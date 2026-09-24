@@ -32,7 +32,7 @@ namespace RensaioBackend.Services.Background;
 public sealed class SeedService : IWorkerService
 {
     private readonly SeedOptions _options;
-    private readonly RpcBridgeClient _rpc;
+    private readonly IExtensionRpcBridge _rpc;
     private readonly ContributionGraphWriter _writer;
     private readonly ContributionMappingService _mapping;
     private readonly ContributionUploadService _upload;
@@ -42,7 +42,7 @@ public sealed class SeedService : IWorkerService
 
     public SeedService(
         SeedOptions options,
-        RpcBridgeClient rpc,
+        IExtensionRpcBridge rpc,
         ContributionGraphWriter writer,
         ContributionMappingService mapping,
         ContributionUploadService upload,
@@ -226,15 +226,8 @@ public sealed class SeedService : IWorkerService
         }
     }
 
-    private async Task<ISourceInterop> ResolveSourceAsync(string package, long sourceId, CancellationToken token)
-    {
-        List<SourceDescriptor> descriptors = await _rpc
-            .ListSourceDescriptorsAsync(package, token).ConfigureAwait(false);
-        SourceDescriptor descriptor = descriptors.FirstOrDefault(d => d.SourceId == sourceId)
-            ?? throw new InvalidOperationException($"Source {sourceId} not found in {package}.");
-        descriptor.PackageId = package;
-        return new RpcSourceInterop(_rpc, descriptor);
-    }
+    private Task<ISourceInterop> ResolveSourceAsync(string package, long sourceId, CancellationToken token)
+        => _rpc.GetSourceInteropAsync(package, sourceId, token);
 
     private async Task MatchAsync(IEnumerable<Manga> mangas, CancellationToken token)
     {

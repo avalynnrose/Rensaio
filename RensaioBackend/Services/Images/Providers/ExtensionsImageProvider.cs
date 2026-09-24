@@ -13,10 +13,10 @@ namespace RensaioBackend.Services.Images.Providers
     /// </summary>
     public class ExtensionsImageProvider : IImageProvider
     {
-        private readonly RpcBridgeClient _rpc;
+        private readonly IExtensionRpcBridge _rpc;
         private readonly AppDbContext _db;
 
-        public ExtensionsImageProvider(AppDbContext db, RpcBridgeClient rpc)
+        public ExtensionsImageProvider(AppDbContext db, IExtensionRpcBridge rpc)
         {
             _db = db;
             _rpc = rpc;

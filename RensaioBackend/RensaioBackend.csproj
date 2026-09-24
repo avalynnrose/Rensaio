@@ -44,6 +44,12 @@
     <Compile Remove="Services\Providers\ProviderQueryService.cs" />
     <Compile Remove="Services\Providers\ProviderResourceService.cs" />
     <Compile Remove="Services\Series\SeriesThumbnailService.cs" />
+    <!--
+      Incomplete/leftover on this branch: references DiscoveryWorker{Extension,Request,
+      Event,Init} types that are not defined anywhere, and is not wired into Program.cs
+      (dead code). It cannot compile, so it is excluded until it is finished or ported.
+    -->
+    <Compile Remove="Services\Search\Discovery\**" />
   </ItemGroup>
   <ItemGroup>
     <Content Remove="appsettings.json" />
@@ -109,12 +115,15 @@
 
 	<ItemGroup>
 		<!--
-		  RensaioBackend does NOT reference Mihon.ExtensionsBridge.Core, AndroidCompat,
-		  IKVM, CEF, or any Mihon extension binary. The entire extension/IKVM surface
-		  runs in the isolated Rensaio.RPC process and is reached over gRPC.
-		  Only the IKVM-free models/interfaces and the gRPC contracts are referenced.
+		  On DESKTOP the backend hosts the extension runtime IN-PROCESS (IKVM/CEF
+		  need a real desktop UI thread; a separate child process fails with a
+		  reverse-JNI crash in JavaVM.GetEnv). On Docker/headless the isolated
+		  Rensaio.RPC child is used instead. Hence the Core reference is present:
+		  the tray links it in-process, the Docker backend simply does not activate
+		  it (Startup picks AddRpcBridge when EnvironmentSetup.IsDocker).
 		-->
 		<ProjectReference Include="..\Mihon.ExtensionsBridge.Net\Mihon.ExtensionsBridge.Models\Mihon.ExtensionsBridge.Models.csproj" />
+		<ProjectReference Include="..\Mihon.ExtensionsBridge.Net\Mihon.ExtensionsBridge.Core\Mihon.ExtensionsBridge.Core.csproj" />
 		<ProjectReference Include="..\Rensaio.RPC.Contracts\Rensaio.RPC.Contracts.csproj" />
 	</ItemGroup>
 

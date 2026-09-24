@@ -84,9 +84,11 @@ static class Program
             try { Log.CloseAndFlush(); } catch { }
         };
 
-        // NOTE: java.awt.headless is no longer set here. IKVM/JVM started with the
-        // extension runtime, which now lives in the isolated Rensaio.RPC process; the
-        // tray only hosts Avalonia + the backend, which no longer carries a JVM.
+        // Desktop hosts the extension runtime IN-PROCESS, so the JVM starts here. Set the
+        // AWT headless property (and verbose IKVM logging) BEFORE the first Java call, as
+        // this is what keeps JCEF on the headless/OSR path.
+        java.lang.System.setProperty("java.awt.headless", "true");
+
         if (!EnvironmentSetup.IsApplicationAlreadyRunning())
         {
             try

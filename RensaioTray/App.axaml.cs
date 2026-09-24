@@ -132,10 +132,10 @@ public partial class App : Application
         try
         {
             // Build and start the ASP.NET Core host (this can run on background thread).
-            // NOTE: the tray no longer injects a CEF message pump. IKVM/CEF/AndroidCompat
-            // now live in the isolated Rensaio.RPC process, which owns its own pump; the
-            // backend subscribes to nothing here and manages the RPC lifecycle itself.
-            _host = RensaioBackend.Program.CreateHostBuilder(Array.Empty<string>()).Build();
+            // Desktop hosts IKVM/CEF IN-PROCESS (Startup chooses AddExtensionsBridge when
+            // not Docker), so the tray injects the Avalonia UI-thread CEF pump. This is the
+            // known-good configuration; a separate child process crashes in JavaVM.GetEnv.
+            _host = RensaioBackend.Program.CreateHostBuilder(Array.Empty<string>()).AddCefTimer().Build();
             // Start the ASP.NET Core host (this can run on background thread).
             // Wrap in a tracked task so host crashes are logged even though we
             // deliberately don't await here (to keep the UI thread responsive).

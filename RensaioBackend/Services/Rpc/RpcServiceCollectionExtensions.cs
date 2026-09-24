@@ -36,6 +36,9 @@ public static class RpcServiceCollectionExtensions
             sp => sp.GetRequiredService<RpcBridgeClient>());
         services.TryAddSingleton<Mihon.ExtensionsBridge.Models.Abstractions.IRepositoryManager>(
             sp => sp.GetRequiredService<RpcBridgeClient>());
+        // Transport-specific extension surface (icons/descriptors/listing) consumed by
+        // image providers and the seed sweep.
+        services.TryAddSingleton<IExtensionRpcBridge>(sp => sp.GetRequiredService<RpcBridgeClient>());
 
         // Supervisor runs as a hosted service so it starts with the app and stops
         // (gracefully) with it. It is NOT dependent on anything the tray injects.

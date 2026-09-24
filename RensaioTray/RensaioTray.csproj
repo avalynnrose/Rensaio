@@ -54,5 +54,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\RensaioBackend\RensaioBackend.csproj" />
+    <!-- In-process extension runtime (IKVM/CEF) on desktop: the tray drives the CEF
+         pump on its Avalonia UI thread. -->
+    <ProjectReference Include="..\Mihon.ExtensionsBridge.Net\Mihon.ExtensionsBridge.Core\Mihon.ExtensionsBridge.Core.csproj" />
   </ItemGroup>
 </Project>

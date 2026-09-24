@@ -21,7 +21,7 @@ namespace RensaioBackend.Services.Rpc;
 /// Calls await the supervisor's readiness gate first, so a call issued during an
 /// RPC restart blocks until the server is back online instead of failing.
 /// </summary>
-public sealed class RpcBridgeClient : IBridgeManager, IExtensionManager, IRepositoryManager, IDisposable
+public sealed class RpcBridgeClient : IBridgeManager, IExtensionManager, IRepositoryManager, IExtensionRpcBridge, IDisposable
 {
     private readonly IRpcReadinessGate _gate;
     private readonly IRpcProcessSupervisor _supervisor;
@@ -222,6 +222,15 @@ public sealed class RpcBridgeClient : IBridgeManager, IExtensionManager, IReposi
                 new PackageRequest { PackageId = package }, headers, null, token).ConfigureAwait(false);
             return RpcJson.Deserialize<List<SourceDescriptor>>(result.Json) ?? [];
         });
+
+    public async Task<ISourceInterop> GetSourceInteropAsync(string package, long sourceId, CancellationToken token = default)
+    {
+        List<SourceDescriptor> descriptors = await ListSourceDescriptorsAsync(package, token).ConfigureAwait(false);
+        SourceDescriptor descriptor = descriptors.FirstOrDefault(d => d.SourceId == sourceId)
+            ?? throw new InvalidOperationException($"Source {sourceId} not found in {package}.");
+        descriptor.PackageId = package;
+        return new RpcSourceInterop(this, descriptor);
+    }
 
     private async Task<List<ISourceInterop>> ListSourcesAsync(string package, CancellationToken token)
     {

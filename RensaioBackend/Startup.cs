@@ -7,6 +7,7 @@ using RensaioBackend.Services.Background;
 using RensaioBackend.Services.Contributions;
 using RensaioBackend.Services.Rpc;
 using RensaioBackend.Utils;
+using Mihon.ExtensionsBridge.Core.Extensions;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.ResponseCompression;
 using Microsoft.AspNetCore.StaticFiles;
@@ -97,10 +98,22 @@ namespace RensaioBackend
                 options.AgeInDays = Configuration.GetValue<int>("CacheCheckInDays", 7);
             });
 
-            // The extension runtime (IKVM/CEF/Mihon) is no longer hosted in-process.
-            // The backend supervises the isolated Rensaio.RPC process and talks to it
-            // over gRPC, so no Core/IKVM assemblies are referenced here.
-            services.AddRpcBridge();
+            // Extension runtime hosting:
+            //  - Desktop/tray: IN-PROCESS (IKVM/CEF must run on the tray's Avalonia UI
+            //    thread; a separate child process crashes with a reverse-JNI failure in
+            //    JavaVM.GetEnv — confirmed by A/B testing).
+            //  - Docker/headless: the isolated Rensaio.RPC child over gRPC (unchanged).
+            if (RensaioBackend.Utils.EnvironmentSetup.IsDocker)
+            {
+                services.AddRpcBridge();
+            }
+            else
+            {
+                services.AddExtensionsBridge();
+                // Desktop in-process transport surface (icons/source descriptors/listing)
+                // consumed by image providers and the seed sweep.
+                services.AddSingleton<IExtensionRpcBridge, InProcessExtensionRpcBridge>();
+            }
 
             // One-shot seeding sweep options (--seed [<extensionPackage>]). Registered
             // here as a typed singleton so SeedService and the startup wiring share the
