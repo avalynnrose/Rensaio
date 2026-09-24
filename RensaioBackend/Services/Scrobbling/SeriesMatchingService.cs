@@ -36,6 +36,11 @@ public class SeriesMatchingService
     private readonly Contributions.ContributionPropagationService _contributionSync;
     private const string ImagePrefix = "/api/image/";
 
+    // Contribution-DB row version semantics (see ContributionUploadService): 0 = pending
+    // add/update, -1 = pending delete, -2 = uploaded (LIVE), -3 = uploaded delete.
+    private const int ContributionVersionLogicalDelete = -1;
+    private const int ContributionVersionUploadedDelete = -3;
+
     public SeriesMatchingService(
         AppDbContext db,
         ContributionDbContext contributorDb,
@@ -731,10 +736,13 @@ public class SeriesMatchingService
                 .ThenByDescending(g => g.Count())
                 .First().Key;
 
+            // Uploaded rows are -2 (NOT >= 0): use the tombstone test, otherwise a first-match
+            // lookup returns nothing once the row has been exported to the cloud.
             var row = await _contributorDb.Metadata
                 .Where(m => m.MappingId == mappingId
                     && m.ProviderId == (int)provider
-                    && m.Version >= 0
+                    && m.Version != ContributionVersionLogicalDelete
+                    && m.Version != ContributionVersionUploadedDelete
                     && !string.IsNullOrWhiteSpace(m.ProviderKey)
                     && (m.MappingStatus == SeriesMappingStatus.AutoMatched
                         || m.MappingStatus == SeriesMappingStatus.UserConfirmed))

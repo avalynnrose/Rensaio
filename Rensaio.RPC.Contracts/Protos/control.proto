@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package rensaio.rpc.v1;
+
+import "Protos/common.proto";
+
+option csharp_namespace = "Rensaio.RPC.Contracts.V1";
+
+// ---------------------------------------------------------------------------
+// Lifecycle and health.
+//
+// The backend owns the RPC process lifecycle: it spawns the process, reads the
+// stdio handshake (see RpcHandshake), waits for readiness via Ping/GetStatus,
+// and issues PrepareShutdown on graceful stop. A per-start token is sent on
+// every call so only the owning backend can drive the loopback endpoint.
+// ---------------------------------------------------------------------------
+
+service ControlService {
+  // Liveness/readiness probe. Returns ready=false while still initializing.
+  rpc Ping (PingRequest) returns (PingReply);
+
+  // Loaded-extension and LRU statistics.
+  rpc GetStatus (StatusRequest) returns (StatusReply);
+
+  // Graceful unload of all interops, then process exit.
+  rpc PrepareShutdown (ShutdownRequest) returns (Empty);
+}
+
+message PingRequest {
+  string token = 1;
+}
+
+message PingReply {
+  bool ready = 1;
+  // Handshake protocol version, so backend and RPC can detect mismatches.
+  int32 protocol_version = 2;
+  string rpc_version = 3;
+}
+
+message StatusRequest {
+  string token = 1;
+}
+
+message StatusReply {
+  bool ready = 1;
+  int32 loaded_extensions = 2;
+  int32 lru_capacity = 3;
+  int64 lru_hits = 4;
+  int64 lru_misses = 5;
+  int64 lru_evictions = 6;
+  int64 uptime_seconds = 7;
+  string rpc_version = 8;
+}
+
+message ShutdownRequest {
+  string token = 1;
+  string reason = 2;
+}

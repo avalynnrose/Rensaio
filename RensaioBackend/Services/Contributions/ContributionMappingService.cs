@@ -29,6 +29,7 @@ public sealed class ContributionMappingService
 {
     private const int VersionAddOrUpdate = 0;
     private const int VersionLogicalDelete = -1;
+    private const int VersionUploadedDelete = -3;
 
     // SignalR progress ids — distinct from the External Mappings engine's "metadata-link-*".
     public const string LinkAllJobId = "contribution-link-all";
@@ -81,10 +82,14 @@ public sealed class ContributionMappingService
             .Include(mt => mt.Title)
             .AsNoTracking()
             .ToListAsync(token).ConfigureAwait(false);
-        // Skip tombstones for query projection (rows are only logical-deleted for replication).
+        // Project LIVE rows only. Every positive expectation here was wrong: rows are stamped
+        // -2 (Uploaded) once the upload path flips them, so a `Version >= 0` filter dropped the
+        // series rows — and with them the group cover (Data.ThumbnailUrl) — for every mapping
+        // after its first export. Tombstones are -1 (PendingDelete) and -3 (UploadedDelete);
+        // everything else (-2 Uploaded, 0 pending) is a live row.
         var seriesRows = await _contributorDb.Series
             .Include(s => s.Source)
-            .Where(s => s.Version >= 0)
+            .Where(s => s.Version != VersionLogicalDelete && s.Version != VersionUploadedDelete)
             .AsNoTracking()
             .ToListAsync(token).ConfigureAwait(false);
         var metadataRows = await _contributorDb.Metadata
@@ -192,7 +197,9 @@ public sealed class ContributionMappingService
 
         var seriesRows = await _contributorDb.Series
             .Include(s => s.Source)
-            .Where(s => s.MappingId == mappingId && s.Version >= 0)
+            .Where(s => s.MappingId == mappingId
+                && s.Version != VersionLogicalDelete
+                && s.Version != VersionUploadedDelete)
             .AsNoTracking()
             .ToListAsync(token).ConfigureAwait(false);
         var sources = seriesRows.Select(ToSourceDto).Where(s => s != null).Cast<ContributionMappingSourceDto>().ToList();
@@ -311,13 +318,69 @@ public sealed class ContributionMappingService
             }
         }
 
+        // The rows loaded above are AsNoTracking snapshots, but EnsureProviderIgnoredAsync (just
+        // above) re-queried them WITH tracking, so the context may now hold a DIFFERENT instance
+        // for the same primary key. Re-bind every snapshot to the tracked instance:
+        //   * without this, the Attach calls below throw "another instance with the same key
+        //     value for {'Id'} is already being tracked"; and
+        //   * the decision checks would evaluate against stale state — e.g. step 6 would tombstone
+        //     a row that this pass just settled as ForeverIgnored, because the snapshot still
+        //     shows the previous Unmatched status.
+        var trackedMetadataById = _contributorDb.ChangeTracker.Entries<ContributionMetadataEntity>()
+            .ToDictionary(e => e.Entity.Id, e => e.Entity);
+        if (trackedMetadataById.Count > 0)
+        {
+            for (int i = 0; i < existing.Count; i++)
+                if (trackedMetadataById.TryGetValue(existing[i].Id, out var trackedExisting))
+                    existing[i] = trackedExisting;
+
+            for (int i = 0; i < reEvaluated.Count; i++)
+                if (trackedMetadataById.TryGetValue(reEvaluated[i].Id, out var trackedReEvaluated))
+                    reEvaluated[i] = trackedReEvaluated;
+        }
+
         // 3. Contribution-DB first match is intrinsic here: existing active links (AutoMatched /
         //    UserConfirmed rows with a provider key) are seeded into the matcher and never
-        //    re-searched — HIT = no provider search, only metadata fetch when available. Run the
-        //    shared matcher for the providers that still need searching.
+        //    re-searched — HIT = no provider search, only metadata fetch when available.
+        //
+        //    SEARCH SCOPE: only providers with PENDING work are searched and seeded. A provider is
+        //    SETTLED — and must never be re-searched, seeded or (re)linked — when it has an active
+        //    link (AutoMatched/UserConfirmed), a refusal (Blocked), a permanent ignore
+        //    (ForeverIgnored), or an ignore that has NOT yet expired (TemporaryIgnored within one
+        //    month). PENDING providers are: Unmatched (searched before, no match — re-search),
+        //    an EXPIRED TemporaryIgnored (re-evaluate), and a provider with NO row at all (never
+        //    searched). This mirrors the rensaio.db engine's GetPendingProviders so both scanners
+        //    re-scan exactly the same set.
+        bool IsPendingRow(ContributionMetadataEntity m) => m.MappingStatus switch
+        {
+            SeriesMappingStatus.Unmatched => true,
+            SeriesMappingStatus.TemporaryIgnored => m.LinkedDate != null && m.LinkedDate <= ignoreThreshold,
+            SeriesMappingStatus.AutoMatched => false,
+            SeriesMappingStatus.UserConfirmed => false,
+            SeriesMappingStatus.Blocked => false,
+            SeriesMappingStatus.ForeverIgnored => false,
+            _ => true,
+        };
+
+        var pendingProviders = existing.Where(IsPendingRow)
+            .Select(m => (ExternalSeriesProvider)m.ProviderId)
+            .ToHashSet();
+
+        // A provider is settled when a row exists for it and that row is not pending. A provider
+        // with no row at all has never been searched and stays pending.
+        bool IsSettled(ExternalSeriesProvider provider)
+            => existing.Any(m => m.ProviderId == (int)provider)
+                && !pendingProviders.Contains(provider);
+
         var enabled = providers.Select(p => p.ProviderType).ToHashSet();
-        var match = await _matchCore.MatchAsync(titleCandidates, providers, seeds, blockedIds,
-            skippedProviders, enabled, token).ConfigureAwait(false);
+        var searchProviders = providers
+            .Where(p => !skippedProviders.Contains(p.ProviderType) && !IsSettled(p.ProviderType))
+            .ToList();
+
+        Metadata.MetadataMatchResult match = searchProviders.Count > 0
+            ? await _matchCore.MatchAsync(titleCandidates, searchProviders, seeds, blockedIds,
+                skippedProviders, enabled, token).ConfigureAwait(false)
+            : new Metadata.MetadataMatchResult();
 
         // 4. Persist linked nodes as ContributionMetadata rows.
         var desired = new HashSet<(int ProviderId, string ProviderKey)>();
@@ -325,6 +388,12 @@ public sealed class ContributionMappingService
 
         foreach (var node in match.Links)
         {
+            // Never (re)link a settled provider. The matcher only searches pending providers, but a
+            // seed-derived node can still surface on a provider that already holds a decision — an
+            // active link, Blocked, ForeverIgnored or a non-expired TemporaryIgnored refusal.
+            if (IsSettled(node.Provider))
+                continue;
+
             var identity = ((int)node.Provider, node.ExternalSeriesId);
             desired.Add(identity);
             if (byIdentity.TryGetValue(identity, out var row))
@@ -629,6 +698,88 @@ public sealed class ContributionMappingService
         if (existing == null) return;
         existing.Version = VersionLogicalDelete;
         await _contributorDb.SaveChangesAsync(token).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Resolves the contribution mapping ids that own any of the supplied titles.
+    /// Used by the seed sweep to scope matching to just the series it collected,
+    /// instead of rescanning the whole contribution graph.
+    /// </summary>
+    public async Task<List<Guid>> FindMappingIdsByTitlesAsync(IEnumerable<string> titles, CancellationToken token = default)
+    {
+        var wanted = titles
+            .Where(t => !string.IsNullOrWhiteSpace(t))
+            .Select(t => t.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (wanted.Count == 0)
+            return [];
+
+        return await _contributorDb.MappingTitles
+            .Include(mt => mt.Title)
+            .Where(mt => mt.Title != null && wanted.Contains(mt.Title.Title!))
+            .Select(mt => mt.MappingId)
+            .Distinct()
+            .ToListAsync(token).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Scoped variant of <see cref="ScanAllMappingsAsync"/>: matches only the supplied
+    /// mapping ids. Progress is still published under the same aggregate job id so the
+    /// UI shows a coherent run.
+    /// </summary>
+    public async Task ScanMappingsAsync(
+        IReadOnlyCollection<Guid> mappingIds, List<IExternalSeriesProvider> providers, CancellationToken token = default)
+    {
+        var total = mappingIds.Count;
+        if (total == 0)
+            return;
+
+        if (_hubReport != null)
+        {
+            await _hubReport.ReportProgressAsync(new ProgressState
+            {
+                Id = LinkAllJobId,
+                JobType = JobType.MetadataLink,
+                ProgressStatus = ProgressStatus.Started,
+                Percentage = 0,
+                Message = $"Linking 0/{total} mappings"
+            });
+        }
+
+        var processed = 0;
+        foreach (var id in mappingIds)
+        {
+            if (token.IsCancellationRequested) break;
+
+            await ScanMappingAsync(id, providers, token).ConfigureAwait(false);
+            processed++;
+
+            if (_hubReport != null)
+            {
+                var pct = processed * 100 / total;
+                await _hubReport.ReportProgressAsync(new ProgressState
+                {
+                    Id = LinkAllJobId,
+                    JobType = JobType.MetadataLink,
+                    ProgressStatus = ProgressStatus.InProgress,
+                    Percentage = pct,
+                    Message = $"Linking {processed}/{total} mappings"
+                });
+            }
+        }
+
+        if (_hubReport != null)
+        {
+            await _hubReport.ReportProgressAsync(new ProgressState
+            {
+                Id = LinkAllJobId,
+                JobType = JobType.MetadataLink,
+                ProgressStatus = ProgressStatus.Completed,
+                Percentage = 100,
+                Message = $"Linked {processed}/{total} mappings"
+            });
+        }
     }
 
     /// <summary>Background scan across all mappings, publishing per-mapping + aggregate SignalR progress.</summary>

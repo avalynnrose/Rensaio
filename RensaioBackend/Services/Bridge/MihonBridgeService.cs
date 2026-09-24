@@ -1,7 +1,8 @@
-﻿using Mihon.ExtensionsBridge.Core.Extensions;
-using Mihon.ExtensionsBridge.Models;
+﻿using Mihon.ExtensionsBridge.Models;
+using Mihon.ExtensionsBridge.Models.Helpers;
 using Mihon.ExtensionsBridge.Models.Abstractions;
 using Microsoft.Extensions.Logging;
+using RensaioBackend.Services.Rpc;
 using RensaioBackend.Services.Search;
 using RensaioBackend.Utils;
 using System;
@@ -110,46 +111,57 @@ namespace RensaioBackend.Services.Bridge
                             return await func().ConfigureAwait(false);
                         }
                     }
-                    catch (HttpRequestException httpEx)
+                    catch (Exception caught)
                     {
-                        HttpStatusCode status = httpEx.StatusCode ?? HttpStatusCode.InternalServerError;
+                        // Source calls now cross the RPC boundary, where gRPC replaces the original
+                        // failure with a bare RpcException (no InnerException). Unwrap restores the
+                        // original exception category so the per-category handling below still runs
+                        // — otherwise every HTTP status (and its retry) would be lost.
+                        Exception ex = RpcExceptionUnwrapper.Unwrap(caught);
 
-                        // Retry with exponential backoff on the two transient responses we care about:
-                        //  - TooManyRequests (429): the server explicitly asked us to back off.
-                        //  - NotFound (404): some Cloudflare-protected sources return an empty/404 page
-                        //    when their bot/rate-limit detection triggers.
-                        if (IsRetryableHttpStatus(status) && attempt < DefaultMaxRetries)
+                        if (ex is HttpRequestException httpEx)
                         {
-                            _logger.LogDebug("Retrying {ErrorMessage} (attempt {Attempt}/{Max}) after {Delay}s",
-                                errorMessage, attempt + 1, DefaultMaxRetries, ComputeBackoff(attempt).TotalSeconds);
-                            await Task.Delay(ComputeBackoff(attempt)).ConfigureAwait(false);
-                            continue;
+                            HttpStatusCode status = httpEx.StatusCode ?? HttpStatusCode.InternalServerError;
+
+                            // Retry with exponential backoff on the two transient responses we care about:
+                            //  - TooManyRequests (429): the server explicitly asked us to back off.
+                            //  - NotFound (404): some Cloudflare-protected sources return an empty/404 page
+                            //    when their bot/rate-limit detection triggers.
+                            if (IsRetryableHttpStatus(status) && attempt < DefaultMaxRetries)
+                            {
+                                _logger.LogDebug("Retrying {ErrorMessage} (attempt {Attempt}/{Max}) after {Delay}s",
+                                    errorMessage, attempt + 1, DefaultMaxRetries, ComputeBackoff(attempt).TotalSeconds);
+                                await Task.Delay(ComputeBackoff(attempt)).ConfigureAwait(false);
+                                continue;
+                            }
+
+                            object[] pars2 = pars.ToArray();
+                            Array.Resize(ref pars2, pars2.Length + 1);
+                            pars2[^1] = status;
+                            _logger.LogError(errorMessage + " Http Error: {httperror}", pars2);
+                            if (failureBreakdown != null)
+                            {
+                                string reason = status.ToString();
+                                int current = failureBreakdown.GetOrAdd(reason, 0);
+                                failureBreakdown[reason] = current + 1;
+                            }
+                            return null;
                         }
 
-                        object[] pars2 = pars.ToArray();
-                        Array.Resize(ref pars2, pars2.Length + 1);
-                        pars2[^1] = status;
-                        _logger.LogError(errorMessage + " Http Error: {httperror}", pars2);
-                        if (failureBreakdown != null)
+                        if (ex is TaskCanceledException)
                         {
-                            string reason = status.ToString();
-                            int current = failureBreakdown.GetOrAdd(reason, 0);
-                            failureBreakdown[reason] = current + 1;
+                            _logger.LogError(errorMessage + " Task was cancelled", pars);
+                            return null;
                         }
-                        return null;
-                    }
-                    catch (TaskCanceledException)
-                    {
-                        _logger.LogError(errorMessage + " Task was cancelled", pars);
-                        return null;
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        _logger.LogError(errorMessage + " Operation was cancelled", pars);
-                        return null;
-                    }
-                    catch (Exception ex)
-                    {
+
+                        if (ex is OperationCanceledException)
+                        {
+                            _logger.LogError(errorMessage + " Operation was cancelled", pars);
+                            return null;
+                        }
+
+                        // Underlying (unwrapped) exception — never the transport RpcException when a
+                        // cause could be recovered — so the log reflects the true failure.
                         _logger.LogError(ex, errorMessage, pars);
                         return null;
                     }

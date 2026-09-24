@@ -8,7 +8,7 @@ using RensaioBackend.Services.Bridge;
 using RensaioBackend.Services.Jobs;
 using RensaioBackend.Services.Settings;
 using Microsoft.EntityFrameworkCore;
-using Mihon.ExtensionsBridge.Core.Extensions;
+using Mihon.ExtensionsBridge.Models.Helpers;
 using Mihon.ExtensionsBridge.Models;
 using Mihon.ExtensionsBridge.Models.Abstractions;
 

@@ -4,15 +4,12 @@ using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Markup.Xaml;
 using Avalonia.Media.Imaging;
 using Avalonia.Platform;
-using java.awt;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using Mihon.ExtensionsBridge.Core.Utilities;
-using Mihon.ExtensionsBridge.Models.Abstractions;
 using RensaioBackend.Utils;
 using RensaioTray.Utils;
 using RensaioTray.Views;
@@ -134,8 +131,11 @@ public partial class App : Application
     {
         try
         {
-            // Build and start the ASP.NET Core host (this can run on background thread)
-            _host = RensaioBackend.Program.CreateHostBuilder(Array.Empty<string>()).AddCefTimer().Build();
+            // Build and start the ASP.NET Core host (this can run on background thread).
+            // NOTE: the tray no longer injects a CEF message pump. IKVM/CEF/AndroidCompat
+            // now live in the isolated Rensaio.RPC process, which owns its own pump; the
+            // backend subscribes to nothing here and manages the RPC lifecycle itself.
+            _host = RensaioBackend.Program.CreateHostBuilder(Array.Empty<string>()).Build();
             // Start the ASP.NET Core host (this can run on background thread).
             // Wrap in a tracked task so host crashes are logged even though we
             // deliberately don't await here (to keep the UI thread responsive).

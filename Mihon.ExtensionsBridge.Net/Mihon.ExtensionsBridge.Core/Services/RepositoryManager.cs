@@ -51,13 +51,15 @@ namespace Mihon.ExtensionsBridge.Core.Services
         /// Initializes a new instance of the <see cref="RepositoryManager"/> class.
         /// </summary>
         /// <param name="workingStructure">Working folder structure persisting repositories and extensions.</param>
-        /// <param name="repoDownload">Downloader used to populate repositories with extensions.</param>
         /// <param name="extensionsManager">Manager that coordinates extension comparison and auto-update.</param>
         /// <param name="logger">Logger instance for diagnostics.</param>
         /// <exception cref="ArgumentNullException">Thrown if any provided dependency is <c>null</c>.</exception>
+        // NOTE: IRepositoryDownloader is intentionally NOT a constructor parameter.
+        // It is Scoped (IHttpClientFactory) and this manager is a Singleton, so
+        // injecting it would be a captive dependency rejected by DI validation.
+        // The downloader is resolved per-operation from the scope factory instead.
         public RepositoryManager(IServiceProvider provider,
             IWorkingFolderStructure workingStructure,
-            IRepositoryDownloader repoDownload,
             IInternalExtensionManager extensionsManager,
             ILogger<RepositoryManager> logger)
         {

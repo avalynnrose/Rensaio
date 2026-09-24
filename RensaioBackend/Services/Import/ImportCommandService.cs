@@ -1,5 +1,5 @@
 using Microsoft.EntityFrameworkCore;
-using Mihon.ExtensionsBridge.Core.Extensions;
+using Mihon.ExtensionsBridge.Models.Helpers;
 using Mihon.ExtensionsBridge.Models;
 using RensaioBackend.Data;
 using RensaioBackend.Extensions;
@@ -19,7 +19,6 @@ using RensaioBackend.Services.Series;
 using RensaioBackend.Services.Settings;
 using System.Collections.Generic;
 using System.Linq.Expressions;
-using static com.sun.tools.javadoc.JavaScriptScanner;
 using static System.Net.Mime.MediaTypeNames;
 using Action = RensaioBackend.Models.Action;
 

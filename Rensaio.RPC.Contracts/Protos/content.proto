@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package rensaio.rpc.v1;
+
+import "Protos/common.proto";
+import "Protos/catalog.proto";
+
+option csharp_namespace = "Rensaio.RPC.Contracts.V1";
+
+// ---------------------------------------------------------------------------
+// Binary payloads: page images and direct downloads.
+//
+// Both return server streams of Chunk so the backend never buffers a whole
+// payload in memory. The first Chunk carries the content type; the backend
+// exposes the result as a forward-only stream.
+// ---------------------------------------------------------------------------
+
+service ContentService {
+  rpc GetPageImage (PageImageRequest) returns (stream Chunk);
+  rpc DownloadUrl (DownloadUrlRequest) returns (stream Chunk);
+}
+
+message PageImageRequest {
+  SourceRef source = 1;
+  // Serialized Mihon.ExtensionsBridge.Models.Extensions.Page
+  string page_json = 2;
+  // Optional: honored by the server's retry/backoff wrapper.
+  int32 max_retries = 3;
+}
+
+message DownloadUrlRequest {
+  SourceRef source = 1;
+  string url = 2;
+  int32 max_retries = 3;
+}

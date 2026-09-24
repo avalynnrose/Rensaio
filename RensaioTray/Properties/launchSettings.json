@@ -1,0 +1,14 @@
+{
+  "profiles": {
+    "RensaioTray": {
+      "commandName": "Project"
+    },
+    "RensaioTray (Debug RPC child)": {
+      "commandName": "Project",
+      "environmentVariables": {
+        "RENSAIO_RPC_DEBUGGER": "1",
+        "IKVM_VERBOSE": "1"
+      }
+    }
+  }
+}

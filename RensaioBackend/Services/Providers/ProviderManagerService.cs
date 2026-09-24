@@ -7,7 +7,7 @@ using RensaioBackend.Models.Enums;
 using RensaioBackend.Services.Bridge;
 using RensaioBackend.Services.Settings;
 using Microsoft.EntityFrameworkCore;
-using Mihon.ExtensionsBridge.Core.Extensions;
+using Mihon.ExtensionsBridge.Models.Helpers;
 using Mihon.ExtensionsBridge.Models;
 using Mihon.ExtensionsBridge.Models.Abstractions;
 using Mihon.ExtensionsBridge.Models.Extensions;
@@ -95,7 +95,8 @@ namespace RensaioBackend.Services.Providers
             storage.SourceRepositoryName = orepo?.Name;
             storage.SourcePackageName = extension.Package;
             storage.SourceSourceId = source.Id;
-            storage.ThumbnailUrl = "ext://" + Path.Combine(entry.GetRelativeVersionFolder(), entry.Icon.FileName);
+            // Icons are served on demand from RPC and keyed by package id.
+            storage.ThumbnailUrl = "ext://" + extension.Package;
             ISourceInterop? interop = await _mihon.SourceFromProviderIdAsync(storage.MihonProviderId, token).ConfigureAwait(false);
             storage.SupportLatest = interop.SupportsLatest;
             storage.IsNSFW = extension.Nsfw == 1;
@@ -152,7 +153,7 @@ namespace RensaioBackend.Services.Providers
                         v.ActiveEntry = repo.ActiveEntry;
                         v.AutoUpdate = repo.AutoUpdate;
                         v.Repositories = new List<ExtensionRepositoryDto>() { repoview };
-                        v.ThumbnailUrl = "ext://" + Path.Combine(entry.GetRelativeVersionFolder(), entry.Icon.FileName);
+                        v.ThumbnailUrl = "ext://" + extension.Package;
                         if (!providers.ContainsKey(v.Package))
                         {
                             providers.Add(v.Package, v);
@@ -377,14 +378,11 @@ namespace RensaioBackend.Services.Providers
 
                 await _db.SaveChangesAsync(token).ConfigureAwait(false);
 
-                // 3. Remove from Mihon bridge
-                var extensions = _mihon.ListExtensions();
-                var group = extensions.FirstOrDefault(a =>
-                    a.GetActiveEntry().Extension.Package.Equals(pkgName, StringComparison.OrdinalIgnoreCase));
-                if (group != null)
-                {
-                    await _mihon.RemoveExtensionAsync(group, token).ConfigureAwait(false);
-                }
+                // 3. NOTE: the extension is intentionally NOT removed from the RPC
+                // registry. Disabling is backend-local state only; Rensaio.RPC keeps
+                // the extension installed and may keep using it for other providers.
+                // This matches the product rule that the backend no longer
+                // installs/uninstalls extensions from repositories.
 
                 // 4. Refresh cache (handles job scheduling)
                 await _providerCache.RefreshCacheAsync(false, token).ConfigureAwait(false);

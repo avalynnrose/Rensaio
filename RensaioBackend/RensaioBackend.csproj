@@ -49,6 +49,16 @@
     <Content Remove="appsettings.json" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!--
+      Shared source: provider resilience (exponential retry + per-host circuit
+      breaker). Linked rather than project-referenced so RensaioBackend and
+      RensaioOAuthProxy compile identical behaviour without coupling their
+      dependency graphs (the proxy deliberately has no project references).
+    -->
+    <Compile Include="..\shared\ProviderResilience\ProviderResilience.cs" Link="Utils\ProviderResilience.cs" />
+  </ItemGroup>
+
 
   <ItemGroup>
     <None Remove="Resources\na.jpg" />
@@ -98,7 +108,14 @@
   </ItemGroup>
 
 	<ItemGroup>
-		<ProjectReference Include="..\Mihon.ExtensionsBridge.Net\Mihon.ExtensionsBridge.Core\Mihon.ExtensionsBridge.Core.csproj" />
+		<!--
+		  RensaioBackend does NOT reference Mihon.ExtensionsBridge.Core, AndroidCompat,
+		  IKVM, CEF, or any Mihon extension binary. The entire extension/IKVM surface
+		  runs in the isolated Rensaio.RPC process and is reached over gRPC.
+		  Only the IKVM-free models/interfaces and the gRPC contracts are referenced.
+		-->
+		<ProjectReference Include="..\Mihon.ExtensionsBridge.Net\Mihon.ExtensionsBridge.Models\Mihon.ExtensionsBridge.Models.csproj" />
+		<ProjectReference Include="..\Rensaio.RPC.Contracts\Rensaio.RPC.Contracts.csproj" />
 	</ItemGroup>
 
 	<ItemGroup>

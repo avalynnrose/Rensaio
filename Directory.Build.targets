@@ -1,0 +1,77 @@
+<Project>
+
+  <!--
+    Rensaio.RPC runs as a SEPARATE process, so the backend/tray must NOT take an
+    assembly reference to it — doing so would drag IKVM/AndroidCompat/Mihon into
+    their compile graph and defeat the isolation the whole split exists to provide.
+
+    However the supervisor (RpcProcessSupervisor.LocateRpcExecutable) looks for the
+    executable beside the consumer, or in a "rpc" subfolder of its output. Without a
+    copy step that only ever worked for `dotnet publish` (which the build scripts
+    handle explicitly); a plain `dotnet build` / F5 left no executable, so the RPC
+    child could not start.
+
+    This target builds Rensaio.RPC out-of-band and copies its output into
+    $(OutDir)rpc for the exe-producing consumer projects only.
+  -->
+  <PropertyGroup>
+    <RpcIsolationConsumer Condition="'$(MSBuildProjectName)' == 'RensaioBackend' or '$(MSBuildProjectName)' == 'RensaioTray'">true</RpcIsolationConsumer>
+    <!-- Headless RPC (Docker/Linux fallback). -->
+    <RpcProjectPath>$(MSBuildThisFileDirectory)Rensaio.RPC\Rensaio.RPC.csproj</RpcProjectPath>
+    <!-- Desktop RPC (Avalonia-hosted; the preferred child on Windows). -->
+    <DesktopRpcProjectPath>$(MSBuildThisFileDirectory)Rensaio.DesktopRPC\Rensaio.DesktopRPC.csproj</DesktopRpcProjectPath>
+    <!-- Both RPC hosts target net8.0; these are their deterministic build output dirs. -->
+    <RpcOutputDir>$(MSBuildThisFileDirectory)Rensaio.RPC\bin\$(Configuration)\net8.0</RpcOutputDir>
+    <DesktopRpcOutputDir>$(MSBuildThisFileDirectory)Rensaio.DesktopRPC\bin\$(Configuration)\net8.0</DesktopRpcOutputDir>
+  </PropertyGroup>
+
+  <Target Name="BuildAndCopyRpcProcess"
+          AfterTargets="Build"
+          Condition="'$(RpcIsolationConsumer)' == 'true' and '$(DesignTimeBuild)' != 'true' and Exists('$(RpcProjectPath)')">
+
+    <!--
+      Build RPC first (ordering only; no reference is added to this project).
+      WarnAndContinue: when the whole solution is built in parallel, both
+      RensaioBackend and RensaioTray invoke this target at once and the nested RPC
+      build can momentarily contend. A contention error must not fail the consumer
+      build — the sibling invocation produces the same output.
+    -->
+    <MSBuild Projects="$(RpcProjectPath)"
+             Targets="Build"
+             Properties="Configuration=$(Configuration)"
+             BuildInParallel="false"
+             ContinueOnError="WarnAndContinue" />
+
+    <!-- Build the Avalonia desktop RPC too (Windows preference). WarnAndContinue so a
+         non-Windows/dev box without the Avalonia workload still produces the headless RPC. -->
+    <MSBuild Projects="$(DesktopRpcProjectPath)"
+             Targets="Build"
+             Properties="Configuration=$(Configuration)"
+             BuildInParallel="false"
+             ContinueOnError="WarnAndContinue"
+             Condition="'$(OS)' == 'Windows_NT' and Exists('$(DesktopRpcProjectPath)')" />
+
+    <ItemGroup>
+      <_RpcProcessFiles Include="$(RpcOutputDir)\**\*.*" />
+      <!-- Desktop RPC files are copied into the SAME rpc folder; distinct file names,
+           so the two hosts coexist and the supervisor picks by name/OS. -->
+      <_RpcProcessFiles Include="$(DesktopRpcOutputDir)\**\*.*"
+                        Condition="'$(OS)' == 'Windows_NT' and Exists('$(DesktopRpcOutputDir)')" />
+    </ItemGroup>
+
+    <!--
+      Mirror the RPC output into $(OutDir)rpc so LocateRpcExecutable finds it
+      (it probes a "rpc" subfolder beside the consumer). SkipUnchangedFiles keeps
+      repeat builds cheap; ContinueOnError tolerates a concurrent copy.
+    -->
+    <Copy SourceFiles="@(_RpcProcessFiles)"
+          DestinationFiles="@(_RpcProcessFiles->'$(OutDir)rpc\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true"
+          ContinueOnError="WarnAndContinue"
+          Condition="'@(_RpcProcessFiles)' != ''" />
+
+    <Warning Text="Rensaio.RPC executable was built but not found at $(RpcOutputDir); the RPC child will not start until it is present."
+             Condition="!Exists('$(RpcOutputDir)\Rensaio.RPC.exe') and !Exists('$(RpcOutputDir)\Rensaio.RPC')" />
+  </Target>
+
+</Project>

@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package rensaio.rpc.v1;
+
+import "Protos/common.proto";
+
+option csharp_namespace = "Rensaio.RPC.Contracts.V1";
+
+// ---------------------------------------------------------------------------
+// Catalogue / source reads.
+//
+// Every call identifies the target by package + numeric source id, matching the
+// existing "package|sourceId" convention in MihonBridgeService. Manga and
+// Chapter inputs/outputs travel as JSON built from the shared model types so
+// the RPC server can forward them straight to ISourceInterop without a lossy
+// translation step.
+// ---------------------------------------------------------------------------
+
+service CatalogService {
+  rpc GetDetails (SourceMangaRequest) returns (JsonResult);
+  rpc GetChapters (SourceMangaRequest) returns (JsonResult);
+  rpc GetDetailsAndChapters (SourceMangaRequest) returns (JsonResult);
+  rpc Search (SourceSearchRequest) returns (JsonResult);
+  rpc GetPopular (SourcePageRequest) returns (JsonResult);
+  rpc GetLatest (SourcePageRequest) returns (JsonResult);
+  rpc GetPages (SourceChapterRequest) returns (JsonResult);
+  rpc GetPreferences (SourceRef) returns (JsonResult);
+  rpc SetPreferenceByIndex (SetPreferenceIndexRequest) returns (BoolValue);
+  rpc SetPreference (SetPreferenceRequest) returns (BoolValue);
+  rpc SetPreferences (SetPreferencesRequest) returns (BoolValue);
+}
+
+message SourceRef {
+  string package_id = 1;
+  int64 source_id = 2;
+  Correlation correlation = 3;
+}
+
+message SourceMangaRequest {
+  SourceRef source = 1;
+  // Serialized Mihon.ExtensionsBridge.Models.Extensions.Manga
+  string manga_json = 2;
+}
+
+message SourceChapterRequest {
+  SourceRef source = 1;
+  // Serialized Mihon.ExtensionsBridge.Models.Extensions.Chapter
+  string chapter_json = 2;
+}
+
+message SourcePageRequest {
+  SourceRef source = 1;
+  int32 page = 2;
+}
+
+message SourceSearchRequest {
+  SourceRef source = 1;
+  int32 page = 2;
+  string query = 3;
+}
+
+message SetPreferenceIndexRequest {
+  SourceRef source = 1;
+  int32 position = 2;
+  string value = 3;
+}
+
+message SetPreferenceRequest {
+  SourceRef source = 1;
+  // Serialized Mihon.ExtensionsBridge.Models.Extensions.KeyPreference
+  string preference_json = 2;
+}
+
+message SetPreferencesRequest {
+  SourceRef source = 1;
+  // Serialized list of Mihon.ExtensionsBridge.Models.Extensions.KeyPreference
+  string preferences_json = 2;
+}

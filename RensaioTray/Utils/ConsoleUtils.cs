@@ -34,6 +34,14 @@ public static class ConsoleUtils
     [DllImport("user32.dll")]
     public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetConsoleOutputCP(uint wCodePageID);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetConsoleCP(uint wCodePageID);
+
     [DllImport("user32.dll")]
     public static extern IntPtr LoadIcon(IntPtr hInstance, string lpIconName);
 
@@ -66,6 +74,86 @@ public static class ConsoleUtils
     public const uint IMAGE_ICON = 1;
     public const uint LR_DEFAULTSIZE = 0x00000040;
     public const uint LR_LOADFROMFILE = 0x00000010;
+
+    // --- Constants for console code pages ---
+
+    /// <summary>
+    /// UTF-8 Windows console code page.
+    /// </summary>
+    public const uint CP_UTF8 = 65001;
+
+    /// <summary>
+    /// Switches the console to UTF-8 so non-ASCII text (CJK, emoji, accented
+    /// characters, etc.) is not transcoded to '?' by the OEM code page.
+    /// </summary>
+    /// <remarks>
+    /// When a GUI process calls <see cref="AllocConsole"/> the console keeps the
+    /// system OEM code page (e.g. 437/850). .NET's <c>Console.OutputEncoding</c>
+    /// then defaults to that page, so any character it cannot represent is
+    /// replaced with '?'. This is why Serilog's console sink mangled CJK text
+    /// while the file sink (always UTF-8) was correct. Forcing code page 65001
+    /// and the managed encodings to UTF-8 fixes the console writer; note that the
+    /// console font must also contain the glyphs (e.g. a CJK-capable font such as
+    /// "MS Gothic" in the legacy conhost font dialog) for them to render.
+    /// </remarks>
+    /// <returns>True if the console was switched to UTF-8, false otherwise.</returns>
+    public static bool EnableUnicodeConsole()
+    {
+        bool success = false;
+
+        try
+        {
+            // Set the native console code page first so the managed encoding below
+            // and any child processes inherit UTF-8.
+            if (!SetConsoleOutputCP(CP_UTF8))
+            {
+                SafeWriteLine($"Failed to set console output code page to UTF-8 (error {Marshal.GetLastWin32Error()}).");
+            }
+            else
+            {
+                success = true;
+            }
+
+            // Input code page is best-effort: it is irrelevant to logging and can
+            // fail when stdin is redirected.
+            try
+            {
+                SetConsoleCP(CP_UTF8);
+            }
+            catch
+            {
+                // Ignore input code page failures.
+            }
+
+            // Point the managed Console writers at UTF-8. This also recreates the
+            // cached Console.Out writer, so it must run before any logging sink
+            // captures Console.Out.
+            try
+            {
+                Console.OutputEncoding = System.Text.Encoding.UTF8;
+                success = true;
+            }
+            catch (Exception ex)
+            {
+                SafeWriteLine($"Failed to set Console.OutputEncoding to UTF-8: {ex.Message}");
+            }
+
+            try
+            {
+                Console.InputEncoding = System.Text.Encoding.UTF8;
+            }
+            catch
+            {
+                // Ignore input encoding failures (redirected/no stdin).
+            }
+        }
+        catch (Exception ex)
+        {
+            SafeWriteLine($"Failed to enable Unicode console support: {ex.Message}");
+        }
+
+        return success;
+    }
 
     /// <summary>
     /// Disables the close button on the console window.

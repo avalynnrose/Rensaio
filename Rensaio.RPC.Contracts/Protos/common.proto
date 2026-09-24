@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package rensaio.rpc.v1;
+
+option csharp_namespace = "Rensaio.RPC.Contracts.V1";
+
+// ---------------------------------------------------------------------------
+// Shared RPC-only envelopes.
+//
+// Complex model types (Manga, Chapter, Page, MangaList, ParsedManga,
+// ParsedChapter, KeyPreference, RepositoryEntry, extension descriptors, ...)
+// are NOT duplicated as protobuf messages. They live once in the IKVM-free
+// "Mihon.ExtensionsBridge.Models" assembly, which is referenced by BOTH the
+// RPC host and RensaioBackend. On the wire they travel as JSON in the
+// `payload` / `json` string fields below and are (de)serialized by the
+// RpcModels mapping layer. Scalars and transport concerns stay typed.
+// ---------------------------------------------------------------------------
+
+message Empty {}
+
+message BoolValue {
+  bool value = 1;
+}
+
+// A JSON payload exchanged with the shared model layer.
+message JsonResult {
+  string json = 1;
+}
+
+// Optional diagnostic identifier echoed in RPC logs. Never used for routing.
+message Correlation {
+  string correlation_id = 1;
+}
+
+// One chunk of a server-streamed binary payload. `content_type` is populated
+// on the first message only; subsequent messages carry data only.
+message Chunk {
+  bytes data = 1;
+  string content_type = 2;
+  bool first = 3;
+  int64 chunk_index = 4;
+}
+
+// Structured error detail carried in gRPC trailing metadata / status details.
+message RpcError {
+  string code = 1;
+  string message = 2;
+  string details = 3;
+  bool retryable = 4;
+}

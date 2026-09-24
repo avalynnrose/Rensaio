@@ -1,5 +1,5 @@
 ﻿using RensaioBackend.Models.Database;
-using Mihon.ExtensionsBridge.Core.Extensions;
+using Mihon.ExtensionsBridge.Models.Helpers;
 using Mihon.ExtensionsBridge.Models;
 
 namespace RensaioBackend.Extensions

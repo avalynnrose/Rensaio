@@ -2,7 +2,6 @@
 using Microsoft.AspNetCore.Razor.Runtime.TagHelpers;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
-using Mihon.ExtensionsBridge.Core.Extensions;
 using RensaioBackend.Services;
 using Serilog;
 using Serilog.Core;
@@ -21,7 +20,6 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using static jdk.jfr.@internal.SecuritySupport;
 using static Microsoft.EntityFrameworkCore.DbLoggerCategory;
 using ILogger = Microsoft.Extensions.Logging.ILogger;
 

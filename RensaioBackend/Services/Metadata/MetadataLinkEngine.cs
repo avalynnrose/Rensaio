@@ -68,6 +68,12 @@ public class MetadataLinkEngine
 {
     private const string LinkAllJobId = "metadata-link-all";
 
+    // Contribution-DB row version semantics (see ContributionUploadService): 0 = pending
+    // add/update, -1 = pending delete, -2 = uploaded (LIVE), -3 = uploaded delete. A live
+    // row is therefore any value except the two tombstones.
+    private const int ContributionVersionLogicalDelete = -1;
+    private const int ContributionVersionUploadedDelete = -3;
+
     private readonly AppDbContext _db;
     private readonly ContributionDbContext _contributorDb;
     private readonly ExternalSeriesProviderFactory _factory;
@@ -492,8 +498,12 @@ public class MetadataLinkEngine
                 .First().Key;
 
             // 3. Active metadata rows of the winning mapping = the community's links.
+            //    Uploaded rows are -2 (NOT >= 0), so "not a tombstone" is the correct live test;
+            //    a `Version >= 0` filter would silently return nothing after the first upload.
             var metadata = await _contributorDb.Metadata
-                .Where(m => m.MappingId == mappingId && m.Version >= 0)
+                .Where(m => m.MappingId == mappingId
+                    && m.Version != ContributionVersionLogicalDelete
+                    && m.Version != ContributionVersionUploadedDelete)
                 .AsNoTracking()
                 .ToListAsync(token).ConfigureAwait(false);
 

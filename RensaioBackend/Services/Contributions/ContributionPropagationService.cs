@@ -225,6 +225,12 @@ namespace RensaioBackend.Services.Contributions
                 .ToListAsync(token).ConfigureAwait(false);
             var existingIds = existing.Select(t => t.Id).ToHashSet();
 
+            // Rows added earlier in THIS unit of work are invisible to the query above but
+            // already tracked; re-adding them would raise "another instance with the same
+            // key value ... is already being tracked".
+            foreach (var tracked in _contributorDb.ChangeTracker.Entries<TitleEntity>().Select(e => e.Entity))
+                existingIds.Add(tracked.Id);
+
             var result = new Dictionary<string, Guid>(StringComparer.Ordinal);
             foreach (var title in titles)
             {
@@ -262,6 +268,13 @@ namespace RensaioBackend.Services.Contributions
                 .AsNoTracking()
                 .ToListAsync(token).ConfigureAwait(false);
 
+            // Also consider links created earlier in this unit of work (e.g. by a sibling
+            // series sharing a title) so they collapse onto ONE mapping instead of each
+            // minting its own.
+            mappingTitles.AddRange(_contributorDb.ChangeTracker.Entries<MappingTitleEntity>()
+                .Select(e => e.Entity)
+                .Where(mt => seriesTitleIds.Contains(mt.TitleId)));
+
             // Prefer the mapping that already links the main title.
             if (titleIds.TryGetValue(TitleEntity.Normalize(mainTitle), out var mainId))
             {
@@ -291,10 +304,18 @@ namespace RensaioBackend.Services.Contributions
 
             var existingByTitle = existingRows.ToDictionary(mt => mt.TitleId);
 
+            // Links created earlier in this unit of work are invisible to the query above.
+            // Without them a second series sharing a title would re-Add the same
+            // (MappingId, TitleId) key and EF would throw a duplicate-tracking error.
+            var trackedTitleIds = _contributorDb.ChangeTracker.Entries<MappingTitleEntity>()
+                .Where(e => e.Entity.MappingId == mappingId)
+                .Select(e => e.Entity.TitleId)
+                .ToHashSet();
+
             // ADD missing associations.
             foreach (var titleId in desired)
             {
-                if (!existingByTitle.ContainsKey(titleId))
+                if (!existingByTitle.ContainsKey(titleId) && !trackedTitleIds.Contains(titleId))
                 {
                     _contributorDb.MappingTitles.Add(new MappingTitleEntity
                     {
@@ -308,12 +329,30 @@ namespace RensaioBackend.Services.Contributions
             // Tombstone associations that are no longer desired.
             foreach (var row in existingRows)
             {
-                if (!desired.Contains(row.TitleId) && row.Version != VersionLogicalDelete)
+                if (desired.Contains(row.TitleId) || row.Version == VersionLogicalDelete)
+                    continue;
+
+                // A previous SyncMappingTitlesAsync for this mapping in the same unit of work
+                // may already track this (MappingId, TitleId) — existingRows is AsNoTracking,
+                // so attaching the fresh copy would throw "another instance with the same key
+                // value ... is already being tracked". Reuse the tracked instance instead.
+                var tracked = _contributorDb.ChangeTracker.Entries<MappingTitleEntity>()
+                    .Select(e => e.Entity)
+                    .FirstOrDefault(e => e.MappingId == row.MappingId && e.TitleId == row.TitleId);
+
+                if (tracked != null)
                 {
-                    _contributorDb.MappingTitles.Attach(row);
-                    row.Version = VersionLogicalDelete;
-                    _contributorDb.Entry(row).Property(mt => mt.Version).IsModified = true;
+                    if (tracked.Version != VersionLogicalDelete)
+                    {
+                        tracked.Version = VersionLogicalDelete;
+                        _contributorDb.Entry(tracked).Property(mt => mt.Version).IsModified = true;
+                    }
+                    continue;
                 }
+
+                _contributorDb.MappingTitles.Attach(row);
+                row.Version = VersionLogicalDelete;
+                _contributorDb.Entry(row).Property(mt => mt.Version).IsModified = true;
             }
         }
 
@@ -335,6 +374,11 @@ namespace RensaioBackend.Services.Contributions
                 .AsNoTracking()
                 .ToListAsync(token).ConfigureAwait(false);
             var existingById = existing.ToDictionary(s => s.Id, s => s);
+
+            // Series records added earlier in this unit of work are only in the tracker.
+            // (Only persisted rows are tombstoned below, which is why `existing` stays as-is.)
+            foreach (var tracked in _contributorDb.ChangeTracker.Entries<ContributionSeriesEntity>())
+                existingById[tracked.Entity.Id] = tracked.Entity;
 
             // ── Pass 1: parse the desired (package, sourceId) identities ──
             var desired = new List<(SeriesProviderEntity Source, string Package, long SourceId, Guid Id, Guid SourceEntityId)>();
@@ -371,6 +415,13 @@ namespace RensaioBackend.Services.Contributions
                 .AsNoTracking()
                 .ToListAsync(token).ConfigureAwait(false))
                 .ToDictionary(s => s.Id);
+
+            // Sources added earlier in this unit of work are only in the tracker.
+            foreach (var tracked in _contributorDb.ChangeTracker.Entries<ContributionSourceEntity>()
+                         .Where(e => wantedSourceKeys.Contains(e.Entity.Id)))
+            {
+                sourceEntitiesById[tracked.Entity.Id] = tracked.Entity;
+            }
 
             foreach (var (source, package, sourceId, id, sourceEntityId) in desired)
             {
@@ -432,12 +483,29 @@ namespace RensaioBackend.Services.Contributions
             // Tombstone sources no longer belonging to the series (or identity changed).
             foreach (var row in existing)
             {
-                if (!desiredIds.Contains(row.Id) && row.Version != VersionLogicalDelete)
+                if (desiredIds.Contains(row.Id) || row.Version == VersionLogicalDelete)
+                    continue;
+
+                // `existing` is AsNoTracking, so a row already tracked from an earlier call
+                // for this mapping in the same unit of work is a fresh copy here; attaching
+                // it would throw the identity conflict. Reuse the tracked instance instead.
+                var tracked = _contributorDb.ChangeTracker.Entries<ContributionSeriesEntity>()
+                    .Select(e => e.Entity)
+                    .FirstOrDefault(e => e.Id == row.Id);
+
+                if (tracked != null)
                 {
-                    _contributorDb.Series.Attach(row);
-                    row.Version = VersionLogicalDelete;
-                    _contributorDb.Entry(row).Property(s => s.Version).IsModified = true;
+                    if (tracked.Version != VersionLogicalDelete)
+                    {
+                        tracked.Version = VersionLogicalDelete;
+                        _contributorDb.Entry(tracked).Property(s => s.Version).IsModified = true;
+                    }
+                    continue;
                 }
+
+                _contributorDb.Series.Attach(row);
+                row.Version = VersionLogicalDelete;
+                _contributorDb.Entry(row).Property(s => s.Version).IsModified = true;
             }
         }
 
@@ -447,6 +515,19 @@ namespace RensaioBackend.Services.Contributions
                 .Where(m => m.MappingId == mappingId)
                 .AsNoTracking()
                 .ToListAsync(token).ConfigureAwait(false);
+
+            // Substitute any instance already tracked from an earlier call for this mapping in
+            // the same unit of work: both the update path (Attach(activeRow)) and the tombstone
+            // path (Attach(row)) below would otherwise re-attach the same persisted key and EF
+            // would throw "another instance with the same key value ... is already being tracked".
+            var trackedMetadataById = _contributorDb.ChangeTracker
+                .Entries<ContributionMetadataEntity>()
+                .ToDictionary(e => e.Entity.Id, e => e.Entity);
+            for (int i = 0; i < existing.Count; i++)
+            {
+                if (trackedMetadataById.TryGetValue(existing[i].Id, out var trackedMeta))
+                    existing[i] = trackedMeta;
+            }
 
             // Group the desired provider rows: rensaio.db can technically hold both a
             // (provider, "") Unmatched row AND a (provider, id) matched row. For the

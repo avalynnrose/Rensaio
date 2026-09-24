@@ -13,7 +13,6 @@ using RensaioBackend.Services.ReadState;
 using RensaioBackend.Services.Settings;
 using RensaioBackend.Utils;
 using Microsoft.EntityFrameworkCore;
-using Mihon.ExtensionsBridge.Core.Utilities;
 using Mihon.ExtensionsBridge.Models.Abstractions;
 using System.ComponentModel;
 
@@ -268,6 +267,15 @@ namespace RensaioBackend.Services.Background
                 _workerTasks.Add(StartWorker<MetadataBackgroundScanService>(workerToken));
                 _workerTasks.Add(StartWorker<ContributionUploadBackgroundService>(workerToken));
                 _workerTasks.Add(StartWorker<ContributionImportBackgroundService>(workerToken));
+
+                // One-shot seeding sweep. Only started when --seed was supplied; without it
+                // the worker is never registered and has zero cost.
+                var seedOptions = scope.ServiceProvider.GetRequiredService<Models.SeedOptions>();
+                if (seedOptions.Enabled)
+                {
+                    _logger.LogInformation("Seed mode enabled — starting the contribution seed sweep.");
+                    _workerTasks.Add(StartWorker<SeedService>(workerToken));
+                }
 
             }
             catch (Exception ex)

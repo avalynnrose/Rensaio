@@ -1,4 +1,4 @@
-using Mihon.ExtensionsBridge.Core.Extensions;
+using Mihon.ExtensionsBridge.Models.Helpers;
 using Mihon.ExtensionsBridge.Models;
 using Mihon.ExtensionsBridge.Models.Abstractions;
 using Mihon.ExtensionsBridge.Models.Extensions;
@@ -239,7 +239,9 @@ namespace RensaioBackend.Extensions
             storage.SourceRepositoryName = repoName;
             storage.SourcePackageName = extension.Package;
             storage.SourceSourceId = source.Id;
-            storage.ThumbnailUrl = "ext://" + Path.Combine(entry.GetRelativeVersionFolder(), entry.Icon.FileName);
+            // Icons are served on demand from RPC and keyed by package id; the backend
+            // must not reference RPC-owned extension folders.
+            storage.ThumbnailUrl = "ext://" + extension.Package;
             storage.SupportLatest = interop?.SupportsLatest ?? false;
             storage.IsNSFW = extension.Nsfw == 1;
             storage.IsDead = false;

@@ -168,7 +168,7 @@ public class ComicVineMetadataProvider : IExternalSeriesProvider
 
     public List<string> FilterLookupTitles(IEnumerable<string> titles)
     {
-        return [];
+        return titles.Where(a => !BangumiMetadataProvider.ContainsCJK(a)).ToList();
     }
     private static string[] NoCategories = ["manhwa", "manga", "manhua"];
     public bool CanSearchSeries(List<string> genres, string? category = null)

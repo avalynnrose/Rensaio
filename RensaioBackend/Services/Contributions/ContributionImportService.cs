@@ -273,6 +273,15 @@ namespace RensaioBackend.Services.Contributions
                     list.Add(mt.TitleId);
                 }
                 var localByCloudMapping = new Dictionary<Guid, Guid>();
+
+                // Pairs already tracked (added/attached earlier in this unit of work) plus
+                // pairs queued by THIS loop. The DB-only AnyAsync is blind to both, so two
+                // cloud mappings resolving to one local mapping would Add the same
+                // (MappingId, TitleId) twice → EF identity conflict on the composite key.
+                var knownPairs = _contributorDb.ChangeTracker.Entries<MappingTitleEntity>()
+                    .Select(e => (e.Entity.MappingId, e.Entity.TitleId))
+                    .ToHashSet();
+
                 foreach (var (cloudMappingId, titleIds) in cloudMappingTitlesById)
                 {
                     var localMappingId = await ResolveLocalMappingAsync(titleIds, token).ConfigureAwait(false);
@@ -280,6 +289,9 @@ namespace RensaioBackend.Services.Contributions
 
                     foreach (var titleId in titleIds.Distinct())
                     {
+                        if (!knownPairs.Add((localMappingId, titleId)))
+                            continue;
+
                         bool exists = await _contributorDb.MappingTitles
                             .AnyAsync(mt => mt.MappingId == localMappingId && mt.TitleId == titleId, token)
                             .ConfigureAwait(false);

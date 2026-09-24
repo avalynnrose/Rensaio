@@ -5,6 +5,7 @@ using RensaioBackend.Services;
 using RensaioBackend.Services.Auth;
 using RensaioBackend.Services.Background;
 using RensaioBackend.Services.Contributions;
+using RensaioBackend.Services.Rpc;
 using RensaioBackend.Utils;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.ResponseCompression;
@@ -12,7 +13,6 @@ using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.FileProviders;
-using Mihon.ExtensionsBridge.Core.Extensions;
 using Mihon.ExtensionsBridge.Models.Configuration;
 using Serilog;
 using Serilog.Extensions.Logging;
@@ -97,7 +97,17 @@ namespace RensaioBackend
                 options.AgeInDays = Configuration.GetValue<int>("CacheCheckInDays", 7);
             });
 
-            services.AddExtensionsBridge();
+            // The extension runtime (IKVM/CEF/Mihon) is no longer hosted in-process.
+            // The backend supervises the isolated Rensaio.RPC process and talks to it
+            // over gRPC, so no Core/IKVM assemblies are referenced here.
+            services.AddRpcBridge();
+
+            // One-shot seeding sweep options (--seed [<extensionPackage>]). Registered
+            // here as a typed singleton so SeedService and the startup wiring share the
+            // same parsed values instead of reading the command line twice. Read from the
+            // real process command line (not the host builder args), which is the only
+            // source that is present for every launch path (Docker entrypoint, CLI, tray).
+            services.AddSingleton(SeedOptions.Parse(Environment.GetCommandLineArgs()));
 
             // Add consolidated services
             services.AddImportService();

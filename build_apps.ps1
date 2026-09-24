@@ -18,7 +18,20 @@ if (-not $SkipBuild) {
     dotnet restore $project
 
     foreach ($rid in $runtimeIds) {
-        dotnet publish $project -c Release -r $rid
+        $backendOut = "bin/Release/net8.0/$rid/publish"
+        dotnet publish $project -c Release -r $rid -o $backendOut
+
+        # Publish the isolated Mihon/IKVM/CEF process NEXT TO the backend so the
+        # backend can spawn it. It goes in an "rpc" subfolder because Rensaio.RPC
+        # also ships an appsettings.json, which would collide in the backend root.
+        # Headless host (Docker/Linux + fallback).
+        dotnet publish "..\Rensaio.RPC\Rensaio.RPC.csproj" -c Release -r $rid -o "$backendOut/rpc"
+
+        # Desktop host (Avalonia UI thread + CEF pump). Windows only; on Windows the
+        # supervisor prefers Rensaio.DesktopRPC.exe, on Linux it uses Rensaio.RPC.
+        if ($rid -like "win-*") {
+            dotnet publish "..\Rensaio.DesktopRPC\Rensaio.DesktopRPC.csproj" -c Release -r $rid -o "$backendOut/rpc"
+        }
     }
     Pop-Location
 

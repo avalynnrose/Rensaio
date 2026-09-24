@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package rensaio.rpc.v1;
+
+import "Protos/common.proto";
+
+option csharp_namespace = "Rensaio.RPC.Contracts.V1";
+
+// ---------------------------------------------------------------------------
+// Extension and repository surface.
+//
+// IMPORTANT PRODUCT RULE: RensaioBackend no longer installs or uninstalls
+// extensions from repositories. It can only:
+//   * enumerate what repositories offer (all versions),
+//   * switch the active version of an already-present extension,
+//   * remove a locally present version,
+//   * install a custom APK supplied by the user.
+//
+// Complex descriptors (RepositoryGroup, RepositoryEntry, TachiyomiExtension,
+// TachiyomiRepository) travel as JSON built from the shared model types.
+// ---------------------------------------------------------------------------
+
+service ExtensionsService {
+  // Installed extensions with their sources and available local versions.
+  rpc ListInstalledExtensions (Correlation) returns (JsonResult);
+
+  // Repositories and every extension/version they expose.
+  rpc ListAvailableExtensions (ListAvailableRequest) returns (JsonResult);
+
+  // Every locally present version of one package.
+  rpc ListVersions (PackageRequest) returns (JsonResult);
+
+  // Source descriptors (id, name, language, capabilities) for one package.
+  rpc ListSources (PackageRequest) returns (JsonResult);
+
+  // Activate a specific present version for a package.
+  rpc SetActiveVersion (SetActiveVersionRequest) returns (BoolValue);
+
+  // Remove a locally present version. Does not touch repositories.
+  rpc RemoveVersion (SetActiveVersionRequest) returns (BoolValue);
+
+  // Install a user-supplied APK (streamed).
+  rpc InstallCustomApk (stream InstallApkRequest) returns (JsonResult);
+
+  // Extension icon bytes (streamed).
+  rpc GetExtensionIcon (PackageRequest) returns (stream Chunk);
+}
+
+message ListAvailableRequest {
+  // Force a repository refresh before enumerating (best-effort).
+  bool refresh = 1;
+  Correlation correlation = 2;
+}
+
+message PackageRequest {
+  string package_id = 1;
+  Correlation correlation = 2;
+}
+
+message SetActiveVersionRequest {
+  string package_id = 1;
+  string version = 2;
+  bool auto_update = 3;
+  Correlation correlation = 4;
+}
+
+message InstallApkRequest {
+  // Populated on the first message; subsequent messages carry data only.
+  bool force = 1;
+  string file_name = 2;
+  bytes data = 3;
+  bool last = 4;
+  Correlation correlation = 5;
+}

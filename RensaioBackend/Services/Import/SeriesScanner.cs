@@ -1,5 +1,4 @@
 using System.Globalization;
-using com.sun.tools.@internal.xjc;
 using RensaioBackend.Extensions;
 using RensaioBackend.Models;
 using RensaioBackend.Models.Database;
@@ -8,7 +7,7 @@ using RensaioBackend.Services.Helpers;
 using RensaioBackend.Services.Import.KavitaParser;
 using RensaioBackend.Services.Import.Models;
 using RensaioBackend.Services.Jobs.Report;
-using Mihon.ExtensionsBridge.Core.Extensions;
+using Mihon.ExtensionsBridge.Models.Helpers;
 using Mihon.ExtensionsBridge.Models;
 using System.Text.Json;
 using System.Text.Json.Serialization;

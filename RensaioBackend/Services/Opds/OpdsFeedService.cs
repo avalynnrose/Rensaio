@@ -1,6 +1,3 @@
-using com.sun.tools.@internal.xjc;
-using javax.activation;
-using javax.xml.crypto;
 using RensaioBackend.Data;
 using RensaioBackend.Extensions;
 using RensaioBackend.Migration.Models;
@@ -13,11 +10,9 @@ using RensaioBackend.Services.ReadState;
 using RensaioBackend.Services.Settings;
 using Microsoft.EntityFrameworkCore;
 using Mihon.ExtensionsBridge.Models.Extensions;
-using sun.security.provider;
 using System.Text;
 using System.Text.Json;
 using System.Xml;
-using static com.sun.tools.@internal.xjc.reader.xmlschema.bindinfo.BIConversion;
 
 namespace RensaioBackend.Services.Opds;
 

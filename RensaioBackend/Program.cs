@@ -27,14 +27,13 @@ namespace RensaioBackend
             */
             // Register FIRST-CHANCE exception handler to catch exceptions that are
             // thrown and caught internally — these never reach UnhandledException.
+            // NOTE: the previous IKVM/Android/Mihon/Java source filters are gone: no JVM
+            // runs in this process any more (it lives in Rensaio.RPC), so only Rensaio
+            // code is of interest here.
             AppDomain.CurrentDomain.FirstChanceException += (sender, e) =>
             {
-                // Log only unexpected internal exceptions, not normal framework patterns.
-                // We filter by source to avoid noise from IL weaving, EF, etc.
                 var source = e.Exception?.Source ?? "";
-                if (source.Contains("IKVM") || source.Contains("ikvm") ||
-                    source.Contains("Android") || source.Contains("Mihon") ||
-                    source.Contains("Rensaio") || source.Contains("Java"))
+                if (source.Contains("Rensaio"))
                 {
                     FallbackCrashLogger.WriteException(e.Exception,
                         "FIRSTCHANCE: " + e.Exception?.GetType().Name + " from " + source);

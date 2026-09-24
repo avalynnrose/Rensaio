@@ -84,7 +84,9 @@ static class Program
             try { Log.CloseAndFlush(); } catch { }
         };
 
-        java.lang.System.setProperty("java.awt.headless", "true");
+        // NOTE: java.awt.headless is no longer set here. IKVM/JVM started with the
+        // extension runtime, which now lives in the isolated Rensaio.RPC process; the
+        // tray only hosts Avalonia + the backend, which no longer carries a JVM.
         if (!EnvironmentSetup.IsApplicationAlreadyRunning())
         {
             try
@@ -112,7 +114,9 @@ static class Program
     /// </summary>
     private static void InitializeConsole()
     {
-        // Allocate a new console window for the application.
+        // Allocate a new console window for the application. If a console is
+        // already attached (e.g. launched from a terminal) this returns false and
+        // we simply reuse the existing one.
         if (ConsoleUtils.AllocConsole())
         {
             // Set the console icon
@@ -137,6 +141,18 @@ static class Program
         else
         {
             Console.WriteLine("Could not allocate a new console.");
+        }
+
+        // Switch the console to UTF-8 BEFORE anything writes to it (logger sinks,
+        // banners, etc.). AllocConsole leaves the console on the system OEM code
+        // page, which silently transcodes CJK and other non-ASCII text to '?',
+        // even though the file logger (always UTF-8) records it correctly.
+        if (ConsoleUtils.GetConsoleWindow() != IntPtr.Zero)
+        {
+            if (!ConsoleUtils.EnableUnicodeConsole())
+            {
+                Console.WriteLine("Warning: Failed to enable Unicode console support. Non-ASCII log output may be garbled.");
+            }
         }
     }
 

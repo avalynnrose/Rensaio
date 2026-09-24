@@ -1,5 +1,4 @@
-﻿using com.sun.xml.@internal.bind.v2.model.core;
-using RensaioBackend.Extensions;
+﻿using RensaioBackend.Extensions;
 using RensaioBackend.Services.Downloads;
 using RensaioBackend.Services.Images;
 using RensaioBackend.Services.Images.Providers;

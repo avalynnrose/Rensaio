@@ -80,6 +80,14 @@ jobs:
           zip -r ../../RensaioBackend/wwwroot.zip .
           sha256sum ../../RensaioBackend/wwwroot.zip | awk '{print $1}' > ../../RensaioBackend/wwwroot.sha256
 
+      - name: Verify architectural isolation guards
+        shell: pwsh
+        run: |
+          # Fail fast if the backend/tray re-acquire IKVM/CEF/Mihon, or if the shared
+          # model layer stops being IKVM-free.
+          ./RensaioBackend/scripts/verify-models-ikvm-free.ps1
+          ./RensaioBackend/scripts/verify-backend-isolated.ps1
+
       - name: Build Backend (linux-x64)
         if: contains(inputs.platforms, 'linux/amd64')
         run: |
@@ -89,6 +97,17 @@ jobs:
             --self-contained true \
             -o RensaioBackend/bin/linux/amd64
 
+      - name: Build RPC (linux-x64)
+        if: contains(inputs.platforms, 'linux/amd64')
+        run: |
+          # The isolated IKVM/CEF/Mihon process is spawned by the backend, so it must
+          # ship in an "rpc" subfolder next to it. Built self-contained to carry IKVM.
+          dotnet publish Rensaio.RPC/Rensaio.RPC.csproj \
+            -c Release \
+            -r linux-x64 \
+            --self-contained true \
+            -o RensaioBackend/bin/linux/amd64/rpc
+
       - name: Build Backend (linux-arm64)
         if: contains(inputs.platforms, 'linux/arm64')
         run: |
@@ -97,6 +116,15 @@ jobs:
             -r linux-arm64 \
             --self-contained true \
             -o RensaioBackend/bin/linux/arm64
+
+      - name: Build RPC (linux-arm64)
+        if: contains(inputs.platforms, 'linux/arm64')
+        run: |
+          dotnet publish Rensaio.RPC/Rensaio.RPC.csproj \
+            -c Release \
+            -r linux-arm64 \
+            --self-contained true \
+            -o RensaioBackend/bin/linux/arm64/rpc
 
       - name: Determine image tag
         id: tag

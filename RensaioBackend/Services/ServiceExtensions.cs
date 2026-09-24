@@ -1,4 +1,5 @@
-﻿using RensaioBackend.Extensions;
+﻿using Rensaio.Resilience;
+using RensaioBackend.Extensions;
 using RensaioBackend.Migration;
 using RensaioBackend.Models.Enums;
 using RensaioBackend.Services.Auth;
@@ -22,7 +23,6 @@ using RensaioBackend.Services.Series;
 using RensaioBackend.Services.Settings;
 using RensaioBackend.Services.Users;
 using Microsoft.Extensions.DependencyInjection.Extensions;
-using sun.net.www.http;
 using System.Net.Http.Headers;
 
 namespace RensaioBackend.Services
@@ -99,9 +99,16 @@ namespace RensaioBackend.Services
         }
         public static IServiceCollection AddScrobblingServices(this IServiceCollection services, IConfiguration configuration)
         {
+            // Shared provider resilience tuning (exponential retry + per-host circuit breaker).
+            services.AddProviderResilience();
+
             services.TryAddScoped<Contributions.ContributionPropagationService>();
             services.TryAddScoped<Contributions.ContributionMappingService>();
             services.TryAddScoped<Contributions.RensaioMappingCascadeService>();
+            // Low-level contributor.db graph writer shared by propagation and the seed sweep.
+            services.TryAddScoped<Contributions.ContributionGraphWriter>();
+            // One-shot seeding sweep worker (started only when --seed is supplied).
+            services.TryAddScoped<Background.SeedService>();
 
             return AddScrobblingServicesCore(services, configuration);
         }
@@ -150,14 +157,22 @@ namespace RensaioBackend.Services
             services.TryAddScoped<Contributions.Abstractions.IGlobalMetadataRepository, Contributions.InMemoryGlobalMetadataRepository>();
             services.TryAddScoped<Contributions.InMemoryGlobalMetadataRepository>();
 
-            // Register HTTP clients
-            services.AddHttpClient("Scrobbler_AniList", SetHttpClientHeaders);
-            services.AddHttpClient("Scrobbler_MAL", SetHttpClientHeaders);
-            services.AddHttpClient("Scrobbler_Kitsu", SetHttpClientHeaders);
-            services.AddHttpClient("Scrobbler_MangaDex", SetHttpClientHeaders);
-            services.AddHttpClient("Scrobbler_MangaBaka", SetHttpClientHeaders);
-            services.AddHttpClient("Scrobbler_Bangumi", SetHttpClientHeaders);
-            services.AddHttpClient("Scrobbler_MangaUpdates", SetHttpClientHeaders);
+            // Register HTTP clients.
+            // Every scrobbler / metadata provider client gets the shared resilience
+            // handler so provider rate limits and outages are retried with exponential
+            // backoff and then short-circuited per host by a 1-minute circuit breaker.
+            services.AddHttpClient("Scrobbler_AniList", SetHttpClientHeaders).AddProviderResilience();
+            services.AddHttpClient("Scrobbler_MAL", SetHttpClientHeaders).AddProviderResilience();
+            services.AddHttpClient("Scrobbler_Kitsu", SetHttpClientHeaders).AddProviderResilience();
+            services.AddHttpClient("Scrobbler_MangaDex", SetHttpClientHeaders).AddProviderResilience();
+            services.AddHttpClient("Scrobbler_MangaBaka", SetHttpClientHeaders).AddProviderResilience();
+            services.AddHttpClient("Scrobbler_Bangumi", SetHttpClientHeaders).AddProviderResilience();
+            services.AddHttpClient("Scrobbler_MangaUpdates", SetHttpClientHeaders).AddProviderResilience();
+            // ComicVine (API-key metadata) and the OAuth proxy client are created by
+            // their providers but were previously never registered; without a
+            // registration CreateClient returns a default client with no resilience.
+            services.AddHttpClient("Scrobbler_ComicVine", SetHttpClientHeaders).AddProviderResilience();
+            services.AddHttpClient("Scrobbler_Proxy", SetHttpClientHeaders).AddProviderResilience();
 
             return services;
         }

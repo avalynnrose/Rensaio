@@ -159,8 +159,9 @@ public sealed class MetadataMatchCore
                     {
                         blockedIds.TryGetValue(providerType, out var idBlocklist);
 
-                        // Round 1 uses the plain local candidates (NO FilterLookupTitles — that is
-                        // second-pass-only by design).
+                        // Round 1 searches the FULL local candidate set. The per-provider
+                        // FilterLookupTitles narrows only which titles are SENT (applied inside
+                        // SearchAndScoreAsync); scoring still runs against every local candidate.
                         var best = await SearchAndScoreAsync(provider, titleCandidates, token, idBlocklist);
 
                         // Record every local candidate as "searched" for this provider so round 2
@@ -432,7 +433,16 @@ public sealed class MetadataMatchCore
         var candidates = new List<(string SearchTitle, string Id)>();
         var lookup = new Dictionary<string, OscillatingResult>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var title in localCandidates.Where(t => !string.IsNullOrWhiteSpace(t)).Distinct(StringComparer.OrdinalIgnoreCase))
+        // Only the titles actually sent to the provider are filtered. The local candidate
+        // list stays intact for scoring below, so a title this provider's search cannot use
+        // (e.g. ComicVine rejects CJK / Bangumi keeps only CJK) still participates in match
+        // scoring against the results returned for the provider's usable titles. Providers
+        // that do not narrow (the default pass-through) behave exactly as before.
+        var searchTitles = provider.FilterLookupTitles(localCandidates)
+            .Where(t => !string.IsNullOrWhiteSpace(t))
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var title in searchTitles)
         {
             IReadOnlyList<ScrobblerSearchResult> results;
             try

@@ -35,6 +35,13 @@ namespace Mihon.ExtensionsBridge.Core.Services
     {
         private static readonly TimeSpan InteropIdleTimeout = TimeSpan.FromMinutes(30);
         private const int InteropCacheMaxCount = 32;
+
+        /// <summary>
+        /// Eviction counters for the LRU telemetry surface exposed to Rensaio.RPC.
+        /// Incremented best-effort; never part of any lock.
+        /// </summary>
+        private long _idleEvictions;
+        private long _overCapacityEvictions;
         /// <summary>
         /// Interval for the background idle sweep that evicts extension interops which have
         /// been idle beyond <see cref="InteropIdleTimeout"/>. Explicitly wired: the constants
@@ -93,13 +100,16 @@ namespace Mihon.ExtensionsBridge.Core.Services
         /// </summary>
         /// <param name="workingStructure">Provides working folders and persistence for local repository groups.</param>
         /// <param name="repositoryManager">Resolves online repositories and their extensions.</param>
-        /// <param name="repoDownload">Downloader used to fetch extension artifacts.</param>
         /// <param name="dex2jar">Converter for transforming DEX files into JAR files.</param>
         /// <param name="compiler">Compiler that produces .NET assemblies via IKVM.</param>
         /// <param name="logger">Logger for operational diagnostics.</param>
         /// <exception cref="ArgumentNullException">Thrown if any provided dependency is null.</exception>
+        // NOTE: IRepositoryDownloader is intentionally NOT a constructor parameter.
+        // It is registered Scoped (it depends on IHttpClientFactory), while this
+        // manager is a Singleton — injecting it here is a captive dependency that
+        // DI validation rejects at startup. Scoped work resolves it per-operation
+        // through _serviceProvider instead (see the downloader usages below).
         public ExtensionManager(IWorkingFolderStructure workingStructure,
-            IRepositoryDownloader repoDownload,
             IDex2JarConverter dex2jar,
             //IIkvmCompiler compiler,            
             IServiceProvider provider,
@@ -1105,7 +1115,16 @@ namespace Mihon.ExtensionsBridge.Core.Services
         /// evicts the least-recently-used interops when the cache exceeds
         /// <see cref="InteropCacheMaxCount"/>. Called periodically by a hosted sweep.
         /// </summary>
-        public async Task SweepIdleInteropsAsync()
+        public Task SweepIdleInteropsAsync()
+            => SweepIdleInteropsAsync(InteropIdleTimeout, InteropCacheMaxCount);
+
+        /// <summary>
+        /// Evicts idle/over-capacity interops using explicit thresholds. Rensaio.RPC passes its
+        /// configured LRU policy here. In-flight interops are protected by
+        /// <see cref="GatekeptExtensionInterop.Dispose"/> (which drains before unloading), so this
+        /// remains safe to call concurrently with active calls and changes no Mihon/IKVM locking.
+        /// </summary>
+        public async Task SweepIdleInteropsAsync(TimeSpan idleTimeout, int maxCount)
         {
             foreach (var key in InteropCache.Keys.ToList())
             {
@@ -1113,15 +1132,16 @@ namespace Mihon.ExtensionsBridge.Core.Services
                 if (interop == null)
                     continue;
 
-                if (interop.IsIdle(InteropIdleTimeout))
+                if (interop.IsIdle(idleTimeout))
                 {
                     if (InteropCache.TryRemove(key, out var evicted))
                     {
                         try
                         {
                             evicted.Dispose();
+                            Interlocked.Increment(ref _idleEvictions);
                             _logger.LogInformation("Evicted idle interop for group {GroupName} (idle > {Timeout} min).",
-                                key?.Name ?? "<null>", InteropIdleTimeout.TotalMinutes);
+                                key?.Name ?? "<null>", idleTimeout.TotalMinutes);
                         }
                         catch (Exception ex)
                         {
@@ -1132,7 +1152,7 @@ namespace Mihon.ExtensionsBridge.Core.Services
             }
 
             // Enforce the max-count bound (LRU eviction) even when nothing is idle.
-            int overflow = InteropCache.Count - InteropCacheMaxCount;
+            int overflow = InteropCache.Count - maxCount;
             if (overflow > 0)
             {
                 var lru = InteropCache.ToList()
@@ -1147,8 +1167,9 @@ namespace Mihon.ExtensionsBridge.Core.Services
                         try
                         {
                             evicted.Dispose();
+                            Interlocked.Increment(ref _overCapacityEvictions);
                             _logger.LogInformation("Evicted least-recently-used interop for group {GroupName} (cache over {Max} entries).",
-                                key?.Name ?? "<null>", InteropCacheMaxCount);
+                                key?.Name ?? "<null>", maxCount);
                         }
                         catch (Exception ex)
                         {
@@ -1157,6 +1178,14 @@ namespace Mihon.ExtensionsBridge.Core.Services
                     }
                 }
             }
+
+            await Task.CompletedTask;
         }
+
+        /// <summary>
+        /// Snapshot of the interop cache for RPC LRU telemetry. Read-only.
+        /// </summary>
+        public InteropCacheStats GetInteropCacheStats()
+            => new(InteropCache.Count, Interlocked.Read(ref _idleEvictions), Interlocked.Read(ref _overCapacityEvictions));
     }
 }

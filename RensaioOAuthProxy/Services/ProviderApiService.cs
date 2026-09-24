@@ -11,6 +11,12 @@ namespace RensaioOAuthProxy.Services;
 /// </summary>
 public class ProviderApiService
 {
+    /// <summary>
+    /// Named client carrying the shared provider resilience pipeline
+    /// (exponential retry + per-host circuit breaker).
+    /// </summary>
+    public const string HttpClientName = "ProviderApi";
+
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly IConfiguration _configuration;
     private readonly ILogger<ProviderApiService> _logger;
@@ -81,7 +87,7 @@ public class ProviderApiService
     public async Task<TokenResult> ExchangeCodeAsync(string provider, string code, string redirectUri)
     {
         var (clientId, clientSecret) = GetCredentials(provider);
-        var httpClient = _httpClientFactory.CreateClient();
+        var httpClient = _httpClientFactory.CreateClient(HttpClientName);
 
         var formData = new Dictionary<string, string>
         {
@@ -123,7 +129,7 @@ public class ProviderApiService
     public async Task<TokenResult> RefreshTokenAsync(string provider, string refreshToken)
     {
         var (clientId, clientSecret) = GetCredentials(provider);
-        var httpClient = _httpClientFactory.CreateClient();
+        var httpClient = _httpClientFactory.CreateClient(HttpClientName);
 
         var formData = new Dictionary<string, string>
         {

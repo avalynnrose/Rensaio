@@ -109,8 +109,8 @@ imageio-webp = "com.github.usefulness:webp-imageio:0.4.1"
 
 # Webview
 jcefmaven = "me.friwi:jcefmaven:146.0.10"
-#db
-h2 = "com.h2database:h2:1.4.200" 
+# NOTE: the embedded H2 database driver was removed along with H2TableReader. It was
+# only used by the deprecated Suwayomi H2 import; no remaining code opens H2 over JDBC.
 
 # lint - used for renovate to update ktlint version
 ktlint = { module = "com.pinterest.ktlint:ktlint-cli", version.ref = "ktlint" }
@@ -158,7 +158,6 @@ shared = [
     "apk-parser",
     "jackson-annotations",
     "jcefmaven",
-    "h2",
     "serialization-xml",
     "serialization-xml-core",
     "okhttp-core",

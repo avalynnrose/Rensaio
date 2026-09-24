@@ -7,4 +7,13 @@
     <RootNamespace>RensaioOAuthProxy</RootNamespace>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!--
+      Shared source: provider resilience (exponential retry + per-host circuit
+      breaker), identical to the copy RensaioBackend compiles. Linked as source
+      so the proxy stays dependency-free while sharing one implementation.
+    -->
+    <Compile Include="..\shared\ProviderResilience\ProviderResilience.cs" Link="Resilience\ProviderResilience.cs" />
+  </ItemGroup>
+
 </Project>

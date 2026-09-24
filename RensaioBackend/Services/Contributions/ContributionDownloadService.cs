@@ -198,6 +198,16 @@ public class ContributionDownloadService
             }
 
             var localByCloudMapping = new Dictionary<Guid, Guid>();
+
+            // Pairs already tracked (added/attached earlier in this unit of work) and pairs
+            // already queued by THIS loop. The DB-only AnyAsync below cannot see either, so
+            // without this two cloud mappings collapsing onto one local mapping (or a
+            // re-apply in the same context) would Add the same (MappingId, TitleId) twice
+            // and EF would throw an identity-conflict on the composite key.
+            var knownPairs = _contributorDb.ChangeTracker.Entries<MappingTitleEntity>()
+                .Select(e => (e.Entity.MappingId, e.Entity.TitleId))
+                .ToHashSet();
+
             foreach (var (cloudMappingId, titleIds) in cloudMappingTitlesById)
             {
                 var localMappingId = await ResolveLocalMappingAsync(titleIds, token).ConfigureAwait(false);
@@ -206,6 +216,9 @@ public class ContributionDownloadService
                 // Ensure every association exists under the LOCAL mapping id.
                 foreach (var titleId in titleIds.Distinct())
                 {
+                    if (!knownPairs.Add((localMappingId, titleId)))
+                        continue;
+
                     bool exists = await _contributorDb.MappingTitles
                         .AnyAsync(mt => mt.MappingId == localMappingId && mt.TitleId == titleId, token)
                         .ConfigureAwait(false);

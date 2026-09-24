@@ -8,7 +8,7 @@ using RensaioBackend.Services.Import;
 using RensaioBackend.Services.Providers;
 using RensaioBackend.Services.Settings;
 using Microsoft.Extensions.Caching.Memory;
-using Mihon.ExtensionsBridge.Core.Extensions;
+using Mihon.ExtensionsBridge.Models.Helpers;
 using Mihon.ExtensionsBridge.Models.Extensions;
 using System.Collections.Concurrent;
 using System.Globalization;

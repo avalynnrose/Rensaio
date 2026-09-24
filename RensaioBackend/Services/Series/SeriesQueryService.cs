@@ -7,7 +7,7 @@ using RensaioBackend.Services.Providers;
 using RensaioBackend.Services.Settings;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
-using Mihon.ExtensionsBridge.Core.Extensions;
+using Mihon.ExtensionsBridge.Models.Helpers;
 using System.Net;
 
 namespace RensaioBackend.Services.Series

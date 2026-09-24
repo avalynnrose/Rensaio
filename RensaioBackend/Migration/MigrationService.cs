@@ -1,4 +1,3 @@
-using com.sun.org.apache.xpath.@internal.objects;
 using RensaioBackend.Data;
 using RensaioBackend.Migration.Models;
 using RensaioBackend.Models.Enums;
@@ -11,14 +10,10 @@ using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
-using Mihon.ExtensionsBridge.Core.Extensions;
-using Mihon.ExtensionsBridge.Core.Runtime;
-using Mihon.ExtensionsBridge.Core.Utilities;
 using Mihon.ExtensionsBridge.Models;
+using Mihon.ExtensionsBridge.Models.Helpers;
 using Mihon.ExtensionsBridge.Models.Abstractions;
 using Mihon.ExtensionsBridge.Models.Extensions;
-using sun.java2d.loops;
-using sun.misc;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -211,7 +206,9 @@ public class MigrationService
         // Same EnsureCreated/Migrate conflict fix as above for v1→v2 migration path.
         await MarkAllMigrationsAsAppliedAsync(targetDb, cancellationToken).ConfigureAwait(false);
         MigrationState state = new();
-        ObtainOriginalMangaMap(Path.GetDirectoryName(legacyDatabasePath)!, state);
+        // DEPRECATED: the optional Suwayomi H2 database enrichment (MANGA table) was
+        // removed. Provider resolution uses the language-based lookup, and metadata is
+        // enriched via source search, both of which were already the fallback path.
         await MigrateSettingsAsync(legacyDb, targetDb, state, cancellationToken).ConfigureAwait(false);
         var settingsService = _serviceProvider.GetRequiredService<SettingsService>();
         _logger.LogInformation("Set Mihon Settings from Original database");
@@ -228,13 +225,6 @@ public class MigrationService
         return true;
     }
 
-
-    private void ObtainOriginalMangaMap(string path, MigrationState state)
-    {
-        _logger.LogInformation("Load original Manga Information from Suwayomi DB. This may take a while...");
-        string fullPath = Path.Combine(path, "Suwayomi","database");
-        state.OriginalMap = H2DatabaseUtils.ObtainMangaTableFromSuwayomiIfPossible(fullPath) ?? new Dictionary<int, (long, ParsedManga)>();
-    }
 
     private async Task MigrateSettingsAsync(OldDbContext legacyDb, AppDbContext targetDb, MigrationState state, CancellationToken cancellationToken)
     {
@@ -730,22 +720,14 @@ public class MigrationService
         };
         ParsedManga? resolvedManga = null;
         ISourceInterop? sourceInterop = null;
-        NewProviderStorage? ps;
+        // DEPRECATED: the Suwayomi H2 lookup that could pre-seed resolvedManga was removed.
+        // Resolution now always uses the language-based provider lookup and, when needed,
+        // source search (see TryResolveMangaAsync).
         bool fromDb = false;
-        if (state.OriginalMap.TryGetValue(legacyProvider.SuwayomiId, out var sm))
+        NewProviderStorage? ps = context.GetProviderStorage(legacyProvider.Language);
+        if (ps != null)
         {
-            fromDb = true;
-            ps = context.GetProviderStorage(sm.Item1);
-            resolvedManga = sm.Item2;
-            sourceInterop = await context.GetSourceInteropAsync(sm.Item1, cancellationToken).ConfigureAwait(false);
-        }
-        else
-        {
-            ps = context.GetProviderStorage(legacyProvider.Language);
-            if (ps != null)
-            {
-                sourceInterop = await context.GetSourceInteropAsync(destination.Provider, legacyProvider.Language, cancellationToken).ConfigureAwait(false);
-            }
+            sourceInterop = await context.GetSourceInteropAsync(destination.Provider, legacyProvider.Language, cancellationToken).ConfigureAwait(false);
         }
         if (ps==null || sourceInterop==null)
         {
@@ -1308,7 +1290,6 @@ public class MigrationService
 
     private sealed class MigrationState
     {
-        public Dictionary<int, (long, ParsedManga)> OriginalMap { get; set; }
         public List<RensaioBackend.Models.Database.SeriesProviderEntity> SeriesProviders { get; set; } = [];
         public IReadOnlyList<string> MihonRepositories { get; set; } = Array.Empty<string>();
         public IReadOnlyList<string> Languages { get; set; } = Array.Empty<string>();
