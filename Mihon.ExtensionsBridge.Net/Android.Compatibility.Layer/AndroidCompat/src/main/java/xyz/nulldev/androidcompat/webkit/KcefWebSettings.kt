@@ -2,7 +2,13 @@ package xyz.nulldev.androidcompat.webkit
 
 import android.webkit.WebSettings
 
-class KcefWebSettings : WebSettings() {
+/**
+ * Engine-neutral in-memory [WebSettings] implementation.
+ *
+ * Previously named `KcefWebSettings`; it holds no CEF state, so it is shared by both the JCEF
+ * provider and the .NET-hosted browser provider (see [PlaywrightWebViewProvider]).
+ */
+class BrowserWebSettings : WebSettings() {
     // Boolean settings
     private var navDumps = false
     private var mediaPlaybackRequiresUserGesture = true

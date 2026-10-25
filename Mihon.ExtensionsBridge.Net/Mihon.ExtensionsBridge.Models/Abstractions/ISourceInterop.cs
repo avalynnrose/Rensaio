@@ -16,6 +16,14 @@ namespace Mihon.ExtensionsBridge.Models.Abstractions
         Task<MangaUpdate> GetDetailsAndChaptersAsync(Manga manga, CancellationToken token = default);
         Task<List<ParsedChapter>> GetChaptersAsync(Manga manga, CancellationToken token = default);
         Task<ParsedManga> GetDetailsAsync(Manga manga, CancellationToken token = default);
+
+        /// <summary>
+        /// Resolves the absolute source page url for a manga from its (possibly relative) url.
+        /// Delegates to the extension's <c>HttpSource.getMangaUrl(SManga)</c>, which applies the
+        /// source's base url (and any per-source override). Returns an empty string when the
+        /// source does not support HTTP urls.
+        /// </summary>
+        Task<string> GetMangaUrlAsync(Manga manga, CancellationToken token = default);
         Task<ContentTypeStream> GetPageImageAsync(Page page, CancellationToken token = default);
         Task<ContentTypeStream> DownloadUrlAsync(string url, CancellationToken token = default);
         Task<MangaList> GetLatestAsync(int page, CancellationToken token = default);

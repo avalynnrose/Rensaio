@@ -1,4 +1,5 @@
 using RensaioBackend.Models.Abstractions;
+using RensaioBackend.Models.Enums;
 using System.Text.Json.Serialization;
 
 namespace RensaioBackend.Models.Dto;
@@ -33,6 +34,13 @@ public sealed class ContributionMappingSourceDto : IThumb
     /// <summary>Cover from the source record (Data.ThumbnailUrl) — the group shows the first non-empty one.</summary>
     [JsonPropertyName("thumbnailUrl")]
     public string? ThumbnailUrl { get; set; }
+
+    /// <summary>
+    /// Fully-resolved, absolute source page url (the entry's Data.Url transformed through the
+    /// owning extension's <c>getMangaUrl</c>), so the UI can deep-link straight to the series page.
+    /// </summary>
+    [JsonPropertyName("sourceUrl")]
+    public string? SourceUrl { get; set; }
 
     /// <summary>Alias for the thumbnail-cache rewrite machine; never serialized (see thumbnailUrl).</summary>
     [JsonIgnore]
@@ -74,6 +82,13 @@ public sealed class ContributionMappingGroupDto : IThumb
     [JsonPropertyName("titles")]
     public List<string> Titles { get; set; } = [];
 
+    /// <summary>
+    /// Set when the mapping is Verified (EVERY live source entry carries a VerifiedDateUTC — the
+    /// most recent one is reported); null when Unverified (at least one live entry is null).
+    /// </summary>
+    [JsonPropertyName("verifiedDateUtc")]
+    public DateTime? VerifiedDateUtc { get; set; }
+
     [JsonPropertyName("sources")]
     public List<ContributionMappingSourceDto> Sources { get; set; } = [];
 
@@ -111,4 +126,75 @@ public sealed class ContributionMappingLinkDto
 
     [JsonPropertyName("externalSeriesTitle")]
     public string? ExternalSeriesTitle { get; set; }
+}
+
+/// <summary>Request body for joining two or more contribution mappings into one.</summary>
+public sealed class ContributionMappingJoinDto
+{
+    /// <summary>The mapping (Series) ids to merge. Two or more required.</summary>
+    [JsonPropertyName("mappingIds")]
+    public List<Guid> MappingIds { get; set; } = [];
+}
+
+/// <summary>
+/// One ranked candidate returned by the Contribution page's "Smart Search". It carries the same
+/// surface the normal provider search exposes (<see cref="ScrobblerSearchResult"/>) plus the
+/// combined scoring used to rank it: <c>Score</c> is the blended value the list is sorted by,
+/// <c>TitleScore</c> the pure title-match percentage and <c>ImageScore</c>/<c>ImageDistance</c>
+/// the best PDQ cover comparison against the series' reference covers (null when no image could
+/// be compared).
+/// </summary>
+public sealed class SmartSearchHitDto : IThumb
+{
+    [JsonPropertyName("externalId")]
+    public string ExternalId { get; set; } = string.Empty;
+
+    [JsonPropertyName("title")]
+    public string Title { get; set; } = string.Empty;
+
+    [JsonPropertyName("alternateTitles")]
+    public List<string> AlternateTitles { get; set; } = [];
+
+    [JsonPropertyName("coverUrl")]
+    public string? CoverUrl { get; set; }
+
+    /// <summary>Alias for the thumbnail-cache rewrite machine; never serialized (see coverUrl).</summary>
+    [JsonIgnore]
+    public string? ThumbnailUrl
+    {
+        get => CoverUrl;
+        set => CoverUrl = value;
+    }
+
+    [JsonPropertyName("type")]
+    public string? Type { get; set; }
+
+    [JsonPropertyName("year")]
+    public string? Year { get; set; }
+
+    /// <summary>Blended ranking score (0..100); the list is sorted by this descending.</summary>
+    [JsonPropertyName("score")]
+    public double Score { get; set; }
+
+    /// <summary>Best title-match percentage (0..100) against the mapping's candidate titles.</summary>
+    [JsonPropertyName("titleScore")]
+    public int TitleScore { get; set; }
+
+    /// <summary>Best cover similarity percentage (0..100) against the series' reference images; null when none.</summary>
+    [JsonPropertyName("imageScore")]
+    public int? ImageScore { get; set; }
+
+    /// <summary>PDQ Hamming distance of the best cover comparison; null when no image was compared.</summary>
+    [JsonPropertyName("imageDistance")]
+    public int? ImageDistance { get; set; }
+}
+
+/// <summary>Response for the Contribution page's "Smart Search" (top ranked provider candidates).</summary>
+public sealed class SmartSearchResultDto
+{
+    [JsonPropertyName("provider")]
+    public ExternalSeriesProvider Provider { get; set; }
+
+    [JsonPropertyName("results")]
+    public List<SmartSearchHitDto> Results { get; set; } = [];
 }

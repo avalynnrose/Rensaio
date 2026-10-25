@@ -37,6 +37,12 @@ public sealed class RpcAppSettings
     /// </summary>
     public int? ParentProcessId { get; set; }
 
+    /// <summary>
+    /// Path the host writes its readiness handshake to. When set, the supervisor learns the
+    /// bound port from this file instead of a redirected stdout pipe (no stdio redirection).
+    /// </summary>
+    public string? HandshakeFile { get; set; }
+
     /// <summary>Parses "key=value" switches; unknown keys are ignored.</summary>
     public static RpcAppSettings Parse(string[] args)
     {
@@ -67,6 +73,9 @@ public sealed class RpcAppSettings
                 case "parentpid":
                     if (int.TryParse(value, out int ppid) && ppid > 0)
                         settings.ParentProcessId = ppid;
+                    break;
+                case "handshake-file":
+                    settings.HandshakeFile = value;
                     break;
                 case "rpc:cef:enabled":
                 case "cefenabled":

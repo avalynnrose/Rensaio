@@ -107,8 +107,10 @@ twelvemonkeys-imageio-webp = { module = "com.twelvemonkeys.imageio:imageio-webp"
 
 imageio-webp = "com.github.usefulness:webp-imageio:0.4.1"
 
-# Webview
-jcefmaven = "me.friwi:jcefmaven:146.0.10"
+# NOTE: jcefmaven (me.friwi:jcefmaven) was removed. Browser hosting moved to the .NET
+# host (Mihon.ExtensionsBridge.Browser, Patchright/Playwright); the JVM no longer owns a
+# browser, so no CEF distribution, jcef_helper process, or JOGL/JOGAMP native dependency
+# ships with the JVM side.
 # NOTE: the embedded H2 database driver was removed along with H2TableReader. It was
 # only used by the deprecated Suwayomi H2 import; no remaining code opens H2 over JDBC.
 
@@ -157,7 +159,6 @@ shared = [
     "dex2jar-tools",
     "apk-parser",
     "jackson-annotations",
-    "jcefmaven",
     "serialization-xml",
     "serialization-xml-core",
     "okhttp-core",

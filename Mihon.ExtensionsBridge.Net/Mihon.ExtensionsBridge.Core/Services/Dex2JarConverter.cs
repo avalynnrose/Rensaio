@@ -69,8 +69,15 @@ namespace Mihon.ExtensionsBridge.Core.Services
         /// <c>Object.&lt;init&gt;</c>). ART accepts it; the JVM verifier requires the direct superclass
         /// ("Call to wrong initialization method", MangaDex serialization DTOs). Unlike the 1.3.0 shape the
         /// receiver is the uninitialised <c>this</c>, not a NEW result.
+        /// Bumped to 1.5.3 for the assignment-driven retype: dex2jar can <em>rotate</em> NEW emission sites
+        /// across a subtype family (e.g. protobuf's <c>r1</c> / <c>h1</c> / <c>u1</c> inside
+        /// <c>beginStructure</c>). The multiset anchoring then sees equal type multisets, declares the
+        /// method correct, and leaves a <c>NEW r1</c> that is later stored into a <c>h1</c> field — the
+        /// verifier rejects it ("Unexpected type r1 where h1 was expected"). The new pass derives the
+        /// required subtype from the consuming putfield/invoke/areturn and retypes the NEW, independent of
+        /// the oracle's ordering.
         /// </remarks>
-        public const string Version = "1.5.2";
+        public const string Version = "1.5.3";
 
         /// <summary>
         /// Classpath prefix used to redirect certain Android framework classes to compatibility replacements.

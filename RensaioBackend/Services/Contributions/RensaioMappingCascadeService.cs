@@ -4,6 +4,7 @@ using RensaioBackend.Data;
 using RensaioBackend.Models.ContributionDatabase;
 using RensaioBackend.Models.Database;
 using RensaioBackend.Models.Enums;
+using RensaioBackend.Services.Metadata;
 using RensaioBackend.Services.Series;
 
 namespace RensaioBackend.Services.Contributions;
@@ -23,17 +24,20 @@ public sealed class RensaioMappingCascadeService
     private readonly AppDbContext _db;
     private readonly ContributionDbContext _contributorDb;
     private readonly SeriesStateService _seriesStateService;
+    private readonly MetadataLinkEngine _linkEngine;
     private readonly ILogger<RensaioMappingCascadeService> _logger;
 
     public RensaioMappingCascadeService(
         AppDbContext db,
         ContributionDbContext contributorDb,
         SeriesStateService seriesStateService,
+        MetadataLinkEngine linkEngine,
         ILogger<RensaioMappingCascadeService> logger)
     {
         _db = db;
         _contributorDb = contributorDb;
         _seriesStateService = seriesStateService;
+        _linkEngine = linkEngine;
         _logger = logger;
     }
 
@@ -43,17 +47,22 @@ public sealed class RensaioMappingCascadeService
     /// be null when none exists yet) and must mutate/flag it; <paramref name="create"/> supplies the
     /// row to create when none exists (return null to skip creation); when <paramref name="delete"/>
     /// is true an existing row is removed (tombstone) instead of mutated.
+    ///
+    /// When <paramref name="automatch"/> is true the metadata link engine is re-run for each
+    /// collided series after the change is persisted, so the freshly-confirmed provider seeds a
+    /// link pass that propagates to every OTHER provider (alternates) the seeded provider declares
+    /// — mirroring <c>SeriesMatchingService.ConfirmMatchAsync</c>'s behaviour on the Rensaio side.
     /// </summary>
     public async Task CascadeAsync(Guid mappingId, ExternalSeriesProvider provider,
         Action<SeriesMappingEntity>? apply = null, Func<Guid, SeriesMappingEntity>? create = null,
-        bool delete = false, CancellationToken token = default)
+        bool delete = false, bool automatch = false, CancellationToken token = default)
     {
         try
         {
             // 1. Resolve the mapping's normalized titles (the automerge identity set).
-            var mappingTitles = await _contributorDb.MappingTitles
+            var mappingTitles = await _contributorDb.SeriesTitles
                 .Include(mt => mt.Title)
-                .Where(mt => mt.MappingId == mappingId)
+                .Where(mt => mt.SeriesId == mappingId)
                 .AsNoTracking()
                 .ToListAsync(token).ConfigureAwait(false);
 
@@ -118,6 +127,25 @@ public sealed class RensaioMappingCascadeService
 
                 await _db.SaveChangesAsync(token).ConfigureAwait(false);
                 await _seriesStateService.SyncToRensaioJsonAsync(series.Id, token).ConfigureAwait(false);
+
+                // Automatch: re-run the cross-provider engine for this series so the confirmed
+                // provider seeds a pass that links the remaining (alternate) providers too.
+                if (automatch && !delete)
+                {
+                    try
+                    {
+                        await _linkEngine.LinkSeriesAsync(series.Id, token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex,
+                            "Automatch after cascade failed for Rensaio series {SeriesId}", series.Id);
+                    }
+                }
             }
         }
         catch (Exception ex)

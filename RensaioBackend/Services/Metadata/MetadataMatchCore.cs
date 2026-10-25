@@ -2,7 +2,9 @@ using RensaioBackend.Models.Dto;
 using RensaioBackend.Models.Enums;
 using RensaioBackend.Services.Scrobbling;
 using RensaioBackend.Services.Scrobbling.Abstractions;
+using RensaioBackend.Utils.ImageHashing;
 using Microsoft.Extensions.Logging;
+using System.Text;
 
 namespace RensaioBackend.Services.Metadata;
 
@@ -56,12 +58,23 @@ public sealed class MetadataMatchCore
     /// <summary>Per-provider cap on how many distinct titles may be searched in the second pass.</summary>
     private const int MaxSecondPassCandidatesPerProvider = 50;
 
+    /// <summary>Title-score window (percentage points) within which candidates are image tie-broken.</summary>
+    private const int ImageTieBreakWindow = 5;
+
+    /// <summary>Max distinct candidate ids hashed for an image tie-break.</summary>
+    private const int MaxImageContenders = 6;
+
+    /// <summary>Cover distance up to which an image tie-break may override raw title order.</summary>
+    private const int ImageTieBreakAcceptThreshold = 64;
+
     private readonly ExternalSeriesProviderFactory _factory;
+    private readonly ImageMatchCore _imageMatch;
     private readonly ILogger<MetadataMatchCore> _logger;
 
-    public MetadataMatchCore(ExternalSeriesProviderFactory factory, ILogger<MetadataMatchCore> logger)
+    public MetadataMatchCore(ExternalSeriesProviderFactory factory, ImageMatchCore imageMatch, ILogger<MetadataMatchCore> logger)
     {
         _factory = factory;
+        _imageMatch = imageMatch;
         _logger = logger;
     }
 
@@ -99,6 +112,19 @@ public sealed class MetadataMatchCore
     /// (computed by the caller from its own persisted state). <paramref name="enabledProviders"/>
     /// optionally narrows second-pass and propagation targets (null = all providers enabled).
     /// </summary>
+    /// <summary>Convenience overload for callers that have a local cover but no Mihon provider id.</summary>
+    public Task<MetadataMatchResult> MatchAsync(
+        List<string> titleCandidates,
+        IReadOnlyList<IExternalSeriesProvider> providers,
+        List<MetadataLinkSeed> seeds,
+        Dictionary<ExternalSeriesProvider, HashSet<string>> blockedIds,
+        HashSet<ExternalSeriesProvider> skippedProviders,
+        HashSet<ExternalSeriesProvider>? enabledProviders,
+        string? localCoverUrl,
+        CancellationToken token = default)
+        => MatchAsync(titleCandidates, providers, seeds, blockedIds, skippedProviders,
+            enabledProviders, token, localCoverUrl, null);
+
     public async Task<MetadataMatchResult> MatchAsync(
         List<string> titleCandidates,
         IReadOnlyList<IExternalSeriesProvider> providers,
@@ -106,9 +132,41 @@ public sealed class MetadataMatchCore
         Dictionary<ExternalSeriesProvider, HashSet<string>> blockedIds,
         HashSet<ExternalSeriesProvider> skippedProviders,
         HashSet<ExternalSeriesProvider>? enabledProviders = null,
-        CancellationToken token = default)
+        CancellationToken token = default,
+        string? localCoverUrl = null,
+        string? mihonProviderId = null)
     {
         var result = new MetadataMatchResult();
+
+        // Local cover hash (computed once) used to corroborate borderline title matches.
+        // A null/empty hash simply disables image corroboration for this pass.
+        PdqHash256? localHash = null;
+        if (!string.IsNullOrWhiteSpace(localCoverUrl))
+        {
+            try
+            {
+                localHash = await _imageMatch.GetLocalHashAsync(localCoverUrl, mihonProviderId, token).ConfigureAwait(false);
+                if (localHash is { IsEmpty: false })
+                    _logger.LogInformation("Local cover hash ready — image corroboration ENABLED ({Url})", localCoverUrl);
+                else
+                    _logger.LogInformation("Local cover could not be hashed — image corroboration DISABLED ({Url})", localCoverUrl);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogInformation(ex, "Local cover hash unavailable — image corroboration DISABLED ({Url})", localCoverUrl);
+            }
+        }
+        else
+        {
+            _logger.LogInformation("No local cover supplied — image matching SKIPPED for this pass");
+        }
+
+        _logger.LogInformation("Matching {CandidateCount} title candidate(s) [image {ImageState}]: {Titles}",
+            titleCandidates.Count, localHash is { IsEmpty: false } ? "on" : "off", string.Join(" | ", titleCandidates));
 
         // Node set: provider -> external ID + confidence + titles + linked IDs.
         var nodes = new Dictionary<ExternalSeriesProvider, MetaDataLinkEntry>();
@@ -119,6 +177,14 @@ public sealed class MetadataMatchCore
         foreach (var seed in seeds)
         {
             if (string.IsNullOrWhiteSpace(seed.ExternalSeriesId)) continue;
+            // A stored placeholder id (e.g. myanimelist:0) is not a real link; seeding it would
+            // enqueue a doomed detail fetch and re-persist the bogus edge.
+            if (IsBogusExternalId(seed.ExternalSeriesId)) continue;
+            // Id-level block: the caller's seeds normally exclude blocked rows, but a seed can be
+            // reused from a sibling mapping (cross-mapping reuse). A blocked (provider, id) must
+            // NEVER be re-linked, so drop it here regardless of where the seed came from.
+            if (blockedIds.TryGetValue(seed.Provider, out var seedBlock) &&
+                seedBlock.Contains(seed.ExternalSeriesId)) continue;
             AddNode(nodes, seed.Provider, seed.ExternalSeriesId, seed.ExternalSeriesTitle ?? string.Empty,
                 seed.Confidence, SeriesLinkStatus.Linked);
             edges[(seed.Provider, seed.ExternalSeriesId)] = seed.Confidence;
@@ -130,127 +196,49 @@ public sealed class MetadataMatchCore
             }
         }
 
+        _logger.LogDebug("Seeded {SeedCount} existing link(s); {NodeCount} node(s) pre-linked",
+            seeds.Count, nodes.Count);
+
         // Bookkeeping to avoid fetching the same provider detail more than once per link pass
         // (e.g. MangaUpdates id reached directly + via two inbound edges).
         var fetchedIds = result.FetchedIds;
 
-        // 2. For each provider, search if not already directly linked; score via TitleMatcher.
-        // Run the per-provider searches in parallel; apply results in a single serial pass so the
-        // shared nodes/edges graph stays consistent (providers also share the HttpClient factory).
         // Per-provider history of titles already searched this pass (round 1 records the local
-        // candidates; round 2 appends every title it tries). Prevents re-searching the same title
-        // on the same provider. NOT cleared between round-1 and round-2.
+        // candidates; the second pass appends every title it tries). Prevents re-searching the
+        // same title on the same provider.
         var searchedTitles = new Dictionary<ExternalSeriesProvider, HashSet<string>>();
 
-        var providerResults = await Task.WhenAll(
-            providers
-                .Where(p => !skippedProviders.Contains(p.ProviderType))
-                .Select(async provider =>
+        // Follows provider-declared edges to resolve ADDITIONAL providers via DETAIL FETCH ONLY
+        // (never a search), up to MaxHops. Invoked (a) right after seeding — a series that already
+        // has providers must not have those providers' declared siblings searched — and (b) right
+        // after EVERY successful search match, so a declared link resolves the next providers
+        // before we would otherwise search them.
+        async Task PropagateEdgesAsync()
+        {
+            for (int hop = 1; hop <= MaxHops; hop++)
+            {
+                var frontier = edges.Where(e => e.Value > 0).ToList();
+                bool addedAny = false;
+                foreach (var edge in frontier)
                 {
-                    var providerType = provider.ProviderType;
-                    var existing = nodes.GetValueOrDefault(providerType);
-                    if (existing != null)
-                    {
-                        // Already linked from seed — later expanded via detail fetch (once per id).
-                        return (Provider: provider, Best: (MetaDataLinkEntry?)null, IsExisting: true);
-                    }
+                    var (site, id) = edge.Key;
+                    var provider = _factory.GetProvider(site);
+                    if (provider == null || !SeriesMetadataResolver.IsMetadataProvider(provider)) continue;
+                    if (enabledProviders != null && !enabledProviders.Contains(site)) continue; // not enabled
+                    if (skippedProviders.Contains(site)) continue; // provider-level ignore
+                    if (blockedIds.TryGetValue(site, out var idset) && idset.Contains(id)) continue; // id-level block
+                    if (nodes.ContainsKey(site)) continue; // already linked
+                    if (!fetchedIds.Add((site, id))) continue; // already fetched this pass
 
-                    try
-                    {
-                        blockedIds.TryGetValue(providerType, out var idBlocklist);
+                    var conf = edge.Value * HopDecay;
+                    if (conf < SuggestThreshold) continue;
 
-                        // Round 1 searches the FULL local candidate set. The per-provider
-                        // FilterLookupTitles narrows only which titles are SENT (applied inside
-                        // SearchAndScoreAsync); scoring still runs against every local candidate.
-                        var best = await SearchAndScoreAsync(provider, titleCandidates, token, idBlocklist);
+                    _logger.LogInformation("Hop {Hop} following declared edge {Site}:{Id} (edge conf {Conf:F2}) — detail fetch + map, no search",
+                        hop, site, id, edge.Value);
 
-                        // Record every local candidate as "searched" for this provider so round 2
-                        // never retests them.
-                        if (!searchedTitles.TryGetValue(providerType, out var history))
-                        {
-                            history = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                            searchedTitles[providerType] = history;
-                        }
-                        foreach (var title in titleCandidates.Where(t => !string.IsNullOrWhiteSpace(t)))
-                            history.Add(title);
+                    var metadata = await provider.FetchSeriesMetadataAsync(id, token);
+                    if (metadata == null) continue;
 
-                        return (Provider: provider, Best: best, IsExisting: false);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        throw;
-                    }
-                    catch
-                    {
-                        return (Provider: provider, Best: (MetaDataLinkEntry?)null, IsExisting: false);
-                    }
-                }));
-
-        foreach (var pr in providerResults)
-        {
-            var provider = pr.Provider;
-            var providerType = provider.ProviderType;
-            var existing = nodes.GetValueOrDefault(providerType);
-            if (existing != null)
-            {
-                // Only expand (fetch detail for) providers that are enabled — disabled providers'
-                // existing links must not trigger metadata fetches.
-                if (enabledProviders == null || enabledProviders.Contains(providerType))
-                    await ExpandViaDetailAsync(provider, existing, nodes, edges, fetchedIds, token);
-                result.ProvidersSearched++;
-                continue;
-            }
-
-            var best = pr.Best;
-            if (best == null) continue;
-            result.ProvidersSearched++;
-
-            if (best.Confidence >= AutoThreshold)
-            {
-                AddNode(nodes, providerType, best.ExternalSeriesId, best.Title ?? string.Empty, best.Confidence, SeriesLinkStatus.Linked);
-                edges[(providerType, best.ExternalSeriesId)] = best.Confidence;
-                await ExpandViaDetailAsync(provider, nodes[providerType], nodes, edges, fetchedIds, token);
-            }
-            else if (best.Confidence >= SuggestThreshold)
-            {
-                result.Suggestions.Add(best);
-            }
-        }
-
-        // 3. Second pass: using the titles gathered from ALREADY-LINKED providers only, try to
-        // fill the still-unmatched providers. FilterLookupTitles is applied per-provider here
-        // (and only here). Runs recursively until all titles are tested on the unmatched providers
-        // or all providers are matched. Round-1 titles are never retested (per-provider history).
-        await SecondPassLinkUnmatchedAsync(providers, nodes, edges, fetchedIds, searchedTitles,
-            enabledProviders, skippedProviders, blockedIds, result, token).ConfigureAwait(false);
-
-        // 3.5. Deduplicate explicit provider-node expansions: skip if already fetched via propagation.
-        foreach (var node in nodes.Values.Where(n => n.Status == SeriesLinkStatus.Linked))
-        {
-            fetchedIds.Add((node.Provider, node.ExternalSeriesId));
-        }
-
-        // 4. Propagation: follow provider-declared edges to fill gaps (max hops).
-        for (int hop = 1; hop <= MaxHops; hop++)
-        {
-            var frontier = edges.Where(e => e.Value > 0).ToList();
-            foreach (var edge in frontier)
-            {
-                var (site, id) = edge.Key;
-                var provider = _factory.GetProvider(site);
-                if (provider == null || !SeriesMetadataResolver.IsMetadataProvider(provider)) continue;
-                if (enabledProviders != null && !enabledProviders.Contains(site)) continue; // not enabled
-                if (skippedProviders.Contains(site)) continue; // provider-level ignore
-                if (blockedIds.TryGetValue(site, out var idset) && idset.Contains(id)) continue; // id-level block
-                if (nodes.ContainsKey(site)) continue; // already linked
-                if (!fetchedIds.Add((site, id))) continue; // already fetched this pass
-
-                var conf = edge.Value * HopDecay;
-                if (conf < SuggestThreshold) continue;
-
-                var metadata = await provider.FetchSeriesMetadataAsync(id, token);
-                if (metadata != null)
-                {
                     // AlternateTitles never contains the primary title (see TitleListBuilder);
                     // score against title + alternates but persist only the alternates.
                     var altTitles = metadata.AlternativeTitles;
@@ -258,10 +246,21 @@ public sealed class MetadataMatchCore
                     scoringTitles.AddRange(altTitles);
                     var matchScore = ScoreAgainstLocal(scoringTitles, titleCandidates);
                     var finalConfidence = Math.Max(conf, matchScore);
+                    // Cover corroboration: a borderline title (suggest band) whose cover matches the
+                    // local series cover is approved to Linked — same rule as the round-1 search.
+                    if (localHash is { IsEmpty: false }
+                        && finalConfidence >= SuggestThreshold && finalConfidence < AutoThreshold
+                        && await IsCoverCorroboratedAsync(metadata.CoverUrl, localHash.Value, token).ConfigureAwait(false))
+                    {
+                        finalConfidence = AutoThreshold;
+                    }
                     var status = finalConfidence >= AutoThreshold ? SeriesLinkStatus.Linked : SeriesLinkStatus.Suggested;
 
+                    // Pass the detail fetch's cover + native metadata through: this path has the
+                    // payload in hand and, unlike ExpandViaDetailAsync, would otherwise drop it —
+                    // leaving propagated providers with no provider cover on the Contribution page.
                     AddNode(nodes, site, metadata.ExternalId, metadata.Title, finalConfidence, status,
-                        metadata.LinkedSitesIds, altTitles);
+                        metadata.LinkedSitesIds, altTitles, metadata.CoverUrl, metadata.MetaData);
 
                     if (status == SeriesLinkStatus.Linked)
                         edges[(site, metadata.ExternalId)] = finalConfidence;
@@ -270,20 +269,121 @@ public sealed class MetadataMatchCore
                     {
                         var (lsite, lid) = SplitSiteId(linked);
                         if (lsite.HasValue && !string.IsNullOrWhiteSpace(lid))
-                        {
                             edges[(lsite.Value, lid)] = Math.Max(edges.GetValueOrDefault((lsite.Value, lid)), finalConfidence * HopDecay);
-                        }
                     }
 
                     // expand local title pool with the discovered titles for better matching
                     foreach (var t in scoringTitles)
                         titleCandidates.Add(t);
                     titleCandidates = titleCandidates.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                    addedAny = true;
                 }
+                if (!addedAny) break;
             }
         }
 
+        // (a) Expand the seeded nodes once (fetch detail → cover/metadata + declared links).
+        foreach (var seedNode in nodes.Values.ToList())
+        {
+            var provider = _factory.GetProvider(seedNode.Provider);
+            if (provider == null) continue;
+            if (enabledProviders != null && !enabledProviders.Contains(seedNode.Provider)) continue;
+            await ExpandViaDetailAsync(provider, seedNode, nodes, edges, fetchedIds, token);
+            result.ProvidersSearched++;
+        }
+
+        // (a) Follow the seeds' declared links BEFORE any search: providers already known for this
+        //     series are not searched, and their declared siblings are resolved via detail only.
+        await PropagateEdgesAsync();
+
+        // 2. Search the still-unmatched providers ONE BY ONE (hub first, per the caller's order).
+        //    After EACH match the declared links are propagated immediately, so a hub that declares
+        //    the other providers resolves them via detail — they are never searched. Providers
+        //    resolved by a seed or by propagation are skipped entirely. This is what removes the
+        //    "same title searched on every provider" waste.
+        foreach (var provider in providers)
+        {
+            var providerType = provider.ProviderType;
+            if (skippedProviders.Contains(providerType)) continue;
+            if (nodes.ContainsKey(providerType)) continue; // already matched via seed / propagation
+
+            result.ProvidersSearched++;
+
+            MetaDataLinkEntry? best;
+            try
+            {
+                blockedIds.TryGetValue(providerType, out var idBlocklist);
+
+                // Round 1 searches the FULL local candidate set. The per-provider
+                // FilterLookupTitles narrows only which titles are SENT (applied inside
+                // SearchAndScoreAsync); scoring still runs against every local candidate.
+                best = await SearchAndScoreAsync(provider, titleCandidates, token, idBlocklist, localHash);
+
+                if (!searchedTitles.TryGetValue(providerType, out var history))
+                {
+                    history = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    searchedTitles[providerType] = history;
+                }
+                foreach (var title in titleCandidates.Where(t => !string.IsNullOrWhiteSpace(t)))
+                    history.Add(title);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                best = null;
+            }
+
+            if (best == null)
+            {
+                _logger.LogInformation("Round-1 {Provider} → no link", providerType);
+                continue;
+            }
+
+            if (best.Confidence >= AutoThreshold)
+            {
+                AddNode(nodes, providerType, best.ExternalSeriesId, best.Title ?? string.Empty, best.Confidence, SeriesLinkStatus.Linked);
+                edges[(providerType, best.ExternalSeriesId)] = best.Confidence;
+                await ExpandViaDetailAsync(provider, nodes[providerType], nodes, edges, fetchedIds, token);
+                _logger.LogInformation("Round-1 {Provider} → {Id} '{Title}' (Linked, conf {Conf:F2})",
+                    providerType, best.ExternalSeriesId, best.Title, best.Confidence);
+
+                // Resolve this match's declared links BEFORE searching the remaining providers.
+                await PropagateEdgesAsync();
+            }
+            else if (best.Confidence >= SuggestThreshold)
+            {
+                result.Suggestions.Add(best);
+                _logger.LogInformation("Round-1 {Provider} → {Id} '{Title}' (Suggested, conf {Conf:F2})",
+                    providerType, best.ExternalSeriesId, best.Title, best.Confidence);
+            }
+            else
+            {
+                _logger.LogInformation("Round-1 {Provider} → no link (best {Best:F2})", providerType, best.Confidence);
+            }
+        }
+
+        // 3. Second pass: using the titles gathered from ALREADY-LINKED providers only, try to
+        //    fill the still-unmatched providers (titles-based search). FilterLookupTitles is applied
+        //    per-provider here. Round-1 titles are never retested (per-provider history).
+        await SecondPassLinkUnmatchedAsync(providers, nodes, edges, fetchedIds, searchedTitles,
+            enabledProviders, skippedProviders, blockedIds, result, localHash, token).ConfigureAwait(false);
+
+        // 3.5. Deduplicate explicit provider-node expansions: skip if already fetched via propagation.
+        foreach (var node in nodes.Values.Where(n => n.Status == SeriesLinkStatus.Linked))
+        {
+            fetchedIds.Add((node.Provider, node.ExternalSeriesId));
+        }
+
+        // 4. Final propagation: follow any declared edges surfaced by the second pass.
+        await PropagateEdgesAsync();
+
         result.Links = nodes.Values.Where(n => n.Status == SeriesLinkStatus.Linked).ToList();
+        _logger.LogInformation(
+            "Done — {Linked} linked, {Suggested} suggestion(s), {Edges} edge(s), {Searched} provider(s) searched",
+            result.Links.Count, result.Suggestions.Count, edges.Count, result.ProvidersSearched);
         return result;
     }
 
@@ -304,6 +404,7 @@ public sealed class MetadataMatchCore
         HashSet<ExternalSeriesProvider> skippedProviders,
         Dictionary<ExternalSeriesProvider, HashSet<string>> blockedIds,
         MetadataMatchResult result,
+        PdqHash256? localHash,
         CancellationToken token)
     {
         // Already-linked providers contribute titles; unmatched providers are the targets.
@@ -371,8 +472,19 @@ public sealed class MetadataMatchCore
                             foreach (var alt in best.AlternateTitles)
                                 candidateTitles.Add(alt);
                         var score = ScoreAgainstLocal(candidateTitles, pool);
+                        // Cover corroboration: a borderline title (suggest band) whose cover matches
+                        // the local series cover is approved to Linked — same rule as the round-1 search.
+                        if (localHash is { IsEmpty: false }
+                            && score >= SuggestThreshold && score < AutoThreshold
+                            && await IsCoverCorroboratedAsync(best.CoverUrl, localHash.Value, token).ConfigureAwait(false))
+                        {
+                            score = AutoThreshold;
+                        }
                         if (score >= AutoThreshold)
                         {
+                            _logger.LogInformation(
+                                "Second pass linked {Provider}:{Id} ('{Title}', score {Score:F2})",
+                                providerType, best.ExternalId, best.Title, score);
                             AddNode(nodes, providerType, best.ExternalId, best.Title ?? string.Empty, score, SeriesLinkStatus.Linked);
                             edges[(providerType, best.ExternalId)] = score;
                             foreach (var l in best.LinkedSitesIds ?? [])
@@ -428,8 +540,11 @@ public sealed class MetadataMatchCore
 
     private async Task<MetaDataLinkEntry?> SearchAndScoreAsync(
         IExternalSeriesProvider provider, IEnumerable<string> localCandidates, CancellationToken token,
-        HashSet<string>? blockedIds = null)
+        HashSet<string>? blockedIds = null, PdqHash256? localHash = null)
     {
+        // Materialize once: used for the incremental short-circuit probe and the final score.
+        var local = localCandidates as IList<string> ?? localCandidates.ToList();
+
         var candidates = new List<(string SearchTitle, string Id)>();
         var lookup = new Dictionary<string, OscillatingResult>(StringComparer.OrdinalIgnoreCase);
 
@@ -438,9 +553,16 @@ public sealed class MetadataMatchCore
         // (e.g. ComicVine rejects CJK / Bangumi keeps only CJK) still participates in match
         // scoring against the results returned for the provider's usable titles. Providers
         // that do not narrow (the default pass-through) behave exactly as before.
-        var searchTitles = provider.FilterLookupTitles(localCandidates)
+        //
+        // Near-duplicate collapse: spellings that differ only by quote style, punctuation or a
+        // trailing "(Polish)"/"(Korean)" qualifier map to one key, so the provider is queried
+        // ONCE per distinct title instead of once per spelling (was ~21 searches per provider).
+        var seenKeys = new HashSet<string>(StringComparer.Ordinal);
+        var searchTitles = provider.FilterLookupTitles(local)
             .Where(t => !string.IsNullOrWhiteSpace(t))
-            .Distinct(StringComparer.OrdinalIgnoreCase);
+            .Where(t => seenKeys.Add(SearchTitleKey(t)))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
 
         foreach (var title in searchTitles)
         {
@@ -458,30 +580,202 @@ public sealed class MetadataMatchCore
                 if (string.IsNullOrWhiteSpace(r.ExternalId) || string.IsNullOrWhiteSpace(r.Title)) continue;
                 if (blockedIds != null && blockedIds.Contains(r.ExternalId)) continue; // id-level block rule
                 if (lookup.ContainsKey(r.ExternalId)) continue;
-                lookup[r.ExternalId] = new OscillatingResult { Title = r.Title, Linked = r.LinkedSitesIds, Alt = r.AlternateTitles };
+                lookup[r.ExternalId] = new OscillatingResult { Title = r.Title, Linked = r.LinkedSitesIds, Alt = r.AlternateTitles, CoverUrl = r.CoverUrl };
                 candidates.Add((r.Title, r.ExternalId));
                 foreach (var alt in r.AlternateTitles.Where(a => !string.IsNullOrWhiteSpace(a)))
                     candidates.Add((alt, r.ExternalId));
+            }
+
+            // Short-circuit: once the accumulated results already auto-match, further title
+            // variants cannot improve the winner — stop searching this provider.
+            if (candidates.Count > 0)
+            {
+                var probe = TitleMatcher.MatchTitles(local.ToList(), candidates, 0);
+                if (probe.Length > 0 && probe[0].Percentage / 100.0 >= AutoThreshold)
+                    break;
             }
         }
 
         if (candidates.Count == 0) return null;
 
-        var scored = TitleMatcher.MatchTitles(localCandidates.ToList(), candidates, 0);
+        var scored = TitleMatcher.MatchTitles(local.ToList(), candidates, 0);
         if (scored.Length == 0) return null;
 
         var best = scored[0];
         var info = lookup.GetValueOrDefault(best.Id);
+        var titleConfidence = best.Percentage / 100.0;
+
+        // Image (PDQ) tie-break + corroboration.
+        //
+        // The title matcher can return several DISTINCT candidates within a few points of the top
+        // (same title, different edition/region/entry). When a local cover hash is available we
+        // hash the covers of every candidate within ImageTieBreakWindow of the top title score and
+        // pick the closest cover:
+        //   * a candidate whose cover is the SAME image wins the tie-break outright, and if its
+        //     title is in the suggest band it is promoted to Linked,
+        //   * a candidate with a meaningfully closer (but not identical) cover is preferred over
+        //     the raw title order,
+        //   * unrelated covers fall through to the title order.
+        // Image alone never creates a link: promotion requires the title to be >= SuggestThreshold.
+        var imageCorroborated = false;
+        var imageUsed = false;
+        int? imageDistance = null;
+        var selected = best;
+        var selectedInfo = info;
+
+        if (localHash is { IsEmpty: false })
+        {
+            var contenders = scored
+                .GroupBy(x => x.Id)
+                .Select(g => g.First())
+                .Where(x => x.Percentage >= best.Percentage - ImageTieBreakWindow)
+                .Take(MaxImageContenders)
+                .ToList();
+
+            var needImage = contenders.Count > 1
+                || (titleConfidence >= SuggestThreshold && titleConfidence < AutoThreshold);
+
+            if (needImage)
+            {
+                try
+                {
+                    var localPdq = localHash.Value;
+                    var coverUrls = contenders
+                        .Select(c => lookup.GetValueOrDefault(c.Id)?.CoverUrl)
+                        .Where(u => !string.IsNullOrWhiteSpace(u))
+                        .Select(u => u!)
+                        .ToList();
+
+                    var hashes = await _imageMatch.GetProviderHashesAsync(coverUrls, token).ConfigureAwait(false);
+
+                    var bestDistance = int.MaxValue;
+                    var closest = best;
+                    OscillatingResult? closestInfo = info;
+                    foreach (var c in contenders)
+                    {
+                        var cover = lookup.GetValueOrDefault(c.Id)?.CoverUrl;
+                        if (string.IsNullOrWhiteSpace(cover) || !hashes.TryGetValue(cover, out var candidateHash))
+                            continue;
+
+                        var distance = PdqHashUtility.Compare(in localPdq, in candidateHash);
+                        if (distance < bestDistance)
+                        {
+                            bestDistance = distance;
+                            closest = c;
+                            closestInfo = lookup.GetValueOrDefault(c.Id);
+                        }
+                    }
+
+                    if (bestDistance != int.MaxValue)
+                        imageDistance = bestDistance;
+
+                    if (bestDistance <= ImageMatchScoring.SameImageThreshold)
+                    {
+                        // Same cover image → authoritative tie-break + (band-limited) promotion.
+                        selected = closest;
+                        selectedInfo = closestInfo;
+                        imageUsed = true;
+                        if (closest.Percentage / 100.0 >= SuggestThreshold)
+                            imageCorroborated = true;
+                        _logger.LogInformation(
+                            "Image matched {Provider}:{Id} (image dist {Distance}, similarities {Pct}%) over {Contenders} title candidate(s)",
+                            provider.ProviderType, selected.Id, bestDistance, ImageMatchScoring.DistanceToPercentage(bestDistance), contenders.Count);
+                    }
+                    else if (bestDistance <= ImageTieBreakAcceptThreshold && closest.Id != best.Id)
+                    {
+                        // Meaningfully closer cover → prefer it over the raw title order.
+                        selected = closest;
+                        selectedInfo = closestInfo;
+                        imageUsed = true;
+                        _logger.LogInformation(
+                            "Image tie-break {Provider}:{Id} (image dist {Distance}, similarities {Pct}%) over {Contenders} title candidate(s)",
+                            provider.ProviderType, selected.Id, bestDistance, ImageMatchScoring.DistanceToPercentage(bestDistance), contenders.Count);
+                    }
+                    else
+                    {
+                        // Covers are unrelated → keep the title order. Still record the distance of
+                        // the best (unrelated) cover so the diagnostic is not silently lost.
+                        if (imageDistance is { } imgDist)
+                            _logger.LogInformation(
+                                "Image checked {Provider} — closest cover dist {Distance} (similarity {Pct}%) over {Contenders} candidate(s); title order kept",
+                                provider.ProviderType, imgDist, ImageMatchScoring.DistanceToPercentage(imgDist), contenders.Count);
+                        else
+                            _logger.LogInformation(
+                                "Image checked {Provider} but no candidate cover could be hashed ({Contenders} candidate(s))",
+                                provider.ProviderType, contenders.Count);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    // image unavailable — fall back to title-only behaviour
+                    _logger.LogInformation(ex, "Image comparison failed for {Provider}; title-only result used", provider.ProviderType);
+                }
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "Image not needed for {Provider} (title {Title:F2}, {Contenders} candidate(s))",
+                    provider.ProviderType, titleConfidence, contenders.Count);
+            }
+        }
+
+        var selectedTitleConfidence = selected.Percentage / 100.0;
+        var finalConfidence = imageCorroborated && selectedTitleConfidence >= SuggestThreshold
+            ? AutoThreshold
+            : selectedTitleConfidence;
+
         return new MetaDataLinkEntry
         {
             Provider = provider.ProviderType,
-            ExternalSeriesId = best.Id,
-            Title = info?.Title ?? best.SearchTitle,
-            Confidence = best.Percentage / 100.0,
-            Status = best.Percentage / 100.0 >= AutoThreshold ? SeriesLinkStatus.Linked : SeriesLinkStatus.Suggested,
-            LinkedSitesIds = info?.Linked ?? [],
-            AlternativeTitles = info?.Alt ?? []
+            ExternalSeriesId = selected.Id,
+            Title = selectedInfo?.Title ?? selected.SearchTitle,
+            Confidence = finalConfidence,
+            Status = finalConfidence >= AutoThreshold ? SeriesLinkStatus.Linked : SeriesLinkStatus.Suggested,
+            LinkedSitesIds = selectedInfo?.Linked ?? [],
+            AlternativeTitles = selectedInfo?.Alt ?? [],
+            CoverUrl = selectedInfo?.CoverUrl,
+            ImageDistance = imageDistance,
+            ImageSimilarity = imageDistance.HasValue ? ImageMatchScoring.DistanceToPercentage(imageDistance.Value) : null,
+            ImageMatched = imageDistance is { } d && ImageMatchScoring.IsSameImage(d),
+            ImageUsed = imageUsed
         };
+    }
+
+    /// <summary>
+    /// Collapses near-duplicate title spellings for SEARCH purposes only: strips a trailing
+    /// parenthetical language/qualifier, folds quote/punctuation variants, lower-cases. Scoring
+    /// still uses the exact local candidates, so accuracy is unaffected.
+    /// </summary>
+    private static string SearchTitleKey(string title)
+    {
+        var t = title.Trim();
+
+        // Strip a trailing "(Polish)"/"(Korean)"/"(Official)" style qualifier.
+        if (t.Length > 0 && t[^1] == ')')
+        {
+            int open = t.LastIndexOf('(');
+            if (open > 0)
+            {
+                var inner = t[(open + 1)..^1];
+                if (inner.Length > 0 && inner.Length <= 20
+                    && inner.All(c => char.IsLetter(c) || c == ' ' || c == '-' || c == '_'))
+                {
+                    t = t[..open].Trim();
+                }
+            }
+        }
+
+        var sb = new StringBuilder(t.Length);
+        foreach (var ch in t.ToLowerInvariant())
+        {
+            if (char.IsLetterOrDigit(ch)) sb.Append(ch);
+            else sb.Append(' '); // quotes, punctuation and whitespace all become separators
+        }
+        return string.Join(' ', sb.ToString().Split(' ', StringSplitOptions.RemoveEmptyEntries));
     }
 
     private async Task ExpandViaDetailAsync(
@@ -499,14 +793,28 @@ public sealed class MetadataMatchCore
             if (!fetchedIds.Add((node.Provider, node.ExternalSeriesId))) return;
 
             var metadata = await provider.FetchSeriesMetadataAsync(node.ExternalSeriesId, token);
-            if (metadata == null) return;
+            if (metadata == null)
+            {
+                _logger.LogInformation("Detail fetch {Provider}:{Id} returned nothing",
+                    node.Provider, node.ExternalSeriesId);
+                return;
+            }
 
             // capture cover + native metadata so the caller can persist them to the row
             node.CoverUrl ??= metadata.CoverUrl;
+
+            _logger.LogInformation(
+                "Detail {Provider}:{Id} → '{Title}', cover {Cover}, {Links} declared link(s), {Alts} alternate(s)",
+                node.Provider, node.ExternalSeriesId, metadata.Title,
+                string.IsNullOrWhiteSpace(node.CoverUrl) ? "(none)" : "yes",
+                metadata.LinkedSitesIds.Count, metadata.AlternativeTitles.Count);
             node.MetaData = !string.IsNullOrWhiteSpace(metadata.MetaData) ? metadata.MetaData : node.MetaData;
 
-            // enrich the node
-            node.Title ??= metadata.Title;
+            // enrich the node. Seed nodes carry an EMPTY (non-null) title, and `??=` would not
+            // replace it — so fall back on whitespace too, otherwise the provider's canonical
+            // title is lost from the node's title set.
+            if (string.IsNullOrWhiteSpace(node.Title))
+                node.Title = metadata.Title;
             foreach (var t in metadata.AlternativeTitles)
                 if (!node.AlternativeTitles.Contains(t, StringComparer.OrdinalIgnoreCase))
                     node.AlternativeTitles.Add(t);
@@ -540,6 +848,43 @@ public sealed class MetadataMatchCore
         return scored.Length > 0 ? scored[0].Percentage / 100.0 : 0;
     }
 
+    /// <summary>
+    /// True when the provider cover is the SAME image as the local cover (within
+    /// <see cref="ImageMatchScoring.SameImageThreshold"/>) — used to approve a borderline title in
+    /// the propagation and second-pass paths, mirroring the round-1 search. Best-effort: an
+    /// unavailable/unhashable cover returns false so the caller keeps the title-only score.
+    /// </summary>
+    private async Task<bool> IsCoverCorroboratedAsync(
+        string? providerCoverUrl, PdqHash256 localHash, CancellationToken token)
+    {
+        if (string.IsNullOrWhiteSpace(providerCoverUrl) || localHash.IsEmpty)
+            return false;
+        try
+        {
+            var hashes = await _imageMatch
+                .GetProviderHashesAsync(new[] { providerCoverUrl }, token).ConfigureAwait(false);
+            if (!hashes.TryGetValue(providerCoverUrl, out var candidateHash))
+                return false;
+            var distance = PdqHashUtility.Compare(in localHash, in candidateHash);
+            if (distance <= ImageMatchScoring.SameImageThreshold)
+            {
+                _logger.LogInformation("Cover corroboration approved a borderline title (image dist {Distance}, similarity {Pct}%)",
+                    distance, ImageMatchScoring.DistanceToPercentage(distance));
+                return true;
+            }
+            return false;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Cover corroboration failed for {Url}", providerCoverUrl);
+            return false;
+        }
+    }
+
     private static (ExternalSeriesProvider? Site, string Id) SplitSiteId(string linked)
     {
         var idx = linked.IndexOf(':');
@@ -547,6 +892,10 @@ public sealed class MetadataMatchCore
             return (null, string.Empty);
         var slug = linked[..idx];
         var id = linked[(idx + 1)..];
+        // Reject bogus placeholder ids (e.g. AniList's idMal=0 for manga with no MAL entry,
+        // MangaBaka/MangaDex "0"). Following such an edge only produces a doomed detail fetch.
+        if (IsBogusExternalId(id))
+            return (null, string.Empty);
         if (!Enum.TryParse<ExternalSeriesProvider>(slug, true, out var parsed))
         {
             // Try slug-name resolution via resolver is not available here (static); fallback:
@@ -569,6 +918,15 @@ public sealed class MetadataMatchCore
         return (parsed, id);
     }
 
+    /// <summary>
+    /// True when an external id is a placeholder rather than a real one. Providers encode
+    /// "unknown" inconsistently as 0 (AniList idMal=0, MangaBaka/MangaDex "0"), and chasing
+    /// such an edge only produces a doomed detail fetch. Purely-numeric ids must be positive;
+    /// non-numeric ids (MangaDex UUIDs, MangaUpdates base36, ...) pass through.
+    /// </summary>
+    private static bool IsBogusExternalId(string id)
+        => long.TryParse(id.Trim(), out long numeric) && numeric <= 0;
+
     private void AddNode(
         Dictionary<ExternalSeriesProvider, MetaDataLinkEntry> nodes,
         ExternalSeriesProvider provider,
@@ -577,7 +935,9 @@ public sealed class MetadataMatchCore
         double confidence,
         SeriesLinkStatus status,
         List<string>? linked = null,
-        List<string>? titles = null)
+        List<string>? titles = null,
+        string? coverUrl = null,
+        string? metaData = null)
     {
         nodes[provider] = new MetaDataLinkEntry
         {
@@ -587,7 +947,11 @@ public sealed class MetadataMatchCore
             Confidence = confidence,
             Status = status,
             LinkedSitesIds = linked ?? [],
-            AlternativeTitles = titles ?? []
+            AlternativeTitles = titles ?? [],
+            // Carried through from a detail fetch that is already in hand (propagation path);
+            // callers that still need to fetch pass null and let ExpandViaDetailAsync fill it.
+            CoverUrl = coverUrl,
+            MetaData = metaData
         };
     }
 
@@ -596,6 +960,7 @@ public sealed class MetadataMatchCore
         public string Title { get; set; } = string.Empty;
         public List<string> Linked { get; set; } = [];
         public List<string> Alt { get; set; } = [];
+        public string? CoverUrl { get; set; }
     }
 
     internal sealed class SiteEdgeComparer : IEqualityComparer<(ExternalSeriesProvider Site, string ExternalId)>

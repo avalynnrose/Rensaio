@@ -2,6 +2,7 @@ using RensaioBackend.Data;
 using RensaioBackend.Models.ContributionDatabase;
 using RensaioBackend.Models.Database;
 using RensaioBackend.Services.Contributions.Snapshot;
+using SeriesEntity = RensaioBackend.Models.ContributionDatabase.SeriesEntity;
 using RensaioBackend.Services.Settings;
 using Microsoft.EntityFrameworkCore;
 using System.Net.Http.Json;
@@ -17,37 +18,43 @@ namespace RensaioBackend.Services.Contributions;
 /// Identity rules (mirror of the uploader, Option A — semantic dedup):
 ///  * titles / sources / series — deterministic ids (MD5-derived), upsert by id.
 ///  * mappings — cloud mapping ids are TRANSIENT. Each cloud mapping (its title
-///    set) is folded into a local mapping by title overlap (same fuzzy rule as
+///    set) is folded into a local series by title overlap (same fuzzy rule as
 ///    <see cref="ContributionPropagationService"/>'s resolver), creating a local
-///    <see cref="MappingEntity"/> (fresh local Guid) when none overlaps.
+///    <see cref="SeriesEntity"/> (fresh local Guid) when none overlaps.
 ///  * metadata — cloud metadata ids are TRANSIENT. Rows are deduped by
 ///    (localMappingId, ProviderId, ProviderKey); existing rows keep their local
 ///    id and merge mapping_status by priority
 ///    (UserConfirmed > Blocked > AutoMatched > ForeverIgnored >
-///    TemporaryIgnored > Unmatched), linked_date is last-writer-wins.
+///    ManualIgnore > Unmatched), linked_date is last-writer-wins.
 ///
 /// Only active (non-archived) rows are exported by the worker, so every incoming
-/// row is treated as add/update (v = 0). Local rows not present in the snapshot
-/// are left untouched (no destructive reconciliation).
+/// row is CLOUD-BACKED: it is stamped <see cref="ContributionVersions.Uploaded"/> (-2),
+/// matching <see cref="ContributionImportService"/>. Marking it -2 (not 0) is what lets the
+/// local reproduction of a cloud row be recognised as "exists in the cloud", so a later
+/// reconcile tombstones (rather than hard-deletes) it and never re-exports it. Local rows not
+/// present in the snapshot are left untouched (no destructive reconciliation).
 /// </summary>
 public class ContributionDownloadService
 {
-    private const int VersionAddOrUpdate = 0;
+    private const int VersionUploaded = ContributionVersions.Uploaded;
 
     private readonly ContributionDbContext _contributorDb;
     private readonly SettingsService _settingsService;
     private readonly IHttpClientFactory _httpClientFactory;
+    private readonly ContributionTitleHeuristicsService _titleHeuristics;
     private readonly ILogger<ContributionDownloadService> _logger;
 
     public ContributionDownloadService(
         ContributionDbContext contributorDb,
         SettingsService settingsService,
         IHttpClientFactory httpClientFactory,
+        ContributionTitleHeuristicsService titleHeuristics,
         ILogger<ContributionDownloadService> logger)
     {
         _contributorDb = contributorDb;
         _settingsService = settingsService;
         _httpClientFactory = httpClientFactory;
+        _titleHeuristics = titleHeuristics;
         _logger = logger;
     }
 
@@ -121,11 +128,11 @@ public class ContributionDownloadService
             {
                 if (titlesById.TryGetValue(cloud.Id, out var local))
                 {
-                    if (local.Title != cloud.Title || local.Version == -1)
+                    if (local.Title != cloud.Title || ContributionVersions.IsDeleted(local.Version))
                     {
                         _contributorDb.Titles.Attach(local);
                         local.Title = cloud.Title;
-                        local.Version = VersionAddOrUpdate;
+                        local.Version = VersionUploaded;
                         _contributorDb.Entry(local).Property(t => t.Title).IsModified = true;
                         _contributorDb.Entry(local).Property(t => t.Version).IsModified = true;
                         titleCount++;
@@ -137,7 +144,7 @@ public class ContributionDownloadService
                     {
                         Id = cloud.Id,
                         Title = cloud.Title,
-                        Version = VersionAddOrUpdate,
+                        Version = VersionUploaded,
                     });
                     titlesById[cloud.Id] = cloud;
                     titleCount++;
@@ -158,10 +165,10 @@ public class ContributionDownloadService
             {
                 if (sourcesById.TryGetValue(cloud.Id, out var local))
                 {
-                    if (local.Version == -1)
+                    if (ContributionVersions.IsDeleted(local.Version))
                     {
                         _contributorDb.Sources.Attach(local);
-                        local.Version = VersionAddOrUpdate;
+                        local.Version = VersionUploaded;
                         _contributorDb.Entry(local).Property(s => s.Version).IsModified = true;
                         sourceCount++;
                     }
@@ -172,16 +179,32 @@ public class ContributionDownloadService
                     {
                         Id = cloud.Id,
                         Package = cloud.Package,
+                        PackageId = cloud.PackageId != Guid.Empty
+                            ? cloud.PackageId
+                            : ContributionSourceEntity.DerivePackageId(cloud.Package),
                         SourceId = cloud.SourceId,
                         SourceName = cloud.SourceName,
                         SourceLanguage = cloud.SourceLanguage,
                         LastBatchExecutionUTC = cloud.LastBatchExecutionUTC,
-                        Version = VersionAddOrUpdate,
+                        LatestIds = cloud.LatestIds,
+                        Version = VersionUploaded,
                     });
                     sourcesById[cloud.Id] = cloud;
                     sourceCount++;
                 }
             }
+
+            // Cloud package id per source, so a series entry (which carries no source id anymore)
+            // can resolve its PackageId via its associations.
+            var cloudPackageById = new Dictionary<Guid, Guid>();
+            foreach (var s in snapshot.Sources)
+                cloudPackageById[s.Id] = s.PackageId != Guid.Empty
+                    ? s.PackageId
+                    : ContributionSourceEntity.DerivePackageId(s.Package);
+            foreach (var s in sources)
+                cloudPackageById[s.Id] = s.PackageId != Guid.Empty
+                    ? s.PackageId
+                    : ContributionSourceEntity.DerivePackageId(s.Package);
 
             // ── 3. Mappings (cloud → local by title overlap) ──
             // Group the cloud mapping_titles by cloud mapping id to recover each
@@ -189,10 +212,10 @@ public class ContributionDownloadService
             var cloudMappingTitlesById = new Dictionary<Guid, List<Guid>>();
             foreach (var mt in snapshot.Mappings)
             {
-                if (!cloudMappingTitlesById.TryGetValue(mt.MappingId, out var list))
+                if (!cloudMappingTitlesById.TryGetValue(mt.SeriesId, out var list))
                 {
                     list = new List<Guid>();
-                    cloudMappingTitlesById[mt.MappingId] = list;
+                    cloudMappingTitlesById[mt.SeriesId] = list;
                 }
                 list.Add(mt.TitleId);
             }
@@ -204,8 +227,8 @@ public class ContributionDownloadService
             // without this two cloud mappings collapsing onto one local mapping (or a
             // re-apply in the same context) would Add the same (MappingId, TitleId) twice
             // and EF would throw an identity-conflict on the composite key.
-            var knownPairs = _contributorDb.ChangeTracker.Entries<MappingTitleEntity>()
-                .Select(e => (e.Entity.MappingId, e.Entity.TitleId))
+            var knownPairs = _contributorDb.ChangeTracker.Entries<SeriesTitleEntity>()
+                .Select(e => (e.Entity.SeriesId, e.Entity.TitleId))
                 .ToHashSet();
 
             foreach (var (cloudMappingId, titleIds) in cloudMappingTitlesById)
@@ -219,16 +242,16 @@ public class ContributionDownloadService
                     if (!knownPairs.Add((localMappingId, titleId)))
                         continue;
 
-                    bool exists = await _contributorDb.MappingTitles
-                        .AnyAsync(mt => mt.MappingId == localMappingId && mt.TitleId == titleId, token)
+                    bool exists = await _contributorDb.SeriesTitles
+                        .AnyAsync(mt => mt.SeriesId == localMappingId && mt.TitleId == titleId, token)
                         .ConfigureAwait(false);
                     if (!exists)
                     {
-                        _contributorDb.MappingTitles.Add(new MappingTitleEntity
+                        _contributorDb.SeriesTitles.Add(new SeriesTitleEntity
                         {
-                            MappingId = localMappingId,
+                            SeriesId = localMappingId,
                             TitleId = titleId,
-                            Version = VersionAddOrUpdate,
+                            Version = VersionUploaded,
                         });
                     }
                 }
@@ -249,15 +272,17 @@ public class ContributionDownloadService
                     desiredPairs.Add((localMappingId, titleId));
             }
             var localMappingIds = localByCloudMapping.Values.Distinct().ToList();
-            var localMappingTitleRows = await _contributorDb.MappingTitles
-                .Where(mt => localMappingIds.Contains(mt.MappingId)
-                    && mt.Version != VersionAddOrUpdate
-                    && mt.Version != -1)
+            // Only UPLOADED LIVE (-2) links are candidates for a fresh tombstone. A pending
+            // row (0/-1, user edit) is preserved, and a row already tombstoned (-1/-3) must
+            // not be re-flipped (that would re-export a delete already sent).
+            var localMappingTitleRows = await _contributorDb.SeriesTitles
+                .Where(mt => localMappingIds.Contains(mt.SeriesId)
+                    && mt.Version == ContributionVersions.Uploaded)
                 .ToListAsync(token).ConfigureAwait(false);
             foreach (var mt in localMappingTitleRows)
             {
-                if (desiredPairs.Contains((mt.MappingId, mt.TitleId))) continue;
-                _contributorDb.MappingTitles.Attach(mt);
+                if (desiredPairs.Contains((mt.SeriesId, mt.TitleId))) continue;
+                _contributorDb.SeriesTitles.Attach(mt);
                 mt.Version = -1;
                 _contributorDb.Entry(mt).Property(x => x.Version).IsModified = true;
             }
@@ -265,7 +290,7 @@ public class ContributionDownloadService
             int mappingCount = localByCloudMapping.Count;
 
             // ── 4. Series (deterministic ids, mapping re-keyed) ──
-            var series = await _contributorDb.Series
+            var series = await _contributorDb.SeriesEntries
                 .Where(s => snapshot.Series.Select(x => x.Id).Contains(s.Id))
                 .AsNoTracking()
                 .ToListAsync(token).ConfigureAwait(false);
@@ -273,28 +298,39 @@ public class ContributionDownloadService
             int seriesCount = 0;
             foreach (var cloud in snapshot.Series)
             {
-                if (!localByCloudMapping.TryGetValue(cloud.MappingId, out var localMappingId))
+                if (!localByCloudMapping.TryGetValue(cloud.SeriesId, out var localMappingId))
                 {
                     // Mapping for this series was not in the mapping_titles list —
                     // resolve by its record title id as a fallback.
                     localMappingId = await ResolveLocalMappingAsync(new[] { cloud.Data.TitleId }, token)
                         .ConfigureAwait(false);
-                    localByCloudMapping[cloud.MappingId] = localMappingId;
+                    localByCloudMapping[cloud.SeriesId] = localMappingId;
                 }
 
                 if (seriesById.TryGetValue(cloud.Id, out var local))
                 {
                     bool dataChanged = !JsonEquals(local.Data, cloud.Data);
-                    if (dataChanged || local.MappingId != localMappingId
-                        || local.SourceId != cloud.SourceId || local.Version == -1)
+                    // Null-preserving verified date: the cloud value is one-way. Only adopt it when
+                    // non-null so a null cloud value cannot clear a local verification (mirrors the
+                    // worker's sticky rule); a local clear is therefore also never re-downloaded.
+                    bool verifiedChanged = cloud.VerifiedDateUTC is not null
+                        && local.VerifiedDateUTC != cloud.VerifiedDateUTC;
+                    if (dataChanged || local.SeriesId != localMappingId
+                        || ContributionVersions.IsDeleted(local.Version)
+                        || verifiedChanged)
                     {
-                        _contributorDb.Series.Attach(local);
-                        local.MappingId = localMappingId;
-                        local.SourceId = cloud.SourceId;
+                        _contributorDb.SeriesEntries.Attach(local);
+                        local.SeriesId = localMappingId;
+                        local.PackageId = ResolvePackageId(cloud, cloudPackageById);
                         local.Data = cloud.Data;
-                        local.Version = VersionAddOrUpdate;
-                        _contributorDb.Entry(local).Property(s => s.MappingId).IsModified = true;
-                        _contributorDb.Entry(local).Property(s => s.SourceId).IsModified = true;
+                        if (cloud.VerifiedDateUTC is not null)
+                        {
+                            local.VerifiedDateUTC = cloud.VerifiedDateUTC;
+                            _contributorDb.Entry(local).Property(s => s.VerifiedDateUTC).IsModified = true;
+                        }
+                        local.Version = VersionUploaded;
+                        _contributorDb.Entry(local).Property(s => s.SeriesId).IsModified = true;
+                        _contributorDb.Entry(local).Property(s => s.PackageId).IsModified = true;
                         _contributorDb.Entry(local).Property(s => s.Data).IsModified = true;
                         _contributorDb.Entry(local).Property(s => s.Version).IsModified = true;
                         seriesCount++;
@@ -302,28 +338,40 @@ public class ContributionDownloadService
                 }
                 else
                 {
-                    _contributorDb.Series.Add(new ContributionSeriesEntity
+                    _contributorDb.SeriesEntries.Add(new ContributionSeriesEntity
                     {
                         Id = cloud.Id,
-                        MappingId = localMappingId,
-                        SourceId = cloud.SourceId,
+                        SeriesId = localMappingId,
+                        PackageId = ResolvePackageId(cloud, cloudPackageById),
                         Data = cloud.Data,
-                        Version = VersionAddOrUpdate,
+                        VerifiedDateUTC = cloud.VerifiedDateUTC,
+                        // Advisory seed for a brand-new local row: the cloud's derived flag. The
+                        // repair pass (RecomputeSeriesMetadataFlagsAsync) is authoritative locally,
+                        // so this is never trusted over a local recompute.
+                        Metadata = cloud.Metadata,
+                        Version = VersionUploaded,
                     });
                     seriesById[cloud.Id] = cloud;
                     seriesCount++;
                 }
             }
 
+            // ── 4b. Source associations (many-to-many) ──
+            // The cloud ships the authoritative source set per series entry; rebuild the local
+            // SourceSeries rows so consolidation/re-parenting is reflected. Local pending rows
+            // (user edits, Version 0/-1) are preserved.
+            await SyncSourceAssociationsAsync(
+                snapshot.SourceSeries, seriesById.Keys.ToList(), token).ConfigureAwait(false);
+
             // ── 5. Metadata (dedup by localMappingId + ProviderId + ProviderKey) ──
             int metadataCount = 0;
             var metadataByLocalMapping = await _contributorDb.Metadata
-                .Where(m => localByCloudMapping.Values.Contains(m.MappingId))
+                .Where(m => localByCloudMapping.Values.Contains(m.SeriesId))
                 .AsNoTracking()
                 .ToListAsync(token)
                 .ConfigureAwait(false);
             var localMetadataByKey = metadataByLocalMapping
-                .GroupBy(m => m.MappingId)
+                .GroupBy(m => m.SeriesId)
                 .ToDictionary(
                     g => g.Key,
                     g => g.ToDictionary(m => (m.ProviderId, m.ProviderKey ?? string.Empty)));
@@ -334,11 +382,11 @@ public class ContributionDownloadService
 
             foreach (var cloud in snapshot.Metadata)
             {
-                if (!localByCloudMapping.TryGetValue(cloud.MappingId, out var localMappingId))
+                if (!localByCloudMapping.TryGetValue(cloud.SeriesId, out var localMappingId))
                 {
                     localMappingId = await ResolveLocalMappingAsync(Array.Empty<Guid>(), token)
                         .ConfigureAwait(false);
-                    localByCloudMapping[cloud.MappingId] = localMappingId;
+                    localByCloudMapping[cloud.SeriesId] = localMappingId;
                 }
 
                 var key = (cloud.ProviderId, cloud.ProviderKey ?? string.Empty);
@@ -359,15 +407,15 @@ public class ContributionDownloadService
                     local = new ContributionMetadataEntity
                     {
                         Id = Guid.NewGuid(),
-                        MappingId = localMappingId,
+                        SeriesId = localMappingId,
                         ProviderId = cloud.ProviderId,
                         ProviderKey = cloud.ProviderKey ?? string.Empty,
                         MappingStatus = cloud.MappingStatus,
                         LinkedDate = cloud.LinkedDate,
-                        Version = VersionAddOrUpdate,
+                        Version = VersionUploaded,
                     };
                     _contributorDb.Metadata.Add(local);
-                    touchedLocalMetadata[(local.MappingId, local.ProviderId, local.ProviderKey)] = local;
+                    touchedLocalMetadata[(local.SeriesId, local.ProviderId, local.ProviderKey)] = local;
                     metadataCount++;
                 }
                 else if (!touchedLocalMetadata.ContainsKey((localMappingId, cloud.ProviderId, cloud.ProviderKey ?? string.Empty)))
@@ -375,23 +423,31 @@ public class ContributionDownloadService
                     var merged = MergeStatus(local.MappingStatus, cloud.MappingStatus);
                     bool changed = merged != local.MappingStatus
                         || local.LinkedDate != cloud.LinkedDate
-                        || local.Version == -1;
+                        || ContributionVersions.IsDeleted(local.Version);
                     if (changed)
                     {
                         _contributorDb.Metadata.Attach(local);
                         local.MappingStatus = merged;
                         local.LinkedDate = cloud.LinkedDate;
-                        local.Version = VersionAddOrUpdate;
+                        local.Version = VersionUploaded;
                         _contributorDb.Entry(local).Property(m => m.MappingStatus).IsModified = true;
                         _contributorDb.Entry(local).Property(m => m.LinkedDate).IsModified = true;
                         _contributorDb.Entry(local).Property(m => m.Version).IsModified = true;
                     }
-                    touchedLocalMetadata[(local.MappingId, local.ProviderId, local.ProviderKey)] = local;
+                    touchedLocalMetadata[(local.SeriesId, local.ProviderId, local.ProviderKey)] = local;
                     metadataCount++;
                 }
             }
 
-            await _contributorDb.SaveChangesAsync(token).ConfigureAwait(false);
+            // Reconcile title associations against the merged Auto/User links.
+            await _titleHeuristics.ReconcileAllAsync(token).ConfigureAwait(false);
+
+            // Cloud-apply must NOT invalidate local verification: suppress the graph-change hook
+            // for this save (the download is the authoritative cloud state, not a user/scan edit).
+            using (_contributorDb.SuppressVerificationInvalidation())
+            {
+                await _contributorDb.SaveChangesAsync(token).ConfigureAwait(false);
+            }
 
             return ContributionDownloadResult.Succeeded(
                 titleCount, mappingCount, sourceCount, seriesCount, metadataCount);
@@ -414,29 +470,32 @@ public class ContributionDownloadService
         var distinct = titleIds.Distinct().ToList();
         if (distinct.Count == 0)
         {
-            var created = new MappingEntity { Id = Guid.NewGuid() };
-            _contributorDb.Mappings.Add(created);
+            var created = new SeriesEntity { Id = Guid.NewGuid() };
+            _contributorDb.Series.Add(created);
             return created.Id;
         }
 
-        var mappingTitles = await _contributorDb.MappingTitles
-            .Where(mt => distinct.Contains(mt.TitleId))
+        // Only LIVE links count: a tombstoned association must not resolve a local mapping.
+        var seriesTitles = await _contributorDb.SeriesTitles
+            .Where(mt => distinct.Contains(mt.TitleId)
+                && mt.Version != ContributionVersions.PendingDelete
+                && mt.Version != ContributionVersions.UploadedDelete)
             .AsNoTracking()
             .ToListAsync(token).ConfigureAwait(false);
 
         var overlap = new Dictionary<Guid, int>();
-        foreach (var mt in mappingTitles)
+        foreach (var mt in seriesTitles)
         {
-            overlap.TryGetValue(mt.MappingId, out var count);
-            overlap[mt.MappingId] = count + 1;
+            overlap.TryGetValue(mt.SeriesId, out var count);
+            overlap[mt.SeriesId] = count + 1;
         }
 
         var best = overlap.OrderByDescending(kv => kv.Value).FirstOrDefault();
         if (best.Key != Guid.Empty)
             return best.Key;
 
-        var createdMapping = new MappingEntity { Id = Guid.NewGuid() };
-        _contributorDb.Mappings.Add(createdMapping);
+        var createdMapping = new SeriesEntity { Id = Guid.NewGuid() };
+        _contributorDb.Series.Add(createdMapping);
         return createdMapping.Id;
     }
 
@@ -454,7 +513,7 @@ public class ContributionDownloadService
     /// <summary>
     /// Status-priority merge — mirrors the worker's ON CONFLICT CASE expression:
     /// UserConfirmed(2) > Blocked(5) > AutoMatched(1) > ForeverIgnored(4)
-    /// > TemporaryIgnored(3) > Unmatched(0).
+    /// > ManualIgnore(3) > Unmatched(0).
     /// </summary>
     private static SeriesMappingStatus MergeStatus(SeriesMappingStatus current, SeriesMappingStatus incoming)
     {
@@ -466,13 +525,87 @@ public class ContributionDownloadService
             return SeriesMappingStatus.AutoMatched;
         if (current == SeriesMappingStatus.ForeverIgnored || incoming == SeriesMappingStatus.ForeverIgnored)
             return SeriesMappingStatus.ForeverIgnored;
-        if (current == SeriesMappingStatus.TemporaryIgnored || incoming == SeriesMappingStatus.TemporaryIgnored)
-            return SeriesMappingStatus.TemporaryIgnored;
+        if (current == SeriesMappingStatus.ManualIgnore || incoming == SeriesMappingStatus.ManualIgnore)
+            return SeriesMappingStatus.ManualIgnore;
         return SeriesMappingStatus.Unmatched;
     }
 
     private static bool JsonEquals<T>(T a, T b)
         => JsonSerializer.Serialize(a) == JsonSerializer.Serialize(b);
+
+    /// <summary>
+    /// Resolves a series entry's <c>PackageId</c>: prefer the value on the (new) cloud entry; fall
+    /// back to the package id of its representative/associated source, then to the record url's
+    /// owning package when the cloud predates the normalization.
+    /// </summary>
+    private static Guid ResolvePackageId(
+        ContributionSeriesEntity cloud, IReadOnlyDictionary<Guid, Guid> cloudPackageById)
+    {
+        if (cloud.PackageId != Guid.Empty)
+            return cloud.PackageId;
+        return cloudPackageById.TryGetValue(cloud.SourceId, out var packageId) ? packageId : Guid.Empty;
+    }
+
+    /// <summary>
+    /// Reconciles the local <c>SourceSeries</c> association set for the supplied series entries
+    /// against the cloud snapshot: live associations missing locally are added; local UNPENDING
+    /// associations that the cloud dropped are tombstoned. Local pending rows (Version 0/-1, user
+    /// edits) are preserved.
+    /// </summary>
+    private async Task SyncSourceAssociationsAsync(
+        IReadOnlyList<ContributionSourceSeriesEntity> cloudRows,
+        IReadOnlyList<Guid> seriesIds, CancellationToken token)
+    {
+        if (seriesIds.Count == 0) return;
+
+        // Guard against a STALE cloud snapshot (produced before the SourceSeries normalization):
+        // when the snapshot carries NO association rows at all, do NOT treat that as "no sources"
+        // — that would tombstone the associations the local migrator just rebuilt. Association
+        // deletions only apply once the cloud has started publishing the feature.
+        if (cloudRows.Count == 0) return;
+
+        var desired = cloudRows
+            .Where(ss => ss.SeriesEntityId != Guid.Empty && ss.SourceId != Guid.Empty)
+            .Select(ss => (ss.SourceId, ss.SeriesEntityId))
+            .ToHashSet();
+
+        var existing = await _contributorDb.SourceSeries
+            .Where(ss => seriesIds.Contains(ss.SeriesEntityId))
+            .ToListAsync(token).ConfigureAwait(false);
+        var existingByKey = existing.ToDictionary(ss => (ss.SourceId, ss.SeriesEntityId));
+
+        foreach (var key in desired)
+        {
+            if (existingByKey.TryGetValue(key, out var row))
+            {
+                if (ContributionVersions.IsDeleted(row.Version))
+                {
+                    _contributorDb.SourceSeries.Attach(row);
+                    row.Version = VersionUploaded;
+                    _contributorDb.Entry(row).Property(x => x.Version).IsModified = true;
+                }
+            }
+            else
+            {
+                _contributorDb.SourceSeries.Add(new ContributionSourceSeriesEntity
+                {
+                    SourceId = key.SourceId,
+                    SeriesEntityId = key.SeriesEntityId,
+                    Version = VersionUploaded
+                });
+            }
+        }
+
+        // Tombstone clean local associations the cloud no longer carries (pending rows preserved).
+        foreach (var row in existing)
+        {
+            if (row.Version != ContributionVersions.Uploaded) continue; // keep pending (0/-1) + tombstoned
+            if (desired.Contains((row.SourceId, row.SeriesEntityId))) continue;
+            _contributorDb.SourceSeries.Attach(row);
+            row.Version = ContributionVersions.UploadedDelete;
+            _contributorDb.Entry(row).Property(x => x.Version).IsModified = true;
+        }
+    }
 
     private static string Truncate(string value, int max) =>
         value.Length <= max ? value : value[..max];

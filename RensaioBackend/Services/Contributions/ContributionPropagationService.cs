@@ -8,6 +8,7 @@ using RensaioBackend.Models.Enums;
 using RensaioBackend.Services.Settings;
 using System.Globalization;
 using System.Text.Json;
+using SeriesEntity = RensaioBackend.Models.Database.SeriesEntity;
 
 namespace RensaioBackend.Services.Contributions
 {
@@ -29,17 +30,20 @@ namespace RensaioBackend.Services.Contributions
         private readonly AppDbContext _db;
         private readonly ContributionDbContext _contributorDb;
         private readonly SettingsService _settingsService;
+        private readonly ContributionTitleHeuristicsService _titleHeuristics;
         private readonly ILogger<ContributionPropagationService> _logger;
 
         public ContributionPropagationService(
             AppDbContext db,
             ContributionDbContext contributorDb,
             SettingsService settingsService,
+            ContributionTitleHeuristicsService titleHeuristics,
             ILogger<ContributionPropagationService> logger)
         {
             _db = db;
             _contributorDb = contributorDb;
             _settingsService = settingsService;
+            _titleHeuristics = titleHeuristics;
             _logger = logger;
         }
 
@@ -168,6 +172,14 @@ namespace RensaioBackend.Services.Contributions
             }
             foreach (var mapping in mappings)
             {
+                // Status-aware: a refused mapping (Blocked / ForeverIgnored / ManualIgnore /
+                // Unmatched) must NOT contribute its provider titles to the series' title set.
+                // Doing so created the very "blocked-only" associations the reconcile then had to
+                // tombstone on every run. Only an ACTIVE link (AutoMatched / UserConfirmed) may
+                // vouch for its provider's titles here.
+                if (mapping.MappingStatus is not (SeriesMappingStatus.AutoMatched or SeriesMappingStatus.UserConfirmed))
+                    continue;
+
                 if (!string.IsNullOrWhiteSpace(mapping.ExternalSeriesTitle))
                     rawTitles.Add(mapping.ExternalSeriesTitle);
                 foreach (var alt in mapping.AlternativeTitles)
@@ -190,11 +202,49 @@ namespace RensaioBackend.Services.Contributions
             // Main title identity: the canonical title for sources' Data.TitleId.
             var mainTitleId = titleIds.TryGetValue(TitleEntity.Normalize(series.Title), out var mt) ? mt : Guid.Empty;
 
-            // ── 3. Resolve the one MappingEntity per series via its titles. ──
-            var mappingId = await ResolveMappingAsync(titleIds, series.Title, token).ConfigureAwait(false);
+            // ── 3. Resolve the one SeriesEntity per series via its titles. ──
+            var mappingId = await ResolveSeriesAsync(titleIds, series.Title, token).ConfigureAwait(false);
 
-            // ── 4. Ensure every series title is associated with the mapping. ──
-            await SyncMappingTitlesAsync(mappingId, titleIds.Values, token).ConfigureAwait(false);
+            // ── 4. Ensure every series title is associated with the series. ──
+            // Link EXACTLY the set the title reconcile KEEPS: each live entry's own TitleId
+            // (source-contributed) plus the Auto/User provider-vouched titles. Previously this
+            // linked the RAW per-source display titles too; those are backed by NO entry (the
+            // entry stores the canonical title), so the reconcile tombstoned them on every pass and
+            // the next propagation re-created them — the perpetual "unbacked title association"
+            // loop. The canonical main title is linked only when it will back a freshly created
+            // entry (no entries yet); otherwise it is unbacked and would be tombstoned too.
+            // Materialise the records then read TitleId in memory: Data is a JSON-mapped column,
+            // so projecting Data.TitleId in SQL is not portable (matches the reconcile/grouping
+            // readers, which also extract the id client-side).
+            var existingEntries = await _contributorDb.SeriesEntries
+                .Where(s => s.SeriesId == mappingId
+                    && s.Version != VersionLogicalDelete
+                    && s.Version != ContributionVersions.UploadedDelete)
+                .AsNoTracking()
+                .Select(s => s.Data)
+                .ToListAsync(token).ConfigureAwait(false);
+
+            var backedTitleIds = new HashSet<Guid>();
+            foreach (var data in existingEntries)
+            {
+                if (data != null && data.TitleId != Guid.Empty)
+                    backedTitleIds.Add(data.TitleId);
+            }
+
+            foreach (var mapping in mappings)
+            {
+                if (mapping.MappingStatus is not (SeriesMappingStatus.AutoMatched or SeriesMappingStatus.UserConfirmed))
+                    continue;
+                foreach (var id in ContributionTitleHeuristicsService.DeriveProviderTitleIds(
+                             mapping.ExternalSeriesTitle, mapping.AlternativeTitles))
+                    if (id != Guid.Empty) backedTitleIds.Add(id);
+            }
+
+            // Brand-new series (no entries yet): the canonical title backs the entry created below.
+            if (backedTitleIds.Count == 0 && mainTitleId != Guid.Empty)
+                backedTitleIds.Add(mainTitleId);
+
+            await SyncSeriesTitlesAsync(mappingId, backedTitleIds, token).ConfigureAwait(false);
 
             // ── 5. Diff sources belonging to this mapping. ──
             await SyncSourcesAsync(series, mappings, mappingId, mainTitleId, token).ConfigureAwait(false);
@@ -203,6 +253,10 @@ namespace RensaioBackend.Services.Contributions
             await SyncMetadataAsync(mappings, mappingId, token).ConfigureAwait(false);
 
             await _contributorDb.SaveChangesAsync(token).ConfigureAwait(false);
+
+            // Reconcile title associations after the metadata diff so a Blocked provider can no
+            // longer keep a title linked to this series (Auto/User + source titles are kept).
+            await _titleHeuristics.ReconcileSeriesAsync(mappingId, token).ConfigureAwait(false);
         }
 
         private async Task<Dictionary<string, Guid>> ResolveTitlesAsync(List<string> titles, CancellationToken token)
@@ -256,49 +310,53 @@ namespace RensaioBackend.Services.Contributions
             return result;
         }
 
-        private async Task<Guid> ResolveMappingAsync(Dictionary<string, Guid> titleIds, string mainTitle, CancellationToken token)
+        private async Task<Guid> ResolveSeriesAsync(Dictionary<string, Guid> titleIds, string mainTitle, CancellationToken token)
         {
             // All title ids resolved for this series.
             var seriesTitleIds = titleIds.Values.Distinct().ToList();
             if (seriesTitleIds.Count == 0)
                 return Guid.NewGuid();
 
-            var mappingTitles = await _contributorDb.MappingTitles
-                .Where(mt => seriesTitleIds.Contains(mt.TitleId))
+            // Only LIVE links associate a title with a series; a tombstoned link must never
+            // resolve an existing series (see the giant-cluster bug).
+            var seriesTitles = await _contributorDb.SeriesTitles
+                .Where(mt => seriesTitleIds.Contains(mt.TitleId)
+                    && mt.Version != VersionLogicalDelete
+                    && mt.Version != ContributionVersions.UploadedDelete)
                 .AsNoTracking()
                 .ToListAsync(token).ConfigureAwait(false);
 
             // Also consider links created earlier in this unit of work (e.g. by a sibling
-            // series sharing a title) so they collapse onto ONE mapping instead of each
+            // series sharing a title) so they collapse onto ONE series instead of each
             // minting its own.
-            mappingTitles.AddRange(_contributorDb.ChangeTracker.Entries<MappingTitleEntity>()
+            seriesTitles.AddRange(_contributorDb.ChangeTracker.Entries<SeriesTitleEntity>()
                 .Select(e => e.Entity)
-                .Where(mt => seriesTitleIds.Contains(mt.TitleId)));
+                .Where(mt => seriesTitleIds.Contains(mt.TitleId) && ContributionVersions.IsLive(mt.Version)));
 
-            // Prefer the mapping that already links the main title.
+            // Prefer the series that already links the main title.
             if (titleIds.TryGetValue(TitleEntity.Normalize(mainTitle), out var mainId))
             {
-                var viaMain = mappingTitles.FirstOrDefault(mt => mt.TitleId == mainId)?.MappingId;
+                var viaMain = seriesTitles.FirstOrDefault(mt => mt.TitleId == mainId)?.SeriesId;
                 if (viaMain.HasValue)
                     return viaMain.Value;
             }
 
-            // Fall back to the mapping linked to any of this series' titles.
-            var viaAny = mappingTitles.Select(mt => mt.MappingId).FirstOrDefault();
+            // Fall back to the series linked to any of this series' titles.
+            var viaAny = seriesTitles.Select(mt => mt.SeriesId).FirstOrDefault();
             if (viaAny != Guid.Empty)
                 return viaAny;
 
-            // No existing mapping → create one.
-            var created = new MappingEntity { Id = Guid.NewGuid() };
-            _contributorDb.Mappings.Add(created);
+            // No existing series → create one.
+            var created = new RensaioBackend.Models.ContributionDatabase.SeriesEntity { Id = Guid.NewGuid() };
+            _contributorDb.Series.Add(created);
             return created.Id;
         }
 
-        private async Task SyncMappingTitlesAsync(Guid mappingId, IEnumerable<Guid> titleIds, CancellationToken token)
+        private async Task SyncSeriesTitlesAsync(Guid mappingId, IEnumerable<Guid> titleIds, CancellationToken token)
         {
             var desired = titleIds.Distinct().ToHashSet();
-            var existingRows = await _contributorDb.MappingTitles
-                .Where(mt => mt.MappingId == mappingId)
+            var existingRows = await _contributorDb.SeriesTitles
+                .Where(mt => mt.SeriesId == mappingId)
                 .AsNoTracking()
                 .ToListAsync(token).ConfigureAwait(false);
 
@@ -306,53 +364,57 @@ namespace RensaioBackend.Services.Contributions
 
             // Links created earlier in this unit of work are invisible to the query above.
             // Without them a second series sharing a title would re-Add the same
-            // (MappingId, TitleId) key and EF would throw a duplicate-tracking error.
-            var trackedTitleIds = _contributorDb.ChangeTracker.Entries<MappingTitleEntity>()
-                .Where(e => e.Entity.MappingId == mappingId)
+            // (SeriesId, TitleId) key and EF would throw a duplicate-tracking error.
+            var trackedTitleIds = _contributorDb.ChangeTracker.Entries<SeriesTitleEntity>()
+                .Where(e => e.Entity.SeriesId == mappingId)
                 .Select(e => e.Entity.TitleId)
                 .ToHashSet();
 
-            // ADD missing associations.
+            // ADD missing associations. A row that exists but is TOMBSTONED (-1/-3) must be
+            // resurrected, not skipped: otherwise an unlinked-and-re-propagated title would
+            // stay dead forever, and re-adding it would violate the composite key.
             foreach (var titleId in desired)
             {
-                if (!existingByTitle.ContainsKey(titleId) && !trackedTitleIds.Contains(titleId))
+                if (existingByTitle.TryGetValue(titleId, out var persisted))
                 {
-                    _contributorDb.MappingTitles.Add(new MappingTitleEntity
+                    if (ContributionVersions.IsDeleted(persisted.Version))
                     {
-                        MappingId = mappingId,
+                        _contributorDb.SeriesTitles.Attach(persisted);
+                        persisted.Version = VersionAddOrUpdate;
+                        _contributorDb.Entry(persisted).Property(mt => mt.Version).IsModified = true;
+                        existingByTitle[titleId] = persisted;
+                    }
+                    continue;
+                }
+
+                if (!trackedTitleIds.Contains(titleId))
+                {
+                    _contributorDb.SeriesTitles.Add(new SeriesTitleEntity
+                    {
+                        SeriesId = mappingId,
                         TitleId = titleId,
                         Version = VersionAddOrUpdate
                     });
                 }
             }
 
-            // Tombstone associations that are no longer desired.
+            // Retire associations that are no longer desired. Cloud-backed rows (-2) are
+            // TOMBSTONED so the delete propagates; never-exported rows (0) are DELETED locally.
+            // Already-tombstoned rows (-1/-3) are left as-is — a queued delete must not be lost.
             foreach (var row in existingRows)
             {
-                if (desired.Contains(row.TitleId) || row.Version == VersionLogicalDelete)
+                if (desired.Contains(row.TitleId) || ContributionVersions.IsDeleted(row.Version))
                     continue;
 
-                // A previous SyncMappingTitlesAsync for this mapping in the same unit of work
-                // may already track this (MappingId, TitleId) — existingRows is AsNoTracking,
+                // A previous SyncSeriesTitlesAsync for this series in the same unit of work
+                // may already track this (SeriesId, TitleId) — existingRows is AsNoTracking,
                 // so attaching the fresh copy would throw "another instance with the same key
                 // value ... is already being tracked". Reuse the tracked instance instead.
-                var tracked = _contributorDb.ChangeTracker.Entries<MappingTitleEntity>()
+                var tracked = _contributorDb.ChangeTracker.Entries<SeriesTitleEntity>()
                     .Select(e => e.Entity)
-                    .FirstOrDefault(e => e.MappingId == row.MappingId && e.TitleId == row.TitleId);
+                    .FirstOrDefault(e => e.SeriesId == row.SeriesId && e.TitleId == row.TitleId);
 
-                if (tracked != null)
-                {
-                    if (tracked.Version != VersionLogicalDelete)
-                    {
-                        tracked.Version = VersionLogicalDelete;
-                        _contributorDb.Entry(tracked).Property(mt => mt.Version).IsModified = true;
-                    }
-                    continue;
-                }
-
-                _contributorDb.MappingTitles.Attach(row);
-                row.Version = VersionLogicalDelete;
-                _contributorDb.Entry(row).Property(mt => mt.Version).IsModified = true;
+                ContributionRowLifecycle.Retire(_contributorDb, tracked ?? row);
             }
         }
 
@@ -369,8 +431,8 @@ namespace RensaioBackend.Services.Contributions
             var mappingCover = mappings
                 .Select(m => m.SeriesCoverUrl)
                 .FirstOrDefault(u => !string.IsNullOrWhiteSpace(u));
-            var existing = await _contributorDb.Series
-                .Where(s => s.MappingId == mappingId)
+            var existing = await _contributorDb.SeriesEntries
+                .Where(s => s.SeriesId == mappingId)
                 .AsNoTracking()
                 .ToListAsync(token).ConfigureAwait(false);
             var existingById = existing.ToDictionary(s => s.Id, s => s);
@@ -380,10 +442,12 @@ namespace RensaioBackend.Services.Contributions
             foreach (var tracked in _contributorDb.ChangeTracker.Entries<ContributionSeriesEntity>())
                 existingById[tracked.Entity.Id] = tracked.Entity;
 
-            // ── Pass 1: parse the desired (package, sourceId) identities ──
+            // ── Pass 1: parse the desired (package, url) identities ──
             var desired = new List<(SeriesProviderEntity Source, string Package, long SourceId, Guid Id, Guid SourceEntityId)>();
             var desiredIds = new HashSet<Guid>();
             var wantedSourceKeys = new HashSet<Guid>();
+            // (sourceEntityId, seriesEntityId) pairs that must exist and stay live.
+            var desiredAssociations = new HashSet<(Guid SourceEntityId, Guid SeriesId)>();
 
             foreach (var source in series.Sources)
             {
@@ -402,10 +466,12 @@ namespace RensaioBackend.Services.Contributions
                     continue;
                 }
 
-                var id = ContributionSeriesEntity.DeriveId(package, sourceId, source.Url);
+
+                var id = ContributionSeriesEntity.DeriveId(package, source.Url);
                 desiredIds.Add(id);
                 var sourceEntityId = ContributionSourceEntity.DeriveId(package, sourceId);
                 wantedSourceKeys.Add(sourceEntityId);
+                desiredAssociations.Add((sourceEntityId, id));
                 desired.Add((source, package, sourceId, id, sourceEntityId));
             }
 
@@ -432,6 +498,7 @@ namespace RensaioBackend.Services.Contributions
                     {
                         Id = sourceEntityId,
                         Package = package,
+                        PackageId = ContributionSourceEntity.DerivePackageId(package),
                         SourceId = sourceId,
                         // SourceName is the EXTENSION / plugin display name (source.Provider),
                         // NOT the series title as seen on that provider (source.Title).
@@ -443,10 +510,21 @@ namespace RensaioBackend.Services.Contributions
                     sourceEntitiesById[sourceEntityId] = sourceEntity;
                 }
 
-                var record = new ContributionRecordV1
+                // Preserve an EXISTING entry's own title id. Overwriting it with the canonical
+                // title flips the grouping identity edge (Data.TitleId) and leaves the previously
+                // linked source title unbacked, so the reconcile tombstones it on the next pass.
+                // Only a NEW entry inherits the canonical title, which then backs it.
+                var entryTitleId = existingById.TryGetValue(id, out var existingEntry)
+                    && existingEntry.Data is { TitleId: var existingTitleId }
+                    && existingTitleId != Guid.Empty
+                        ? existingTitleId
+                        : mainTitleId;
+
+                var record = new ContributionRecordV2
                 {
-                    SchemaVersion = ContributionRecordV1.CurrentSchemaVersion,
-                    TitleId = mainTitleId,
+                    SchemaVersion = ContributionRecordV2.CurrentSchemaVersion,
+                    Url = source.Url ?? string.Empty,
+                    TitleId = entryTitleId,
                     ThumbnailUrl = string.IsNullOrWhiteSpace(source.ThumbnailUrl) ? mappingCover : source.ThumbnailUrl,
                     Status = (int)source.Status
                 };
@@ -456,63 +534,102 @@ namespace RensaioBackend.Services.Contributions
                 {
                     var rowJson = JsonSerializer.Serialize(row.Data);
                     // Resurrect / update only when the payload changed (or it was tombstoned).
-                    if (row.Version == VersionLogicalDelete || !string.Equals(rowJson, dataJson, StringComparison.Ordinal))
+                    if (ContributionVersions.IsDeleted(row.Version) || !string.Equals(rowJson, dataJson, StringComparison.Ordinal))
                     {
-                        _contributorDb.Series.Attach(row);
+                        _contributorDb.SeriesEntries.Attach(row);
                         row.Data = record;
-                        row.SourceId = sourceEntityId;
                         row.Version = VersionAddOrUpdate;
                         _contributorDb.Entry(row).Property(s => s.Data).IsModified = true;
-                        _contributorDb.Entry(row).Property(s => s.SourceId).IsModified = true;
                         _contributorDb.Entry(row).Property(s => s.Version).IsModified = true;
                     }
                 }
                 else
                 {
-                    _contributorDb.Series.Add(new ContributionSeriesEntity
+                    _contributorDb.SeriesEntries.Add(new ContributionSeriesEntity
                     {
                         Id = id,
-                        MappingId = mappingId,
+                        SeriesId = mappingId,
+                        PackageId = ContributionSeriesEntity.DerivePackageId(package),
                         SourceId = sourceEntityId,
                         Data = record,
                         Version = VersionAddOrUpdate
                     });
                 }
+
+                // Ensure the (source, series entry) association exists (many-to-many).
+                await EnsureAssociationAsync(sourceEntityId, id, token).ConfigureAwait(false);
             }
 
-            // Tombstone sources no longer belonging to the series (or identity changed).
+            // Retire associations no longer desired: a series entry that is no longer contributed
+            // by ANY source in rensaio.db has its association set tombstoned, and the entry itself
+            // is retired only when left with no live association.
             foreach (var row in existing)
             {
-                if (desiredIds.Contains(row.Id) || row.Version == VersionLogicalDelete)
+                if (ContributionVersions.IsDeleted(row.Version))
                     continue;
 
-                // `existing` is AsNoTracking, so a row already tracked from an earlier call
-                // for this mapping in the same unit of work is a fresh copy here; attaching
-                // it would throw the identity conflict. Reuse the tracked instance instead.
-                var tracked = _contributorDb.ChangeTracker.Entries<ContributionSeriesEntity>()
+                var liveAssociations = _contributorDb.ChangeTracker.Entries<ContributionSourceSeriesEntity>()
+                    .Where(e => e.Entity.SeriesEntityId == row.Id && ContributionVersions.IsLive(e.Entity.Version))
                     .Select(e => e.Entity)
-                    .FirstOrDefault(e => e.Id == row.Id);
+                    .ToList();
 
-                if (tracked != null)
+                if (!desiredIds.Contains(row.Id))
                 {
-                    if (tracked.Version != VersionLogicalDelete)
+                    foreach (var assoc in liveAssociations)
                     {
-                        tracked.Version = VersionLogicalDelete;
-                        _contributorDb.Entry(tracked).Property(s => s.Version).IsModified = true;
+                        assoc.Version = VersionLogicalDelete;
+                        _contributorDb.Entry(assoc).Property(ss => ss.Version).IsModified = true;
                     }
-                    continue;
-                }
 
-                _contributorDb.Series.Attach(row);
-                row.Version = VersionLogicalDelete;
-                _contributorDb.Entry(row).Property(s => s.Version).IsModified = true;
+                    if (liveAssociations.Count == 0 && !desiredAssociations.Any(d => d.SeriesId == row.Id))
+                    {
+                        var tracked = _contributorDb.ChangeTracker.Entries<ContributionSeriesEntity>()
+                            .Select(e => e.Entity)
+                            .FirstOrDefault(e => e.Id == row.Id);
+
+                        ContributionRowLifecycle.Retire(_contributorDb, tracked ?? row);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Ensures the many-to-many <c>SourceSeries</c> association exists for a
+        /// (source, series entry) pair, reviving a tombstoned row in place.
+        /// </summary>
+        private async Task EnsureAssociationAsync(Guid sourceEntityId, Guid seriesEntityId, CancellationToken token)
+        {
+            var assoc = _contributorDb.ChangeTracker.Entries<ContributionSourceSeriesEntity>()
+                .Select(e => e.Entity)
+                .FirstOrDefault(e => e.SourceId == sourceEntityId && e.SeriesEntityId == seriesEntityId);
+
+            assoc ??= await _contributorDb.SourceSeries
+                .FirstOrDefaultAsync(ss => ss.SourceId == sourceEntityId && ss.SeriesEntityId == seriesEntityId, token)
+                .ConfigureAwait(false);
+
+            if (assoc == null)
+            {
+                _contributorDb.SourceSeries.Add(new ContributionSourceSeriesEntity
+                {
+                    SourceId = sourceEntityId,
+                    SeriesEntityId = seriesEntityId,
+                    Version = VersionAddOrUpdate
+                });
+                return;
+            }
+
+            if (ContributionVersions.IsDeleted(assoc.Version))
+            {
+                _contributorDb.SourceSeries.Attach(assoc);
+                assoc.Version = VersionAddOrUpdate;
+                _contributorDb.Entry(assoc).Property(ss => ss.Version).IsModified = true;
             }
         }
 
         private async Task SyncMetadataAsync(List<SeriesMappingEntity> mappings, Guid mappingId, CancellationToken token)
         {
             var existing = await _contributorDb.Metadata
-                .Where(m => m.MappingId == mappingId)
+                .Where(m => m.SeriesId == mappingId)
                 .AsNoTracking()
                 .ToListAsync(token).ConfigureAwait(false);
 
@@ -548,21 +665,41 @@ namespace RensaioBackend.Services.Contributions
 
             foreach (var (pid, mapping) in desiredByProvider)
             {
+                // Provider-reported titles (canonical + alternates) this link vouches for. Only an
+                // ACTIVE link (AutoMatched / UserConfirmed) vouches; a refused mapping vouches for
+                // nothing so the reconcile can drop its associations.
+                var providerTitleIds = mapping.MappingStatus is SeriesMappingStatus.AutoMatched
+                    or SeriesMappingStatus.UserConfirmed
+                    ? ContributionTitleHeuristicsService.DeriveProviderTitleIds(
+                        mapping.ExternalSeriesTitle, mapping.AlternativeTitles)
+                    : new List<Guid>();
+
                 // Find the best EXISTING active row for this provider to reuse (matches
                 // the same key first, then any active row) so we never accumulate two rows.
                 var byKey = existing.FirstOrDefault(m => m.ProviderId == pid
                     && string.Equals(m.ProviderKey, mapping.ExternalSeriesId ?? "", StringComparison.Ordinal)
-                    && m.Version != VersionLogicalDelete);
+                    && ContributionVersions.IsLive(m.Version));
                 var activeRow = byKey
-                    ?? existing.FirstOrDefault(m => m.ProviderId == pid && m.Version != VersionLogicalDelete);
+                    ?? existing.FirstOrDefault(m => m.ProviderId == pid && ContributionVersions.IsLive(m.Version));
 
                 if (activeRow != null)
                 {
                     desiredActive.Add(activeRow.Id);
+
+                    // Fill the LOCAL provider cover from the rensaio mapping (already resolved by
+                    // the engine's GetDetails) when the contribution row lacks one. CoverUrl is
+                    // [JsonIgnore] — never exported — so this must NOT touch Version.
+                    if (string.IsNullOrWhiteSpace(activeRow.CoverUrl) && !string.IsNullOrWhiteSpace(mapping.SeriesCoverUrl))
+                    {
+                        _contributorDb.Metadata.Attach(activeRow);
+                        activeRow.CoverUrl = mapping.SeriesCoverUrl;
+                        _contributorDb.Entry(activeRow).Property(m => m.CoverUrl).IsModified = true;
+                    }
+
                     var statusChanged = activeRow.MappingStatus != mapping.MappingStatus
                         || !string.Equals(activeRow.ProviderKey, mapping.ExternalSeriesId ?? "", StringComparison.Ordinal)
                         || activeRow.LinkedDate != mapping.LinkedDate
-                        || activeRow.Version == VersionLogicalDelete;
+                        || ContributionVersions.IsDeleted(activeRow.Version);
                     if (statusChanged)
                     {
                         _contributorDb.Metadata.Attach(activeRow);
@@ -575,17 +712,27 @@ namespace RensaioBackend.Services.Contributions
                         _contributorDb.Entry(activeRow).Property(m => m.LinkedDate).IsModified = true;
                         _contributorDb.Entry(activeRow).Property(m => m.Version).IsModified = true;
                     }
+
+                    // Always refresh the local-only provider title set (does not affect replication).
+                    if (!activeRow.ProviderTitleIds.SequenceEqual(providerTitleIds))
+                    {
+                        _contributorDb.Metadata.Attach(activeRow);
+                        activeRow.ProviderTitleIds = providerTitleIds;
+                        _contributorDb.Entry(activeRow).Property(m => m.ProviderTitleIds).IsModified = true;
+                    }
                 }
                 else
                 {
                     var created = new ContributionMetadataEntity
                     {
                         Id = Guid.NewGuid(),
-                        MappingId = mappingId,
+                        SeriesId = mappingId,
                         ProviderId = pid,
                         ProviderKey = mapping.ExternalSeriesId ?? string.Empty,
                         MappingStatus = mapping.MappingStatus,
                         LinkedDate = mapping.LinkedDate,
+                        CoverUrl = mapping.SeriesCoverUrl,
+                        ProviderTitleIds = providerTitleIds,
                         Version = VersionAddOrUpdate
                     };
                     _contributorDb.Metadata.Add(created);
@@ -593,23 +740,23 @@ namespace RensaioBackend.Services.Contributions
                 }
             }
 
-            // Tombstone any remaining active rows for a provider NOT desired, and collapse
-            // sibling duplicates: keep only the single row we want active per provider.
+            // Retire any remaining active rows for a provider NOT desired, and collapse sibling
+            // duplicates: keep only the single row we want active per provider. Cloud-backed rows
+            // (-2) are TOMBSTONED; never-exported rows (0) are DELETED locally. Already tombstoned
+            // rows (-1/-3) are skipped (their delete may still be pending export).
             var desiredProviders = desiredByProvider.Keys.ToHashSet();
             foreach (var row in existing)
             {
-                if (row.Version == VersionLogicalDelete)
+                if (ContributionVersions.IsDeleted(row.Version))
                     continue;
                 if (desiredActive.Contains(row.Id) || !desiredProviders.Contains(row.ProviderId))
                 {
                     // Not desired (entirely) or it IS our kept row — skip. Rows for providers
-                    // that are NOT in the desired set are tombstoned below.
+                    // that are NOT in the desired set are retired below.
                 }
                 else
                 {
-                    _contributorDb.Metadata.Attach(row);
-                    row.Version = VersionLogicalDelete;
-                    _contributorDb.Entry(row).Property(m => m.Version).IsModified = true;
+                    ContributionRowLifecycle.Retire(_contributorDb, row);
                 }
             }
         }
@@ -623,7 +770,7 @@ namespace RensaioBackend.Services.Contributions
                 SeriesMappingStatus.Blocked => 4,
                 SeriesMappingStatus.AutoMatched => 3,
                 SeriesMappingStatus.ForeverIgnored => 2,
-                SeriesMappingStatus.TemporaryIgnored => 1,
+                SeriesMappingStatus.ManualIgnore => 1,
                 _ => 0,
             };
             if (Rank(a) != Rank(b)) return Rank(a) > Rank(b);

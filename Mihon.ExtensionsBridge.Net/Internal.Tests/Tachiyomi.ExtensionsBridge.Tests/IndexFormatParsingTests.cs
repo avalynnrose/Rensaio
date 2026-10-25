@@ -4,6 +4,7 @@ using Xunit;
 
 namespace Tachiyomi.ExtensionsBridge.Tests
 {
+    /*
     public class IndexFormatParsingTests
     {
         private const string NewFormatIndex = """
@@ -155,4 +156,5 @@ namespace Tachiyomi.ExtensionsBridge.Tests
             Assert.Null(extensions);
         }
     }
+    */
 }

@@ -40,18 +40,21 @@ public class EditableSettingsDto
     [JsonPropertyName("flareSolverrAsResponseFallback")]
     public bool FlareSolverrAsResponseFallback { get; set; } = false;
 
-    [JsonPropertyName("cefMaxRenderers")]
-    public int CefMaxRenderers { get; set; } = 4;
-    [JsonPropertyName("cefIdleTimeoutMs")]
-    public int CefIdleTimeoutMs { get; set; } = 300_000;
-    [JsonPropertyName("cefWebViewPoolEnabled")]
-    public bool CefWebViewPoolEnabled { get; set; } = true;
-    [JsonPropertyName("cefEnabled")]
-    public bool CefEnabled { get; set; } = true;
-    [JsonPropertyName("cefPumpActiveIntervalMs")]
-    public int CefPumpActiveIntervalMs { get; set; } = 10;
-    [JsonPropertyName("cefPumpIdleIntervalMs")]
-    public int CefPumpIdleIntervalMs { get; set; } = 500;
+    // Browser automation (replaces the former cef* group). The cefPump* intervals have no
+    // equivalent — the .NET-hosted browser drives itself, so there is no pump to tune.
+    [JsonPropertyName("browserEnabled")]
+    public bool BrowserEnabled { get; set; } = true;
+    [JsonPropertyName("browserProvider")]
+    public string BrowserProvider { get; set; } = "patchright";
+    /// <summary>Concurrency cap; replaces cefMaxRenderers.</summary>
+    [JsonPropertyName("browserMaxConcurrentPages")]
+    public int BrowserMaxConcurrentPages { get; set; } = 4;
+    /// <summary>Idle timeout (ms) before a pooled session is evicted; replaces cefIdleTimeoutMs.</summary>
+    [JsonPropertyName("browserIdleTimeoutMs")]
+    public int BrowserIdleTimeoutMs { get; set; } = 300_000;
+    /// <summary>Session pooling/reuse; replaces cefWebViewPoolEnabled.</summary>
+    [JsonPropertyName("browserPoolEnabled")]
+    public bool BrowserPoolEnabled { get; set; } = true;
 
     [JsonPropertyName("isWizardSetupComplete")]
     public bool IsWizardSetupComplete { get; set; } = false;
@@ -74,6 +77,27 @@ public class EditableSettingsDto
     public string SocksProxyUsername { get; set; } = "";
     [JsonPropertyName("socksProxyPassword")]
     public string SocksProxyPassword { get; set; } = "";
+    /// <summary>
+    /// Proxy transport scheme: "socks5" (default) or "http". trawl's transparent proxy is
+    /// HTTP-only (never SOCKS), so selecting trawl requires "http". Because a host/port cannot
+    /// serve both schemes, switching this MOVES the JVM chain from SOCKS to HTTP and takes
+    /// effect on the next RPC-host restart.
+    /// </summary>
+    [JsonPropertyName("proxyScheme")]
+    public string ProxyScheme { get; set; } = "socks5";
+    /// <summary>
+    /// The proxy's root CA. Either an absolute http(s) URL (trawl serves its CA at
+    /// http://<trawl-host>:8191/proxy-ca.crt) or a filesystem path to a PEM file.
+    /// Needed because a transparent proxy is TLS-terminating.
+    /// </summary>
+    [JsonPropertyName("caCertPath")]
+    public string CaCertPath { get; set; } = "";
+    /// <summary>
+    /// Emergency override: trust the proxy's interception without installing its CA. Real
+    /// security downgrade; off by default.
+    /// </summary>
+    [JsonPropertyName("ignoreTlsErrors")]
+    public bool IgnoreTlsErrors { get; set; } = false;
     [JsonPropertyName("nsfwVisibility")]
     [JsonConverter(typeof(JsonStringEnumConverter))]
     public NsfwVisibility NsfwVisibility { get; set; } = NsfwVisibility.HideByDefault;

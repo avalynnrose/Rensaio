@@ -7,7 +7,6 @@ using RensaioBackend.Services.Background;
 using RensaioBackend.Services.Contributions;
 using RensaioBackend.Services.Rpc;
 using RensaioBackend.Utils;
-using Mihon.ExtensionsBridge.Core.Extensions;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.ResponseCompression;
 using Microsoft.AspNetCore.StaticFiles;
@@ -98,28 +97,17 @@ namespace RensaioBackend
                 options.AgeInDays = Configuration.GetValue<int>("CacheCheckInDays", 7);
             });
 
-            // Extension runtime hosting:
-            //  - Desktop/tray: IN-PROCESS (IKVM/CEF must run on the tray's Avalonia UI
-            //    thread; a separate child process crashes with a reverse-JNI failure in
-            //    JavaVM.GetEnv — confirmed by A/B testing).
-            //  - Docker/headless: the isolated Rensaio.RPC child over gRPC (unchanged).
-            if (RensaioBackend.Utils.EnvironmentSetup.IsDocker)
-            {
-                services.AddRpcBridge();
-            }
-            else
-            {
-                services.AddExtensionsBridge();
-                // Desktop in-process transport surface (icons/source descriptors/listing)
-                // consumed by image providers and the seed sweep.
-                services.AddSingleton<IExtensionRpcBridge, InProcessExtensionRpcBridge>();
-            }
+            // The extension runtime is always a SEPARATE process reached over gRPC, so
+            // the backend references no IKVM/Core assembly. The supervisor spawns the
+            // single child host, Rensaio.RPC, on every deployment (Docker and desktop).
+            services.AddRpcBridge();
 
-            // One-shot seeding sweep options (--seed [<extensionPackage>]). Registered
+            // One-shot seeding sweep options (--seed [<extensionPackage>] [--force]). Registered
             // here as a typed singleton so SeedService and the startup wiring share the
             // same parsed values instead of reading the command line twice. Read from the
             // real process command line (not the host builder args), which is the only
             // source that is present for every launch path (Docker entrypoint, CLI, tray).
+            // Preferred order is `--force --seed [pkg]` (see SeedOptions).
             services.AddSingleton(SeedOptions.Parse(Environment.GetCommandLineArgs()));
 
             // Add consolidated services
@@ -137,6 +125,13 @@ namespace RensaioBackend
             services.AddOpdsServices();
             services.AddScrobblingServices(Configuration);
             services.AddMcpServices();
+
+            // Operator-controlled, per-extension-package rate limits for Mihon source
+            // calls. Bound here and pushed into ProviderRateLimits (which owns the token
+            // buckets) at startup and on every configuration reload.
+            services.Configure<SourceRateLimitsOptions>(
+                Configuration.GetSection(SourceRateLimitsOptions.SectionName));
+            services.AddHostedService<SourceRateLimitsConfigurator>();
 
             // Configure ForwardedHeaders to support reverse proxy SSL termination.
             // Without this, Kestrel is unaware of the original HTTPS scheme when deployed

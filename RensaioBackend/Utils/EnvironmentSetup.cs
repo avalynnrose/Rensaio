@@ -109,7 +109,11 @@ namespace RensaioBackend.Utils
 
         public static string ContributorConnectionString(IConfiguration configuration)
         {
-            return "Data Source=" + ContributorDatabasePath(configuration);
+            // Default Timeout raises the SQLite busy timeout: the sweep writes contributor.db
+            // without holding the shared ContributionDbGate, while the contribution import /
+            // repair workers VACUUM/rewrite the same file under that gate. Without a busy timeout
+            // a contended write fails immediately (SQLITE_BUSY); 30s lets it wait the import out.
+            return "Data Source=" + ContributorDatabasePath(configuration) + ";Default Timeout=30";
         }
         public static async Task WriteToAppSettingsAsync(string? storageDirectory, CancellationToken token = default)
         {
@@ -404,7 +408,7 @@ namespace RensaioBackend.Utils
             // Resolve relative log paths against the app data directory
             if (!System.IO.Path.IsPathRooted(logsDir))
                 logsDir = System.IO.Path.Combine(Path, logsDir);
-            FallbackCrashLogger.Initialize(logsDir);
+            //FallbackCrashLogger.Initialize(logsDir);
             LoggerInfrastructure.BuildLogger(Configuration!);
             ExtractWWWRoot();
         }

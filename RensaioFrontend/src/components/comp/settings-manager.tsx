@@ -13,6 +13,13 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useAuth } from "@/contexts/auth-context";
 import { useMutation } from "@tanstack/react-query";
 import { userService } from "@/lib/api/services/userService";
@@ -911,6 +918,7 @@ function SocksSettingsSection({
   setLocalSettings: (updater: (prev: Settings) => Settings) => void;
 }) {
   const isEnabled = localSettings.socksProxyEnabled;
+  const isHttp = (localSettings.proxyScheme || "socks5") === "http";
 
   return (
     <CardContent className="space-y-4">
@@ -925,30 +933,36 @@ function SocksSettingsSection({
             }))
           }
         />
-        <Label htmlFor="socks-proxy-enabled">Enable SOCKS Proxy</Label>
+        <Label htmlFor="socks-proxy-enabled">Enable Proxy</Label>
       </div>
 
       <div className="border-muted space-y-4 border-l-2 pl-6">
         <div className="grid gap-4 md:grid-cols-2">
           <div>
-            <Label htmlFor="socks-proxy-version">SOCKS Version</Label>
-            <Input
-              id="socks-proxy-version"
-              type="number"
-              min="4"
-              max="5"
-              value={localSettings.socksProxyVersion ?? 5}
-              onChange={(e) =>
+            <Label htmlFor="proxy-scheme">Scheme</Label>
+            <Select
+              value={localSettings.proxyScheme || "socks5"}
+              onValueChange={(value) =>
                 setLocalSettings((prev) => ({
                   ...prev,
-                  socksProxyVersion: Math.min(
-                    5,
-                    Math.max(4, parseInt(e.target.value) || 5),
-                  ),
+                  proxyScheme: value,
+                  // The SOCKS version is implied by the chosen scheme, so the dedicated
+                  // version input was removed; keep the stored value coherent for the
+                  // JVM bridge, which still reads it.
+                  socksProxyVersion: value === "socks4" ? 4 : 5,
                 }))
               }
               disabled={!isEnabled}
-            />
+            >
+              <SelectTrigger id="proxy-scheme">
+                <SelectValue placeholder="socks5" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="socks5">SOCKS5</SelectItem>
+                <SelectItem value="socks4">SOCKS4</SelectItem>
+                <SelectItem value="http">HTTP (trawl)</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
           <div>
             <Label htmlFor="socks-proxy-host">Host</Label>
@@ -1017,8 +1031,48 @@ function SocksSettingsSection({
             />
           </div>
         </div>
+
+        {isHttp && (
+          <div className="grid gap-4 md:grid-cols-2">
+            <div className="md:col-span-2">
+              <Label htmlFor="ca-cert-path">Proxy Root CA (URL or path)</Label>
+              <Input
+                id="ca-cert-path"
+                value={localSettings.caCertPath || ""}
+                onChange={(e) =>
+                  setLocalSettings((prev) => ({
+                    ...prev,
+                    caCertPath: e.target.value,
+                  }))
+                }
+                placeholder="http://<trawl-host>:8191/proxy-ca.crt"
+                disabled={!isEnabled}
+              />
+            </div>
+            <div className="flex items-center space-x-2 md:col-span-2">
+              <Switch
+                id="ignore-tls-errors"
+                checked={localSettings.ignoreTlsErrors ?? false}
+                onCheckedChange={(checked) =>
+                  setLocalSettings((prev) => ({
+                    ...prev,
+                    ignoreTlsErrors: checked,
+                  }))
+                }
+                disabled={!isEnabled}
+              />
+              <Label htmlFor="ignore-tls-errors">
+                Ignore TLS errors (insecure fallback — disables certificate
+                verification for all sites)
+              </Label>
+            </div>
+          </div>
+        )}
+
         <p className="text-muted-foreground text-sm">
-          Configure a SOCKS4/5 proxy for provider requests.
+          {isHttp
+            ? "Route provider and browser traffic through an HTTP transparent proxy (e.g. trawl on port 8192). Because it terminates TLS, provide its root CA so intercepted certificates are trusted. Changing the scheme requires an RPC host restart."
+            : "Configure a SOCKS4/5 proxy for provider requests."}
         </p>
       </div>
     </CardContent>
@@ -1684,8 +1738,9 @@ const AVAILABLE_SECTIONS: SettingsSection[] = [
   },
   {
     id: "socks-settings",
-    title: "Socks Settings",
-    description: "Configure SOCKS proxy settings for sources requests.",
+    title: "Proxy Settings",
+    description:
+      "Configure a SOCKS or HTTP proxy for source and browser requests.",
     component: SocksSettingsSection,
   },
   {

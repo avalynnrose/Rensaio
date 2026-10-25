@@ -241,7 +241,7 @@ public class ScrobblerSyncService
     /// <summary>
     /// True when a mapping is "active" enough to be synced to a scrobbler: it has been
     /// auto-matched, user-confirmed, or manually linked. All refusal/ignored statuses
-    /// (TemporaryIgnored, ForeverIgnored, Blocked) and Unmatched are excluded.
+    /// (ManualIgnore, ForeverIgnored, Blocked) and Unmatched are excluded.
     /// </summary>
     private static bool IsMapForSync(SeriesMappingStatus status)
         => status == SeriesMappingStatus.AutoMatched

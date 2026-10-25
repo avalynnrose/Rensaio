@@ -23,6 +23,7 @@ public class MangaUpdatesMetadataProvider : IExternalSeriesProvider
 {
     private readonly HttpClient _httpClient;
     private readonly ILogger<MangaUpdatesMetadataProvider> _logger;
+    public string[] SupportedTypes => new[] { "Manga", "Manhwa", "Manhua" };
 
     private const string ApiBase = "https://api.mangaupdates.com/v1";
 
@@ -51,7 +52,7 @@ public class MangaUpdatesMetadataProvider : IExternalSeriesProvider
     public Task<ScrobblerTokenResult> ExchangeCodeAsync(string code, string redirectUri)
         => throw new NotSupportedException("MangaUpdates does not support OAuth.");
 
-    public Task<ScrobblerTokenResult> RefreshTokenAsync(string refreshToken)
+    public Task<ScrobblerTokenResult> RefreshTokenAsync(string refreshToken, CancellationToken token = default)
         => throw new NotSupportedException("MangaUpdates does not support OAuth.");
 
     public Task<ScrobblerTokenResult> AuthenticateDirectAsync(DirectAuthRequest request)
@@ -74,7 +75,7 @@ public class MangaUpdatesMetadataProvider : IExternalSeriesProvider
 
     public async Task<List<ScrobblerSearchResult>> SearchSeriesAsync(string query, CancellationToken token = default)
     {
-        _logger.LogInformation("MangaUpdates: searching for '{Query}'", query);
+        _logger.LogInformation("{provider}: searching for '{Query}'", ExternalSeriesProvider.MangaUpdates, query);
         var results = new List<ScrobblerSearchResult>();
         if (string.IsNullOrWhiteSpace(query))
             return results;
@@ -92,10 +93,11 @@ public class MangaUpdatesMetadataProvider : IExternalSeriesProvider
             {
                 Content = JsonContent.Create(requestBody)
             };
+            await ProviderRateLimits.EnforceMangaUpdatesAsync();
             var response = await _httpClient.SendAsync(request, token);
             if (!response.IsSuccessStatusCode)
             {
-                _logger.LogWarning("MangaUpdates search failed for '{Query}': HTTP {Status}", query, (int)response.StatusCode);
+                _logger.LogWarning("{provider} search failed for '{Query}': HTTP {Status}", ExternalSeriesProvider.MangaUpdates, query, (int)response.StatusCode);
                 return results;
             }
 
@@ -130,7 +132,7 @@ public class MangaUpdatesMetadataProvider : IExternalSeriesProvider
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
         {
-            _logger.LogWarning(ex, "MangaUpdates search failed for '{Query}'", query);
+            _logger.LogWarning(ex, "{provider} search failed for '{Query}'", ExternalSeriesProvider.MangaUpdates, query);
         }
 
         return results;
@@ -138,7 +140,7 @@ public class MangaUpdatesMetadataProvider : IExternalSeriesProvider
 
     public async Task<SeriesMetadataResult?> FetchSeriesMetadataAsync(string externalSeriesId, CancellationToken token = default)
     {
-        _logger.LogInformation("MangaUpdates: fetching metadata for id '{Id}'", externalSeriesId);
+        _logger.LogInformation("{provider}: fetching metadata for id '{Id}'", ExternalSeriesProvider.MangaUpdates, externalSeriesId);
         if (string.IsNullOrWhiteSpace(externalSeriesId))
             return null;
 
@@ -146,17 +148,18 @@ public class MangaUpdatesMetadataProvider : IExternalSeriesProvider
         var seriesIdLong = Base36Codec.Decode(externalSeriesId);
         if (seriesIdLong < 0)
         {
-            _logger.LogWarning("MangaUpdates detail invalid base36 id '{Id}'", externalSeriesId);
+            _logger.LogWarning("{provider} detail invalid base36 id '{Id}'", ExternalSeriesProvider.MangaUpdates, externalSeriesId);
             return null;
         }
 
         try
         {
             var url = $"{ApiBase}/series/{seriesIdLong}";
+            await ProviderRateLimits.EnforceMangaUpdatesAsync();
             var response = await _httpClient.GetAsync(url, token);
             if (!response.IsSuccessStatusCode)
             {
-                _logger.LogWarning("MangaUpdates detail failed for id '{Id}': HTTP {Status}", externalSeriesId, (int)response.StatusCode);
+                _logger.LogWarning("{provider} detail failed for id '{Id}': HTTP {Status}", ExternalSeriesProvider.MangaUpdates, externalSeriesId, (int)response.StatusCode);
                 return null;
             }
 
@@ -177,7 +180,7 @@ public class MangaUpdatesMetadataProvider : IExternalSeriesProvider
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
         {
-            _logger.LogWarning(ex, "MangaUpdates detail failed for id '{Id}'", externalSeriesId);
+            _logger.LogWarning(ex, "{provider} detail failed for id '{Id}'", ExternalSeriesProvider.MangaUpdates, externalSeriesId);
             return null;
         }
     }

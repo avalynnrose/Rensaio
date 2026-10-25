@@ -265,6 +265,23 @@ namespace Mihon.ExtensionsBridge.Core.Runtime
         }
 
         /// <summary>
+        /// Resolves the absolute source page url for a manga by delegating to the extension's
+        /// <c>HttpSource.getMangaUrl(SManga)</c>. The stored <see cref="Manga.Url"/> is usually a
+        /// source-relative path; this applies the source base url (and any per-source override).
+        /// </summary>
+        public Task<string> GetMangaUrlAsync(Manga manga, CancellationToken token = default)
+        {
+            return WrapHttpException(() =>
+            {
+                if (_httpSource == null || manga == null)
+                    return Task.FromResult(string.Empty);
+                SManga mangaImpl = manga.ToSManga();
+                string url = _httpSource.getMangaUrl(mangaImpl);
+                return Task.FromResult(url ?? string.Empty);
+            });
+        }
+
+        /// <summary>
         /// Fetches Manga detailed information and Chapters for a manga.
         /// If getMangaUpdate is not overridden, calls fetchMangaDetails and fetchChapterList
         /// directly using blocking Observable calls to avoid coroutine suspension issues under IKVM.

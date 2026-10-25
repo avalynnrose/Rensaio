@@ -22,7 +22,8 @@ option csharp_namespace = "Rensaio.RPC.Contracts.V1";
 
 service ExtensionsService {
   // Installed extensions with their sources and available local versions.
-  rpc ListInstalledExtensions (Correlation) returns (JsonResult);
+  // Temporary (online-prepared) groups are excluded unless include_temporary is set.
+  rpc ListInstalledExtensions (ListInstalledRequest) returns (JsonResult);
 
   // Repositories and every extension/version they expose.
   rpc ListAvailableExtensions (ListAvailableRequest) returns (JsonResult);
@@ -42,6 +43,13 @@ service ExtensionsService {
   // Install a user-supplied APK (streamed).
   rpc InstallCustomApk (stream InstallApkRequest) returns (JsonResult);
 
+  // Prepare an online extension for a sweep (download/compile + register Temporary). Returns an
+  // OnlineExtensionDescriptor (JSON). Idempotent: an already-present package is returned as-is.
+  rpc PrepareOnlineExtension (PackageRequest) returns (JsonResult);
+
+  // Release a temporary extension previously prepared (dispose interop + deregister).
+  rpc ReleaseOnlineExtension (PackageRequest) returns (BoolValue);
+
   // Extension icon bytes (streamed).
   rpc GetExtensionIcon (PackageRequest) returns (stream Chunk);
 }
@@ -49,6 +57,12 @@ service ExtensionsService {
 message ListAvailableRequest {
   // Force a repository refresh before enumerating (best-effort).
   bool refresh = 1;
+  Correlation correlation = 2;
+}
+
+message ListInstalledRequest {
+  // Include groups prepared from an online repository for a sweep (Temporary).
+  bool include_temporary = 1;
   Correlation correlation = 2;
 }
 

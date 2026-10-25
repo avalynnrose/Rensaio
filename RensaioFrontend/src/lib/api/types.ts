@@ -47,6 +47,18 @@ export interface Settings {
   socksProxyPort: number;
   socksProxyUsername: string;
   socksProxyPassword: string;
+  /**
+   * "socks5" (default), "socks4" or "http". trawl's transparent proxy is HTTP-only.
+   * The SOCKS version is implied by the scheme; `socksProxyVersion` is kept in sync for the JVM.
+   */
+  proxyScheme: string;
+  /**
+   * Proxy root CA. Either an absolute http(s) URL (trawl serves it at
+   * http://<trawl-host>:8191/proxy-ca.crt) or a PEM file path.
+   */
+  caCertPath: string;
+  /** Emergency override: trust proxy interception without installing its CA. Security downgrade. */
+  ignoreTlsErrors: boolean;
   nsfwVisibility: NsfwVisibility;
   // Setup Wizard properties
   isWizardSetupComplete: boolean;
@@ -870,7 +882,7 @@ export enum SeriesMappingStatus {
   Unmatched = 0,
   AutoMatched = 1,
   UserConfirmed = 2,
-  TemporaryIgnored = 3,
+  ManualIgnore = 3,
   ForeverIgnored = 4,
   Blocked = 5,
 }
@@ -933,6 +945,8 @@ export interface ContributionMappingSource {
   sourceLanguage: string;
   title?: string;
   thumbnailUrl?: string;
+  /** Canonical source page url — deep-links to the series page on the source site. */
+  sourceUrl?: string;
 }
 
 /** One grouped mapping on the Contribution Mappings page (source scope, automerged by normalized title). */
@@ -941,6 +955,11 @@ export interface ContributionMappingGroup {
   displayTitle?: string;
   coverUrl?: string;
   titles: string[];
+  /**
+   * Set when the mapping is Verified (every live source entry carries a date — the most recent
+   * one is reported); undefined when Unverified (at least one live entry is null).
+   */
+  verifiedDateUtc?: string;
   sources: ContributionMappingSource[];
   providers: ExternalSeriesProviderMapping[];
 }
@@ -959,6 +978,29 @@ export interface ContributionMappingLinkRequest {
   provider: ScrobblerProvider;
   externalSeriesId: string;
   externalSeriesTitle?: string;
+}
+
+/** One ranked candidate returned by the Contribution page's "Smart Search". */
+export interface SmartSearchHit {
+  externalId: string;
+  title: string;
+  alternateTitles: string[];
+  coverUrl?: string;
+  type?: string;
+  year?: string;
+  /** Blended ranking score (0..100); the list is sorted by this descending. */
+  score: number;
+  /** Best title-match percentage (0..100) against the mapping's candidate titles. */
+  titleScore: number;
+  /** Best cover similarity percentage (0..100) against the series' reference images; null when none. */
+  imageScore?: number;
+  /** PDQ Hamming distance of the best cover comparison; null when no image was compared. */
+  imageDistance?: number;
+}
+
+export interface SmartSearchResponse {
+  provider: ScrobblerProvider;
+  results: SmartSearchHit[];
 }
 
 export interface ScrobblerConfigUpdate {

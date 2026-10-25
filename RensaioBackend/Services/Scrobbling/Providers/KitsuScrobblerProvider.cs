@@ -40,6 +40,7 @@ public class KitsuScrobblerProvider : IScrobblerProvider
     public string? ImageTemplateUrl => null;
     public bool RequiresOAuth => true;
     public bool SupportsDirectAuth => true;
+    public string[] SupportedTypes => new[] { "Manga", "Manhwa", "Manhua" };
 
     private readonly SeriesMetadataResolver _resolver;
 
@@ -91,6 +92,7 @@ public class KitsuScrobblerProvider : IScrobblerProvider
                 ["password"] = request.Password ?? string.Empty
             };
 
+            await ProviderRateLimits.EnforceKitsuAsync();
             var response = await _httpClient.PostAsync($"{AuthBase}/token",
                 new FormUrlEncodedContent(formData));
             //string xxx = await response.Content.ReadAsStringAsync();
@@ -119,7 +121,7 @@ public class KitsuScrobblerProvider : IScrobblerProvider
     /// Refreshes an expired access token. Kitsu is fully public —
     /// only grant_type and refresh_token are needed, no client credentials.
     /// </summary>
-    public async Task<ScrobblerTokenResult> RefreshTokenAsync(string refreshToken)
+    public async Task<ScrobblerTokenResult> RefreshTokenAsync(string refreshToken, CancellationToken token = default)
     {
         try
         {
@@ -129,8 +131,9 @@ public class KitsuScrobblerProvider : IScrobblerProvider
                 ["refresh_token"] = refreshToken
             };
 
+            await ProviderRateLimits.EnforceKitsuAsync();
             var response = await _httpClient.PostAsync($"{AuthBase}/token",
-                new FormUrlEncodedContent(formData));
+                new FormUrlEncodedContent(formData), token);
 
             var json = await response.Content.ReadFromJsonAsync<KitsuTokenResponse>();
             if (json == null || string.IsNullOrEmpty(json.AccessToken))
@@ -164,7 +167,7 @@ public class KitsuScrobblerProvider : IScrobblerProvider
         {
             if (string.IsNullOrEmpty(refreshToken)) return;
 
-            var refreshResult = await RefreshTokenAsync(refreshToken);
+            var refreshResult = await RefreshTokenAsync(refreshToken, token);
             if (refreshResult.Success && refreshResult.AccessToken != null)
             {
                 // Build JSON payload with refresh token (Kitsu stores refresh in payload)
@@ -194,9 +197,10 @@ public class KitsuScrobblerProvider : IScrobblerProvider
 
     public async Task<List<ScrobblerSearchResult>> SearchSeriesAsync(string query, CancellationToken token = default)
     {
-        _logger.LogInformation("Kitsu: searching for '{Query}'", query);
+        _logger.LogInformation("{provider}: searching for '{Query}'", ExternalSeriesProvider.Kitsu, query);
         _httpClient.ApplyBearerToken(_accessToken);
         AddVND();
+        await ProviderRateLimits.EnforceKitsuAsync();
         var response = await _httpClient.GetAsync(
             $"{ApiBase}/manga?filter[text]={Uri.EscapeDataString(query)}&page[limit]=20&include=categories",
             token);
@@ -241,13 +245,14 @@ public class KitsuScrobblerProvider : IScrobblerProvider
     /// </summary>
     public async Task<SeriesMetadataResult?> FetchSeriesMetadataAsync(string externalSeriesId, CancellationToken token = default)
     {
-        _logger.LogInformation("Kitsu: fetching metadata for id '{Id}'", externalSeriesId);
+        _logger.LogInformation("{provider}: fetching metadata for id '{Id}'", ExternalSeriesProvider.Kitsu, externalSeriesId);
         if (string.IsNullOrWhiteSpace(externalSeriesId)) return null;
         try
         {
             _httpClient.ApplyBearerToken(_accessToken);
             AddVND();
 
+            await ProviderRateLimits.EnforceKitsuAsync();
             var detailResponse = await _httpClient.GetAsync(
                 $"{ApiBase}/manga/{Uri.EscapeDataString(externalSeriesId)}",
                 token);
@@ -264,6 +269,7 @@ public class KitsuScrobblerProvider : IScrobblerProvider
             var linkedSites = new List<string> { $"kitsu:{manga.Id}" };
 
             // Cross-site mappings: /manga/{id}/mappings
+            await ProviderRateLimits.EnforceKitsuAsync();
             var mappingsResponse = await _httpClient.GetAsync(
                 $"{ApiBase}/manga/{Uri.EscapeDataString(externalSeriesId)}/mappings",
                 token);
@@ -296,7 +302,7 @@ public class KitsuScrobblerProvider : IScrobblerProvider
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Kitsu detail failed for id '{Id}'", externalSeriesId);
+            _logger.LogWarning(ex, "{provider} detail failed for id '{Id}'", ExternalSeriesProvider.Kitsu, externalSeriesId);
             return null;
         }
     }
@@ -317,12 +323,14 @@ public class KitsuScrobblerProvider : IScrobblerProvider
             _httpClient.ApplyBearerToken(_accessToken);
             AddVND();
             // First need to get the user's Kitsu ID
+            await ProviderRateLimits.EnforceKitsuAsync();
             var userResponse = await _httpClient.GetAsync($"{ApiBase}/users?filter[self]=true", token);
             userResponse.EnsureSuccessStatusCode();
             var userResult = await userResponse.Content.ReadFromJsonAsync<KitsuUserResponse>(cancellationToken: token);
             var userId = userResult?.Data?.FirstOrDefault()?.Id;
             if (userId == null) return 0;
 
+            await ProviderRateLimits.EnforceKitsuAsync();
             var response = await _httpClient.GetAsync(
                 $"{ApiBase}/library-entries?filter[userId]={userId}&filter[mangaId]={externalSeriesId}&fields[libraryEntries]=progress",
                 token);
@@ -362,6 +370,7 @@ public class KitsuScrobblerProvider : IScrobblerProvider
             _httpClient.ApplyBearerToken(_accessToken);
             AddVND();
             // Need to get the library entry ID first
+            await ProviderRateLimits.EnforceKitsuAsync();
             var userResponse = await _httpClient.GetAsync($"{ApiBase}/users?filter[self]=true", token);
             userResponse.EnsureSuccessStatusCode();
             var userResult = await userResponse.Content.ReadFromJsonAsync<KitsuUserResponse>(cancellationToken: token);
@@ -369,6 +378,7 @@ public class KitsuScrobblerProvider : IScrobblerProvider
             if (userId == null) 
                 return false;
 
+            await ProviderRateLimits.EnforceKitsuAsync();
             var libResponse = await _httpClient.GetAsync(
                 $"{ApiBase}/library-entries?filter[userId]={userId}&filter[mangaId]={externalSeriesId}",
                 token);
@@ -398,6 +408,7 @@ public class KitsuScrobblerProvider : IScrobblerProvider
                     }
                 };
 
+                await ProviderRateLimits.EnforceKitsuAsync();
                 var createResponse = await _httpClient.PostAsJsonAsync($"{ApiBase}/library-entries", createPayload, token);
                 if (createResponse.IsSuccessStatusCode)
                 {
@@ -420,6 +431,7 @@ public class KitsuScrobblerProvider : IScrobblerProvider
                 }
             };
 
+            await ProviderRateLimits.EnforceKitsuAsync();
             var response = await _httpClient.PatchAsJsonAsync($"{ApiBase}/library-entries/{libEntryId}", updatePayload, token);
             if (response.IsSuccessStatusCode)
             {
@@ -452,6 +464,7 @@ public class KitsuScrobblerProvider : IScrobblerProvider
         {
             _httpClient.ApplyBearerToken(_accessToken);
             AddVND();
+            await ProviderRateLimits.EnforceKitsuAsync();
             var response = await _httpClient.GetAsync($"{ApiBase}/users?filter[self]=true", token);
             return response.IsSuccessStatusCode;
         }

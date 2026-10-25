@@ -3,11 +3,11 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
+import { ComboInput } from "@/components/ui/combo-input";
 import { useSearchExternal, useConfirmMatch, useScrobblerConfigs } from '@/lib/api/hooks/useScrobbler';
 import { useToast } from '@/hooks/use-toast';
 import { ScrobblerProvider, type ScrobblerSearchResult } from '@/lib/api/types';
-import { Search, Check } from 'lucide-react';
+import { Search, Check, Sparkles } from 'lucide-react';
 import { LazyImage } from "@/components/ui/lazy-image";
 import { formatThumbnailUrl } from "@/lib/utils/thumbnail";
 import * as TooltipPrimitive from "@radix-ui/react-tooltip";
@@ -33,6 +33,18 @@ interface ScrobblerSearchRequesterProps {
    */
   onConfirm?: (externalSeriesId: string, externalSeriesTitle?: string) => Promise<void> | void;
   confirmLabel?: string;
+  /**
+   * Extra titles to offer as suggestions in the search box (the combobox lists every possible
+   * title so the user can pick one instead of typing). The series title is always included.
+   */
+  candidateTitles?: string[];
+  /**
+   * Optional Smart Search loader. When provided, a "Smart Search" button appears next to the
+   * normal Search button: clicking it calls this loader and replaces the results grid with the
+   * ranked candidates (no textbox query is used). Omitted by callers without a smart backend,
+   * in which case the button is hidden.
+   */
+  onSmartSearch?: () => Promise<ScrobblerSearchResult[]>;
 }
 
 export function ScrobblerSearchRequester({
@@ -45,6 +57,8 @@ export function ScrobblerSearchRequester({
   seriesAltTitles,
   onConfirm,
   confirmLabel = 'Confirm Selection',
+  candidateTitles,
+  onSmartSearch,
 }: ScrobblerSearchRequesterProps) {
   const searchExternal = useSearchExternal();
   const confirmMatch = useConfirmMatch();
@@ -55,6 +69,7 @@ export function ScrobblerSearchRequester({
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<ScrobblerSearchResult[]>([]);
   const [isSearching, setIsSearching] = useState(false);
+  const [isSmartSearching, setIsSmartSearching] = useState(false);
   const [hasSearched, setHasSearched] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [isConfirming, setIsConfirming] = useState(false);
@@ -80,6 +95,29 @@ export function ScrobblerSearchRequester({
       setIsSearching(false);
     }
   }, [searchQuery, provider, searchExternal, toast]);
+
+  // Smart Search: explicit click handler (no auto-load on open). Searches the provider with every
+  // series title + the existing covers via the caller's loader and replaces the results grid.
+  const handleSmartSearch = useCallback(async () => {
+    if (!onSmartSearch) return;
+    setSelectedId(null);
+    setHasSearched(false);
+    setIsSmartSearching(true);
+    try {
+      const results = await onSmartSearch();
+      setSearchResults(results);
+      setHasSearched(true);
+    } catch (error) {
+      console.error('Smart search failed:', error);
+      toast({
+        title: 'Smart search failed',
+        description: error instanceof Error ? error.message : 'Could not reach the provider. Please try again.',
+        variant: 'destructive',
+      });
+    } finally {
+      setIsSmartSearching(false);
+    }
+  }, [onSmartSearch, toast]);
 
   const handleConfirm = useCallback(async () => {
     if (selectedId == null) return;
@@ -155,6 +193,19 @@ export function ScrobblerSearchRequester({
     return undefined;
   }, [imageTemplateUrl]);
 
+  // Combobox suggestions for the search box: the primary series title, any explicit candidate
+  // titles, and the alternative-titles string (callers join it with ' · ').
+  const searchOptions = React.useMemo(() => {
+    const opts = [
+      seriesTitle,
+      ...(candidateTitles ?? []),
+      ...(seriesAltTitles ? seriesAltTitles.split('·').map((t) => t.trim()) : []),
+    ]
+      .map((t) => t?.trim())
+      .filter((t): t is string => !!t);
+    return Array.from(new Set(opts));
+  }, [seriesTitle, candidateTitles, seriesAltTitles]);
+
   return (
     <TooltipProvider>
       <Dialog open={open} onOpenChange={onOpenChange}>
@@ -198,20 +249,33 @@ export function ScrobblerSearchRequester({
             </div>
           </div>
 
-          {/* Search input */}
+          {/* Search input + Smart Search. The Smart Search button appears only when the caller
+              supplies a smart loader; it ignores the textbox and ranks by every title + covers. */}
           <div className="flex gap-2">
-            <Input
+            <ComboInput
               ref={searchInputRef}
-              placeholder={`Search ${ScrobblerProvider[provider]}...`}
+              wrapperClassName="flex-1"
+              placeholder={`Search by title, #id or ${ScrobblerProvider[provider]} URL...`}
               value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
+              onValueChange={setSearchQuery}
+              options={searchOptions}
               onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
-              className="flex-1"
             />
-            <Button onClick={handleSearch} disabled={isSearching || !searchQuery.trim()}>
+            <Button onClick={handleSearch} disabled={isSearching || isSmartSearching || !searchQuery.trim()}>
               <Search className="h-4 w-4 mr-1" />
               Search
             </Button>
+            {onSmartSearch && (
+              <Button
+                variant="secondary"
+                onClick={handleSmartSearch}
+                disabled={isSearching || isSmartSearching}
+                title="Search using every title of the series and its existing covers"
+              >
+                <Sparkles className={`h-4 w-4 mr-1 ${isSmartSearching ? 'animate-pulse' : ''}`} />
+                {isSmartSearching ? 'Smart Searching…' : 'Smart Search'}
+              </Button>
+            )}
           </div>
 
           {/* Search results grid — with scrollbar-gutter for right gap */}
@@ -314,10 +378,12 @@ export function ScrobblerSearchRequester({
           )}
 
           {/* Empty / loading states */}
-          {isSearching && searchResults.length === 0 && (
-            <p className="text-sm text-muted-foreground text-center py-4">Searching...</p>
+          {(isSearching || isSmartSearching) && searchResults.length === 0 && (
+            <p className="text-sm text-muted-foreground text-center py-4">
+              {isSmartSearching ? 'Smart searching...' : 'Searching...'}
+            </p>
           )}
-          {hasSearched && !isSearching && searchResults.length === 0 && searchQuery && (
+          {hasSearched && !isSearching && !isSmartSearching && searchResults.length === 0 && searchQuery && (
             <p className="text-sm text-muted-foreground text-center py-4">
               No results found for "{searchQuery}"
             </p>

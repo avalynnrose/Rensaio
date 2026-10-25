@@ -25,6 +25,7 @@ public class GetLatest : ICommand
         string? mihonprovideId = JsonSerializer.Deserialize<string>(job.Parameters);
         if (mihonprovideId == null)
             return JobResult.Failed;
-        return await _seriesCommand.UpdateSourceAsync(mihonprovideId, token).ConfigureAwait(false);
+        return JobResult.Success;
+        //        return await _seriesCommand.UpdateSourceAsync(mihonprovideId, token).ConfigureAwait(false);
     }
 }

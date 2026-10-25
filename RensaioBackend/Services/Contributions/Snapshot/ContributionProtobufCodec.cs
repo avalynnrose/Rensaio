@@ -12,12 +12,18 @@ namespace RensaioBackend.Services.Contributions.Snapshot
     ///   ContributionSnapshotV1: 1=schema_version, 2=generated_utc, 3=version,
     ///                            4=titles, 5=mapping_titles, 6=sources, 7=series, 8=metadata
     ///   TitleEntity:             1=id, 2=title, 3=v
-    ///   MappingTitleEntity:      1=mapping_id, 2=title_id, 3=v
+    ///   SeriesTitleEntity:       1=series_id, 2=title_id, 3=v
     ///   ContributionSourceEntity:1=id, 2=package, 3=source_id(int64), 4=source_name,
     ///                            5=source_language, 6=last_batch_utc, 7=v
-    ///   ContributionSeriesEntity:1=id, 2=mapping_id, 3=source_id, 4=record, 5=v
-    ///   ContributionRecordV1:    1=schema_version, 2=title_id, 3=thumbnail_url, 4=status,
-    ///                            5=seen_in_popular, 6=seen_in_latest, 7=last_chapter(double), 8=last_update_utc
+    ///                            8=latest_ids (repeated string)
+    ///   ContributionSeriesEntity:1=id, 2=mapping_id, 3=source_id, 4=record, 5=v,
+    ///                            6=verified_date_utc (optional),
+    ///                            7=metadata (derived bool: has a live Metadata row)
+    ///   ContributionRecordV2:    1=schema_version, 2=title_id, 3=thumbnail_url, 4=status,
+    ///                            5=seen_in_popular, 6=seen_in_latest, 7=last_chapter(double), 8=last_update_utc,
+    ///                            9=url, 10=memo, 11=seen_in_popular/is_latest are retained as-is.
+    ///                            (v1 payloads carry schema_version=1 and no url — they decode to a
+    ///                             legacy-shaped V2 that the context tombstones.)
     ///   ContributionMetadataEntity:1=id, 2=mapping_id, 3=provider_id, 4=provider_key,
     ///                            5=mapping_status, 6=linked_date, 7=v
     /// </summary>
@@ -39,6 +45,7 @@ namespace RensaioBackend.Services.Contributions.Snapshot
                     case 6: snapshot.Sources.Add(DecodeSource(reader.ReadBytes())); break;
                     case 7: snapshot.Series.Add(DecodeSeries(reader.ReadBytes())); break;
                     case 8: snapshot.Metadata.Add(DecodeMetadata(reader.ReadBytes())); break;
+                    case 9: snapshot.SourceSeries.Add(DecodeSourceSeries(reader.ReadBytes())); break;
                     default: reader.Skip(wire); break;
                 }
             }
@@ -62,15 +69,15 @@ namespace RensaioBackend.Services.Contributions.Snapshot
             return title;
         }
 
-        private static MappingTitleEntity DecodeMappingTitle(ReadOnlySpan<byte> data)
+        private static SeriesTitleEntity DecodeMappingTitle(ReadOnlySpan<byte> data)
         {
-            var mt = new MappingTitleEntity();
+            var mt = new SeriesTitleEntity();
             var r = new ProtoReader(data);
             while (r.NextField(out int f, out WireType w))
             {
                 switch (f)
                 {
-                    case 1: mt.MappingId = Guid.Parse(r.ReadString()); break;
+                    case 1: mt.SeriesId = Guid.Parse(r.ReadString()); break;
                     case 2: mt.TitleId = Guid.Parse(r.ReadString()); break;
                     case 3: mt.Version = (int)r.ReadVarint(); break;
                     default: r.Skip(w); break;
@@ -85,11 +92,13 @@ namespace RensaioBackend.Services.Contributions.Snapshot
             // collect into locals first, then construct via object initializer.
             var id = Guid.Empty;
             var package = string.Empty;
+            var packageId = Guid.Empty;
             long sourceId = 0;
             var sourceName = string.Empty;
             var sourceLanguage = string.Empty;
             DateTime? lastBatch = null;
             int version = 0;
+            var latestIds = new List<string>();
 
             var r = new ProtoReader(data);
             while (r.NextField(out int f, out WireType w))
@@ -103,6 +112,8 @@ namespace RensaioBackend.Services.Contributions.Snapshot
                     case 5: sourceLanguage = r.ReadString(); break;
                     case 6: lastBatch = ParseDate(r.ReadString()); break;
                     case 7: version = (int)r.ReadVarint(); break;
+                    case 8: latestIds.Add(r.ReadString()); break;
+                    case 9: packageId = Guid.Parse(r.ReadString()); break;
                     default: r.Skip(w); break;
                 }
             }
@@ -111,25 +122,44 @@ namespace RensaioBackend.Services.Contributions.Snapshot
             {
                 Id = id,
                 Package = package,
+                PackageId = packageId != Guid.Empty ? packageId : ContributionSourceEntity.DerivePackageId(package),
                 SourceId = sourceId,
                 SourceName = sourceName,
                 SourceLanguage = sourceLanguage,
                 LastBatchExecutionUTC = lastBatch,
+                LatestIds = latestIds,
                 Version = version
             };
+        }
+
+        private static ContributionSourceSeriesEntity DecodeSourceSeries(ReadOnlySpan<byte> data)
+        {
+            var ss = new ContributionSourceSeriesEntity();
+            var r = new ProtoReader(data);
+            while (r.NextField(out int f, out WireType w))
+            {
+                switch (f)
+                {
+                    case 1: ss.SourceId = Guid.Parse(r.ReadString()); break;
+                    case 2: ss.SeriesEntityId = Guid.Parse(r.ReadString()); break;
+                    case 3: ss.Version = (int)r.ReadVarint(); break;
+                    default: r.Skip(w); break;
+                }
+            }
+            return ss;
         }
 
         private static ContributionSeriesEntity DecodeSeries(ReadOnlySpan<byte> data)
         {
             var series = new ContributionSeriesEntity();
             var r = new ProtoReader(data);
-            var record = new ContributionRecordV1();
+            var record = new ContributionRecordV2();
             while (r.NextField(out int f, out WireType w))
             {
                 switch (f)
                 {
                     case 1: series.Id = Guid.Parse(r.ReadString()); break;
-                    case 2: series.MappingId = Guid.Parse(r.ReadString()); break;
+                    case 2: series.SeriesId = Guid.Parse(r.ReadString()); break;
                     case 3: series.SourceId = Guid.Parse(r.ReadString()); break;
                     case 4:
                         var rec = new ProtoReader(r.ReadBytes());
@@ -145,12 +175,17 @@ namespace RensaioBackend.Services.Contributions.Snapshot
                                 case 6: record.SeenInLatest = rec.ReadVarint() != 0; break;
                                 case 7: record.LastChapter = (decimal)rec.ReadFixed64Double(); break;
                                 case 8: record.LastUpdateUTC = ParseDate(rec.ReadString()); break;
+                                case 9: record.Url = rec.ReadString(); break;
+                                case 10: record.Memo = rec.ReadString(); break;
                                 default: rec.Skip(rw); break;
                             }
                         }
                         series.Data = record;
                         break;
                     case 5: series.Version = (int)r.ReadVarint(); break;
+                    case 6: series.VerifiedDateUTC = ParseDate(r.ReadString()); break;
+                    case 7: series.Metadata = r.ReadVarint() != 0; break;
+                    case 8: series.PackageId = Guid.Parse(r.ReadString()); break;
                     default: r.Skip(w); break;
                 }
             }
@@ -166,7 +201,7 @@ namespace RensaioBackend.Services.Contributions.Snapshot
                 switch (f)
                 {
                     case 1: md.Id = Guid.Parse(r.ReadString()); break;
-                    case 2: md.MappingId = Guid.Parse(r.ReadString()); break;
+                    case 2: md.SeriesId = Guid.Parse(r.ReadString()); break;
                     case 3: md.ProviderId = (int)r.ReadVarint(); break;
                     case 4: md.ProviderKey = r.ReadString(); break;
                     case 5: md.MappingStatus = (RensaioBackend.Models.Database.SeriesMappingStatus)(int)r.ReadVarint(); break;

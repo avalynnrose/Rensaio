@@ -10,9 +10,6 @@ import com.typesafe.config.ConfigRenderOptions
 import com.typesafe.config.ConfigValue
 import com.typesafe.config.parser.ConfigDocument
 import java.util.Locale
-import org.cef.network.CefCookieManager
-import org.cef.network.CefCookie
-import java.util.Date
 import android.os.Looper
 import eu.kanade.tachiyomi.App
 import eu.kanade.tachiyomi.createAppModule
@@ -23,10 +20,10 @@ import okhttp3.Cookie
 import org.koin.dsl.module
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import extension.bridge.browser.BrowserHostGateway
 import xyz.nulldev.androidcompat.AndroidCompat
 import xyz.nulldev.androidcompat.AndroidCompatInitializer
 import xyz.nulldev.androidcompat.androidCompatModule
-import xyz.nulldev.androidcompat.webkit.KcefWebViewProvider
 import xyz.nulldev.ts.config.ApplicationRootDir
 import xyz.nulldev.ts.config.BASE_LOGGER_NAME
 import xyz.nulldev.ts.config.GlobalConfigManager
@@ -93,8 +90,6 @@ import extension.bridge.logging.AndroidCompatLogger
 import extension.bridge.logging.androidCompatLogger
 import extension.bridge.network.SystemProxyBridge
 import extension.bridge.security.TrustManagerBridge
-import extension.bridge.cef.CefAppBridge
-import extension.bridge.cef.CefMessageLoopBridge
 import android.webkit.CookieManager
 import java.net.URL
 import java.net.URLClassLoader
@@ -259,52 +254,17 @@ private fun installJulBridge() {
     root.addHandler(handler)
 }
 
-/**
- * Pre-warms the AWT/Swing event infrastructure so its threads are created once during startup,
- * while the process still has ample thread capacity.
- *
- * JCEF's OSR rendering path posts events via `SwingUtilities.invokeLater`; AWT lazily starts the
- * event-dispatch thread, the Swing `TimerQueue` thread, and the `AWTAutoShutdown` blocker thread
- * on the *first* post. If that first post happens late in the app's life (e.g. while CEF native
- * workers, IKVM-attached threads and search/download task workers have consumed the process thread
- * budget), `java.lang.Thread.start` can fail with `OutOfMemoryError: unable to create native thread`.
- * Warming these threads up early avoids that failure mode entirely.
- */
-private fun prewarmAwtEventThreads(logger: AndroidCompatLogger) {
-    try {
-        val fired = java.util.concurrent.CountDownLatch(1)
-        // Scheduling a Swing Timer starts the TimerQueue thread; when it fires it posts to the
-        // EventQueue via SwingUtilities.invokeLater, which starts the AWT event-dispatch thread
-        // and the AWTAutoShutdown blocker thread. All three threads are then created at startup.
-        val timer = javax.swing.Timer(50) { fired.countDown() }
-        timer.isRepeats = false
-        timer.start()
-        if (fired.await(5, java.util.concurrent.TimeUnit.SECONDS)) {
-            logger.debug { "Pre-warmed AWT/Swing event infrastructure" }
-        } else {
-            logger.debug { "AWT pre-warm timed out; continuing" }
-        }
-    } catch (t: Throwable) {
-        // Best-effort only: a restricted/headless toolkit may not support AWT; JCEF will still
-        // attempt its own event posting later and any failure there is logged separately.
-        logger.debug { "AWT pre-warm skipped: $t" }
-    }
-}
+// NOTE: prewarmAwtEventThreads was removed with JCEF. It existed solely to pre-create the AWT/Swing
+// event threads that JCEF's OSR path posted to. The .NET-hosted browser has no AWT involvement, so
+// there is nothing to warm — and starting AWT machinery here was actively harmful (it forced
+// Toolkit.getDefaultToolkit() and produced the HeadlessToolkit/Class.forName failures).
 
-fun applicationSetup(dataRoot: String, tempRoot: String, sink: AndroidCompatLogSink, externalCef: Boolean)
+fun applicationSetup(dataRoot: String, tempRoot: String, sink: AndroidCompatLogSink)
 {
     val logger = androidCompatLogger(SettingsConfig::class.java)
     // Register sink via manager
     AndroidCompatRuntime.registerSink(sink)
     installJulBridge()
-    // Desktop builds (external pump mode / CEF in use) exercise the AWT/Swing OSR path; pre-warm
-    // its event threads now. Headless server builds (externalCef == false) skip this to avoid
-    // starting AWT machinery that is never used. Also skipped when the embedded browser is
-    // disabled via cefEnabled (boot-time master switch) — no CEF means no OSR/EDT churn.
-    val cefEnabled = runCatching { Settings.cefEnabled }.getOrDefault(true)
-    if (externalCef && cefEnabled) {
-        prewarmAwtEventThreads(logger)
-    }
     AndroidCompatRuntime.setDefaultUncaughtHandler(Thread.UncaughtExceptionHandler { _, throwable ->
         logger.error(throwable) { "unhandled exception" }
     })
@@ -332,9 +292,17 @@ fun applicationSetup(dataRoot: String, tempRoot: String, sink: AndroidCompatLogS
 
     onSettingsMutated { settings ->
         logger.info {
-            "Socks Proxy changed - enabled=${settings.socksProxyEnabled} address=${settings.socksProxyHost}:${settings.socksProxyPort} , username=[REDACTED], password=[REDACTED]"
+            "Proxy changed - enabled=${settings.socksProxyEnabled} scheme=${settings.proxyScheme} " +
+                "address=${settings.socksProxyHost}:${settings.socksProxyPort} , username=[REDACTED], password=[REDACTED]"
         }
+        SystemProxyBridge.apply(settings.toProxySettings())
     }
+
+    // ORDER MATTERS: install the SubjectKeyIdentifier-tolerant platform trust manager FIRST.
+    // SystemProxyBridge.apply() composes the proxy CA on top of the platform manager; doing this
+    // afterwards would leave the proxy composition reading a stale platform source.
+    TrustManagerBridge.ensureSubjectKeyIdentifierTolerance()
+
     SystemProxyBridge.apply(Settings.toProxySettings())
 
     logger.debug {
@@ -359,42 +327,11 @@ fun applicationSetup(dataRoot: String, tempRoot: String, sink: AndroidCompatLogS
             createAppModule(app),
             androidCompatModule(),
             configManagerModule(),
-            module {
-                single<KcefWebViewProvider.InitBrowserHandler> {
-                    object : KcefWebViewProvider.InitBrowserHandler {
-                        override fun init(provider: KcefWebViewProvider) {
-                            val networkHelper = Injekt.get<NetworkHelper>()
-                            val logger = androidCompatLogger(KcefWebViewProvider::class.java)
-                            logger.debug { "Start loading cookies" }
-                            // getGlobalManager() returns null until CEF's native initialization
-                            // completes; a null receiver here used to NPE on every setCookie call.
-                            val manager: CefCookieManager? = CefCookieManager.getGlobalManager()
-                            if (manager == null) {
-                                logger.warn { "CEF global cookie manager unavailable (CEF not initialized); skipping stored-cookie preload" }
-                                return
-                            }
-                            manager.apply {
-                                val cookies = networkHelper.cookieStore.getStoredCookies()
-                                for (cookie in cookies) {
-                                    try {
-                                        if (!setCookie(
-                                                "https://" + cookie.domain,
-                                                cookie.toCefCookie(),
-                                            )
-                                        ) {
-                                            throw Exception()
-                                        }
-                                    } catch (e: Exception) {
-                                        logger.warn(e) { "Loading cookie ${cookie.name} failed" }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
         )
     }
+    // NOTE: the CEF cookie-seeding InitBrowserHandler was removed with JCEF. Cookie seeding into
+    // the browser now happens in-process: CookieManagerImpl.setCookie writes through to the .NET
+    // host, and WebViewFetchInterceptor seeds the session from the JVM cookie store per fetch.
 
 
     
@@ -414,37 +351,39 @@ fun applicationSetup(dataRoot: String, tempRoot: String, sink: AndroidCompatLogS
     
     val non = CookieManager.getInstance()
 
-    TrustManagerBridge.ensureSubjectKeyIdentifierTolerance()
-    
-    // When running as a desktop application (RensaioTray/Avalonia), the CEF
-    // message pump is driven from an external DispatcherTimer on the C# side
-    // instead of an internal Java daemon thread. This avoids reverse-JNI calls
-    // from CEF native threads into IKVM that can cause GetEnv() fail-fast
-    // crashes ~1 minute after WebView use.
-    CefAppBridge.setExternalPump(externalCef)
+    // NOTE: the CEF external message pump (CefAppBridge.setExternalPump + CefPumpBridge +
+    // CefTimer/RpcCefTimer, driven from the Avalonia DispatcherTimer) was removed with JCEF.
+    // It existed only to avoid reverse-JNI calls from CEF native threads into IKVM; the
+    // .NET-hosted browser has no such threads, so the workaround is obsolete.
 
     // Boot-time master switch: when cefEnabled is false, JCEF is never initialized
     // (no ~512 MiB baseline, no native threads, no CPU overhead). WebView-requiring
     // sources degrade to the direct network chain / FlareSolverr exactly as they do
     // when JCEF init fails headlessly. Takes effect on restart.
-    if (!cefEnabled) {
-        logger.warn { "CEF is disabled via settings — embedded browser (JCEF) will not be initialized; WebView-based sources will fall back to direct network/FlareSolverr" }
+    //
+    // Skipped entirely when the .NET browser host is the selected backend: JCEF is then
+    // unused, and initializing it here both wastes ~512 MiB and produces the AWT
+    // Toolkit/Class.forName failure below (the host is installed right after
+    // applicationSetup returns, because the C# service cannot warm up before
+    // applicationSetup has registered the config modules).
+    // Only skip when the host is ALREADY installed. Keying off the setting alone would be unsafe:
+    // a WebView created before the host is installed (the provider factory is consulted per
+    // WebView) would be left with an inert provider instead of a working JCEF fallback.
+    val hostedBrowserInstalled = Settings.browserEnabled &&
+        (Settings.browserProvider.lowercase() in setOf("browserhost", "patchright", "playwright")) &&
+        BrowserHostGateway.isAvailable()
+
+    if (!hostedBrowserInstalled) {
+        // JCEF has been removed; there is no JVM-side browser to initialise. Without the host,
+        // WebView-requiring sources degrade to the direct network chain / FlareSolverr.
+        logger.warn {
+            "The .NET browser host is not installed (browserEnabled=${Settings.browserEnabled}, " +
+                "provider='${Settings.browserProvider}'); WebView sources will degrade to the direct network chain"
+        }
     } else {
-        // Synchronous JCEF initialization — must complete before any extension
-        // tries to create a WebView.  The Comix (and similar) extension calls
-        // runInWebView which creates a WebView on the main looper thread, which
-        // in turn calls CefAppBridge.getOrCreate().  If sharedApp is still null
-        // (because the old async init hadn't finished yet), the main looper blocks
-        // on the CefAppBuilder.build() lock, causing a 90+ second timeout and
-        // "Failed to start WebView" errors.
-        logger.info { "Initializing JCEF runtime — this may take a while" }
-        runCatching { KcefWebViewProvider.ensureRuntimeReady() }
-            .onSuccess {
-                logger.info { "JCEF runtime initialized" }
-            }
-            .onFailure { throwable ->
-                logger.warn(throwable) { "Unable to warm up KCEF runtime" }
-            }
+        logger.info {
+            "Browser backend: .NET host ('${Settings.browserProvider}') — JCEF is not used"
+        }
     }
 
     // AES/CBC/PKCS7Padding Cypher provider for zh.copymanga
@@ -454,7 +393,6 @@ fun applicationSetup(dataRoot: String, tempRoot: String, sink: AndroidCompatLogS
 fun applicationShutdown(logger: AndroidCompatLogger) {
     // Stop Android main looper to prevent pending callbacks
     AndroidCompatRuntime.stopMainLooper(timeoutMillis = 5000L)
-    CefMessageLoopBridge.stop()
     // Close every extension classloader so jars are unlocked/releasable at exit.
     unloadAllExtensions()
     // Unregister sinks and handlers
@@ -463,25 +401,8 @@ fun applicationShutdown(logger: AndroidCompatLogger) {
     logger.info { "Android compatibility runtime shut down." }
 }
 
-fun Cookie.toCefCookie(): CefCookie {
-    val cookie = this
-    return CefCookie(
-        cookie.name,
-        cookie.value,
-        if (cookie.hostOnly) {
-            cookie.domain
-        } else {
-            "." + cookie.domain
-        },
-        cookie.path,
-        cookie.secure,
-        cookie.httpOnly,
-        Date(),
-        null,
-        cookie.expiresAt < 253402300799999L, // okhttp3.internal.http.MAX_DATE
-        Date(cookie.expiresAt),
-    )
-}
+// NOTE: Cookie.toCefCookie() was removed with JCEF. The JVM cookie store is the source of truth
+// and is synced into the .NET browser session via the browser gateway instead.
 
 internal fun installSafeReflectionFactory() {
     runCatching {

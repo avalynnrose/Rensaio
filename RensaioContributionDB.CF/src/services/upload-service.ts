@@ -27,7 +27,7 @@
  *   (migration 0005). `id` is a cloud-internal identifier: on conflict it is
  *   KEPT (not in the SET clause) and the row is updated in place. mapping_status
  *   merges by priority — UserConfirmed > Blocked > AutoMatched > ForeverIgnored >
- *   TemporaryIgnored > Unmatched — so a manual decision can never be clobbered by
+ *   ManualIgnore > Unmatched — so a manual decision can never be clobbered by
  *   a weaker automated one; linked_date / contributor_id are last-writer-wins.
  *
  * Mappings referenced by `m`/`i`/`d` rows are created on demand from the
@@ -41,6 +41,7 @@ import type {
   ContributionSeriesEntityPayload,
   ContributionSourceEntityPayload,
   MappingTitleEntityPayload,
+  SourceSeriesEntityPayload,
   TitleEntityPayload,
 } from '../models/requests';
 import type { UploadError, UploadResponse } from '../models/responses';
@@ -55,6 +56,7 @@ import { markPendingChanges } from './replication-service';
 const TITLES = 't';
 const MAPPING_TITLES = 'm';
 const SOURCES = 's';
+const SOURCE_SERIES = 'x';
 const SERIES = 'i';
 const METADATA = 'd';
 
@@ -92,6 +94,7 @@ export async function processUpload(
     t?: TitleEntityPayload[];
     m?: MappingTitleEntityPayload[];
     s?: ContributionSourceEntityPayload[];
+    x?: SourceSeriesEntityPayload[];
     i?: ContributionSeriesEntityPayload[];
     d?: ContributionMetadataEntityPayload[];
   }
@@ -176,6 +179,20 @@ export async function processUpload(
         }
       } catch (err) {
         errors.push({ list: SOURCES, index: i, message: errMessage(err) });
+      }
+    }
+  }
+
+  // ── 3b. Source ↔ series associations ──
+  if (body.x) {
+    for (let i = 0; i < body.x.length; i += 1) {
+      const row = body.x[i];
+      try {
+        for (const stmt of buildSourceSeriesStatements(db, row, contributorId, replicationVersion, now)) {
+          refs.push({ list: SOURCE_SERIES, index: i, stmt });
+        }
+      } catch (err) {
+        errors.push({ list: SOURCE_SERIES, index: i, message: errMessage(err) });
       }
     }
   }
@@ -479,15 +496,17 @@ function buildSourceStatements(
     db
       .prepare(
         `INSERT INTO sources (
-            id, package, source_id, source_name, source_language,
-            last_batch_utc, contributor_id, replication_version, archived_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            id, package, package_id, source_id, source_name, source_language,
+            last_batch_utc, latest_ids, contributor_id, replication_version, archived_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
          ON CONFLICT(id) DO UPDATE SET
            package = excluded.package,
+           package_id = COALESCE(excluded.package_id, package_id),
            source_id = excluded.source_id,
            source_name = excluded.source_name,
            source_language = excluded.source_language,
            last_batch_utc = excluded.last_batch_utc,
+           latest_ids = excluded.latest_ids,
            contributor_id = excluded.contributor_id,
            replication_version = excluded.replication_version,
            archived_at = NULL`
@@ -495,13 +514,49 @@ function buildSourceStatements(
       .bind(
         row.i,
         row.p,
+        row.pi ?? null,
         row.s,
         row.n ?? '',
         row.l ?? '',
         row.b ?? null,
+        row.li ? JSON.stringify(row.li) : null,
         contributorId,
         replicationVersion
       ),
+  ];
+}
+
+// ── Source ↔ series associations (many-to-many) ──────────────────────────────
+
+function buildSourceSeriesStatements(
+  db: D1Database,
+  row: SourceSeriesEntityPayload,
+  _contributorId: string,
+  replicationVersion: number,
+  now: string
+): D1PreparedStatement[] {
+  validateRow(row, ['s', 'e', 'v']);
+  if (row.v === REPLICATION_DELETE) {
+    return [
+      db
+        .prepare(
+          'UPDATE source_series SET replication_version = ?, archived_at = ? WHERE source_id = ? AND series_entity_id = ?'
+        )
+        .bind(row.v, now, row.s, row.e),
+    ];
+  }
+  // Upsert by composite key; ON CONFLICT resurrects an archived row. `contributor_id` is not a
+  // column on source_series (the association is derived from sources/series membership).
+  return [
+    db
+      .prepare(
+        `INSERT INTO source_series (source_id, series_entity_id, replication_version, archived_at)
+         VALUES (?, ?, ?, NULL)
+         ON CONFLICT(source_id, series_entity_id) DO UPDATE SET
+           replication_version = excluded.replication_version,
+           archived_at = NULL`
+      )
+      .bind(row.s, row.e, replicationVersion),
   ];
 }
 
@@ -536,21 +591,47 @@ function buildSeriesStatements(
     db
       .prepare(
         `INSERT INTO series
-           (id, mapping_id, source_id, title_id, thumbnail_url, status,
-            seen_in_popular, seen_in_latest, last_chapter, last_update_utc,
-            contributor_id, replication_version, archived_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+           (id, mapping_id, source_id, package_id, title_id, url, thumbnail_url, status, memo,
+            seen_in_popular, seen_in_latest, last_chapter, last_update_utc, verified_date_utc,
+            metadata_flag, contributor_id, replication_version, archived_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
          ON CONFLICT(id) DO UPDATE SET
            mapping_id = excluded.mapping_id,
            source_id = excluded.source_id,
+           package_id = COALESCE(excluded.package_id, package_id),
            title_id = excluded.title_id,
+           url = excluded.url,
            thumbnail_url = excluded.thumbnail_url,
            status = excluded.status,
+           memo = excluded.memo,
            seen_in_popular = excluded.seen_in_popular,
            seen_in_latest = excluded.seen_in_latest,
            last_chapter = excluded.last_chapter,
            last_update_utc = excluded.last_update_utc,
-           contributor_id = excluded.contributor_id,
+           -- Sticky verified_date_utc: a non-null incoming value ALWAYS wins (Verify propagates).
+           -- A null incoming value clears the stored date ONLY when the record data actually
+           -- changed (a real update → the series is no longer the verified snapshot); an
+           -- unchanged row keeps its stored date, so a plain sweep can never un-verify a
+           -- verified series, and a LOCAL-only clear (Un-Verify / Join / Split) never reaches
+           -- the worker at all.
+           verified_date_utc = CASE
+             WHEN excluded.verified_date_utc IS NOT NULL THEN excluded.verified_date_utc
+             WHEN title_id IS NOT excluded.title_id
+               OR url IS NOT excluded.url
+               OR thumbnail_url IS NOT excluded.thumbnail_url
+               OR status IS NOT excluded.status
+               OR memo IS NOT excluded.memo
+               OR seen_in_popular IS NOT excluded.seen_in_popular
+               OR seen_in_latest IS NOT excluded.seen_in_latest
+               OR last_chapter IS NOT excluded.last_chapter
+               OR last_update_utc IS NOT excluded.last_update_utc
+               THEN excluded.verified_date_utc
+               ELSE verified_date_utc
+             END,
+             -- Derived "a live metadata row exists" flag; last-writer-wins (never hand-edited, so
+             -- the uploader's value is the freshest derived state).
+             metadata_flag = excluded.metadata_flag,
+             contributor_id = excluded.contributor_id,
            replication_version = excluded.replication_version,
            archived_at = NULL`
       )
@@ -558,13 +639,18 @@ function buildSeriesStatements(
         row.i,
         mappingId,
         row.s,
+        row.pi ?? null,
         rec.i,
+        rec.r ?? '',
         rec.t ?? null,
         rec.s ?? 0,
+        rec.m ?? null,
         rec.p ? 1 : 0,
         rec.e ? 1 : 0,
         rec.l ?? null,
         rec.u ?? null,
+        row.z ?? null,
+        row.q ? 1 : 0,
         contributorId,
         replicationVersion
       ),
@@ -587,7 +673,7 @@ const METADATA_INSERT = `INSERT INTO metadata
      WHEN mapping_status = 5 OR excluded.mapping_status = 5 THEN 5  -- Blocked
      WHEN mapping_status = 1 OR excluded.mapping_status = 1 THEN 1  -- AutoMatched
      WHEN mapping_status = 4 OR excluded.mapping_status = 4 THEN 4  -- ForeverIgnored
-     WHEN mapping_status = 3 OR excluded.mapping_status = 3 THEN 3  -- TemporaryIgnored
+     WHEN mapping_status = 3 OR excluded.mapping_status = 3 THEN 3  -- ManualIgnore
      ELSE 0                                                         -- Unmatched
    END,
    linked_date = excluded.linked_date,

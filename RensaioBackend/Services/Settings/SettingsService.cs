@@ -236,6 +236,58 @@ namespace RensaioBackend.Services.Settings
             }
         }
 
+        /// <summary>
+        /// Pushes the CURRENT settings' bridge-global preferences (FlareSolverr, SocksProxy,
+        /// Browser) into the RPC host. The backend is the source of truth for these settings, so
+        /// this must run once at startup (and on every save) — the RPC host otherwise only loads
+        /// whatever <c>preferences.json</c> it finds, which is why a configured FlareSolverr/trawl
+        /// endpoint could sit unused (Cloudflare challenges unsolvable) without any log.
+        /// </summary>
+        public async Task PushBridgePreferencesAsync(CancellationToken token = default)
+        {
+            SettingsDto settings = await GetSettingsAsync(token).ConfigureAwait(false);
+            await PushBridgePreferencesAsync(settings, token).ConfigureAwait(false);
+        }
+
+        private async Task PushBridgePreferencesAsync(SettingsDto settings, CancellationToken token)
+        {
+            using var scope = _prov.CreateScope();
+            var mihonBridge = scope.ServiceProvider.GetRequiredService<MihonBridgeService>();
+            await mihonBridge.SetPreferencesAsync(new Preferences
+            {
+                FlareSolverr = new FlareSolverrPreferences
+                {
+                    Enabled = settings.FlareSolverrEnabled,
+                    Url = settings.FlareSolverrUrl,
+                    Timeout = (int)settings.FlareSolverrTimeout.TotalSeconds,
+                    SessionTtl = (int)settings.FlareSolverrSessionTtl.TotalSeconds,
+                    AsResponseFallback = settings.FlareSolverrAsResponseFallback
+                },
+                SocksProxy = new SocksProxyPreferences
+                {
+                    Enabled = settings.SocksProxyEnabled,
+                    Host = settings.SocksProxyHost,
+                    Port = settings.SocksProxyPort,
+                    Version = settings.SocksProxyVersion,
+                    Username = settings.SocksProxyUsername,
+                    Password = settings.SocksProxyPassword,
+                    Scheme = string.IsNullOrWhiteSpace(settings.ProxyScheme) ? "socks5" : settings.ProxyScheme,
+                    CaCertPath = settings.CaCertPath,
+                    IgnoreTlsErrors = settings.IgnoreTlsErrors
+                },
+                Browser = new BrowserAutomationPreferences
+                {
+                    Enabled = settings.BrowserEnabled,
+                    Provider = string.IsNullOrWhiteSpace(settings.BrowserProvider)
+                        ? "patchright"
+                        : settings.BrowserProvider,
+                    MaxConcurrency = settings.BrowserMaxConcurrentPages,
+                    IdleTimeoutMs = settings.BrowserIdleTimeoutMs,
+                    PoolEnabled = settings.BrowserPoolEnabled,
+                }
+            }, token).ConfigureAwait(false);
+        }
+
         public async Task SaveSettingsAsync(EditableSettingsDto set, bool force = false, CancellationToken token = default, bool clearOidcClientSecret = false)
         {
             await PreserveStoredOidcValuesAsync(set, clearOidcClientSecret, token).ConfigureAwait(false);
@@ -300,16 +352,20 @@ namespace RensaioBackend.Services.Settings
                         Port = set.SocksProxyPort,
                         Version = set.SocksProxyVersion,
                         Username = set.SocksProxyUsername,
-                        Password = set.SocksProxyPassword
+                        Password = set.SocksProxyPassword,
+                        Scheme = string.IsNullOrWhiteSpace(set.ProxyScheme) ? "socks5" : set.ProxyScheme,
+                        CaCertPath = set.CaCertPath,
+                        IgnoreTlsErrors = set.IgnoreTlsErrors
                     },
-                    Cef = new CefPreferences
+                    Browser = new BrowserAutomationPreferences
                     {
-                        MaxRenderers = set.CefMaxRenderers,
-                        IdleTimeoutMs = set.CefIdleTimeoutMs,
-                        WebViewPoolEnabled = set.CefWebViewPoolEnabled,
-                        Enabled = set.CefEnabled,
-                        PumpActiveIntervalMs = set.CefPumpActiveIntervalMs,
-                        PumpIdleIntervalMs = set.CefPumpIdleIntervalMs
+                        Enabled = set.BrowserEnabled,
+                        Provider = string.IsNullOrWhiteSpace(set.BrowserProvider)
+                            ? "patchright"
+                            : set.BrowserProvider,
+                        MaxConcurrency = set.BrowserMaxConcurrentPages,
+                        IdleTimeoutMs = set.BrowserIdleTimeoutMs,
+                        PoolEnabled = set.BrowserPoolEnabled,
                     }
                 }, token).ConfigureAwait(false);
             }
@@ -357,12 +413,6 @@ namespace RensaioBackend.Services.Settings
                 FlareSolverrTimeout = settings.FlareSolverrTimeout,
                 FlareSolverrSessionTtl = settings.FlareSolverrSessionTtl,
                 FlareSolverrAsResponseFallback = settings.FlareSolverrAsResponseFallback,
-                CefMaxRenderers = settings.CefMaxRenderers,
-                CefIdleTimeoutMs = settings.CefIdleTimeoutMs,
-                CefWebViewPoolEnabled = settings.CefWebViewPoolEnabled,
-                CefEnabled = settings.CefEnabled,
-                CefPumpActiveIntervalMs = settings.CefPumpActiveIntervalMs,
-                CefPumpIdleIntervalMs = settings.CefPumpIdleIntervalMs,
                 IsWizardSetupComplete = settings.IsWizardSetupComplete,
                 WizardSetupStepCompleted = settings.WizardSetupStepCompleted,
                 SocksProxyEnabled = settings.SocksProxyEnabled,
@@ -371,6 +421,9 @@ namespace RensaioBackend.Services.Settings
                 SocksProxyVersion = settings.SocksProxyVersion,
                 SocksProxyUsername = settings.SocksProxyUsername,
                 SocksProxyPassword = settings.SocksProxyPassword,
+                ProxyScheme = settings.ProxyScheme,
+                CaCertPath = settings.CaCertPath,
+                IgnoreTlsErrors = settings.IgnoreTlsErrors,
                 NsfwVisibility = settings.NsfwVisibility,
                 ReleaseCadenceMultiplierYellow = settings.ReleaseCadenceMultiplierYellow,
                 ReleaseCadenceMultiplierRed = settings.ReleaseCadenceMultiplierRed,
@@ -519,6 +572,23 @@ namespace RensaioBackend.Services.Settings
         }
 
         /// <summary>
+        /// Removes a single key-value setting. No-op when the key is absent.
+        /// Used to invalidate derived caches (e.g. the last-imported metadata.bin hash)
+        /// when the underlying state they describe (the Contribution DB) is gone.
+        /// </summary>
+        public async Task DeleteSettingAsync(string name, CancellationToken token = default)
+        {
+            var setting = await _db.Settings
+                .FirstOrDefaultAsync(s => s.Name == name, token)
+                .ConfigureAwait(false);
+            if (setting == null)
+                return;
+
+            _db.Settings.Remove(setting);
+            await _db.SaveChangesAsync(token).ConfigureAwait(false);
+        }
+
+        /// <summary>
         /// Settings as they may be shown to clients: a copy of the effective settings with
         /// the OIDC client secret blanked. Every read path that leaves the process
         /// (REST GET, MCP get_settings) goes through here.
@@ -553,12 +623,6 @@ namespace RensaioBackend.Services.Settings
                 FlareSolverrTimeout = ed.FlareSolverrTimeout,
                 FlareSolverrSessionTtl = ed.FlareSolverrSessionTtl,
                 FlareSolverrAsResponseFallback = ed.FlareSolverrAsResponseFallback,
-                CefMaxRenderers = ed.CefMaxRenderers,
-                CefIdleTimeoutMs = ed.CefIdleTimeoutMs,
-                CefWebViewPoolEnabled = ed.CefWebViewPoolEnabled,
-                CefEnabled = ed.CefEnabled,
-                CefPumpActiveIntervalMs = ed.CefPumpActiveIntervalMs,
-                CefPumpIdleIntervalMs = ed.CefPumpIdleIntervalMs,
                 IsWizardSetupComplete = ed.IsWizardSetupComplete,
                 WizardSetupStepCompleted = ed.WizardSetupStepCompleted,
                 SocksProxyEnabled = ed.SocksProxyEnabled,
@@ -567,6 +631,9 @@ namespace RensaioBackend.Services.Settings
                 SocksProxyVersion = ed.SocksProxyVersion,
                 SocksProxyUsername = ed.SocksProxyUsername,
                 SocksProxyPassword = ed.SocksProxyPassword,
+                ProxyScheme = ed.ProxyScheme,
+                CaCertPath = ed.CaCertPath,
+                IgnoreTlsErrors = ed.IgnoreTlsErrors,
                 NsfwVisibility = ed.NsfwVisibility,
                 ReleaseCadenceMultiplierYellow = ed.ReleaseCadenceMultiplierYellow,
                 ReleaseCadenceMultiplierRed = ed.ReleaseCadenceMultiplierRed,

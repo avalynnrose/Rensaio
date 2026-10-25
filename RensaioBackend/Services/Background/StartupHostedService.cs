@@ -1,4 +1,4 @@
-﻿using RensaioBackend.Data;
+using RensaioBackend.Data;
 using RensaioBackend.Extensions;
 using RensaioBackend.Migration;
 using RensaioBackend.Models.Database;
@@ -10,6 +10,7 @@ using RensaioBackend.Services.Helpers;
 using RensaioBackend.Services.Jobs;
 using RensaioBackend.Services.Providers;
 using RensaioBackend.Services.ReadState;
+using RensaioBackend.Services.Contributions;
 using RensaioBackend.Services.Settings;
 using RensaioBackend.Utils;
 using Microsoft.EntityFrameworkCore;
@@ -95,7 +96,8 @@ namespace RensaioBackend.Services.Background
         /// On an existing database, <c>MigrateAsync</c> applies any pending migrations.
         /// WAL journal mode is enabled in both cases.
         /// </summary>
-        private static async Task EnsureContributionDbAsync(IConfiguration configuration, CancellationToken cancellationToken)
+        private static async Task EnsureContributionDbAsync(
+            IConfiguration configuration, ILogger logger, CancellationToken cancellationToken)
         {
             var dbPath = EnvironmentSetup.ContributorDatabasePath(configuration);
 
@@ -121,8 +123,47 @@ namespace RensaioBackend.Services.Background
             {
                 await db.Database.MigrateAsync(cancellationToken).ConfigureAwait(false);
             }
-        }
 
+            // Repair databases that already ran AddMetadataProviderTitleIds BEFORE the migration
+            // backfilled the column: ADD COLUMN left every existing row NULL, and because the model
+            // maps ProviderTitleIds as a non-nullable JSON list, materializing NULL throws
+            // ("The data is NULL at ordinal 0"). This idempotent normalization removes any residual
+            // NULLs so every read succeeds; the next scan / propagation / confirm repopulates them.
+            await db.Database.ExecuteSqlRawAsync(
+                "UPDATE \"Metadata\" SET \"provider_title_ids\" = '[]' WHERE \"provider_title_ids\" IS NULL;",
+                cancellationToken).ConfigureAwait(false);
+
+            // Same NULL-normalization for the new Sources.LatestIds JSON column.
+            await db.Database.ExecuteSqlRawAsync(
+                "UPDATE \"Sources\" SET \"LatestIds\" = '[]' WHERE \"LatestIds\" IS NULL;",
+                cancellationToken).ConfigureAwait(false);
+
+            // Repair databases that ran the FIRST (buggy) AddSourceSeriesAndPackageId migration:
+            // it added the PackageId BLOB columns with a 0-length default, so every pre-existing
+            // row holds an invalid blob and any read throws
+            // "Guid BLOB must be exactly 16 bytes". Normalize NULL/0-length blobs to 16 zero bytes
+            // (Guid.Empty) so materialization succeeds; the data migrator below then backfills the
+            // real values.
+            await db.Database.ExecuteSqlRawAsync(
+                "UPDATE \"Sources\" SET \"PackageId\" = zeroblob(16) WHERE \"PackageId\" IS NULL OR length(\"PackageId\") <> 16;",
+                cancellationToken).ConfigureAwait(false);
+            await db.Database.ExecuteSqlRawAsync(
+                "UPDATE \"SeriesEntries\" SET \"PackageId\" = zeroblob(16) WHERE \"PackageId\" IS NULL OR length(\"PackageId\") <> 16;",
+                cancellationToken).ConfigureAwait(false);
+
+            // PART 2 of the SourceSeries normalization: backfill PackageId, consolidate
+            // same-package same-url series entries onto one row, and populate SourceSeries.
+            // Idempotent — a no-op once every source carries a PackageId. Best-effort: a failure
+            // must not abort startup (the additive columns/table are already in place).
+            try
+            {
+                await ContributionSourceSeriesMigrator.RunAsync(db, logger, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Contribution SourceSeries data migration failed; continuing.");
+            }
+        }
         /// <summary>
         /// Creates the EF migrations history table for the contributor database and
         /// records all known migrations as already applied (used after a fresh
@@ -176,6 +217,20 @@ namespace RensaioBackend.Services.Background
                 SettingsDto settings = await settingsService.GetSettingsAsync(cancellationToken).ConfigureAwait(false);
                 settingsService.SetThreadSettings(settings);
                 await settingsService.SetTimesSettingsAsync(settings, cancellationToken).ConfigureAwait(false);
+
+                // Push bridge-global preferences (FlareSolverr/trawl endpoint, SOCKS proxy, browser)
+                // into the RUNNING RPC host. The backend owns these settings, but the RPC host only
+                // loads its own preferences.json at startup — without this push a configured
+                // FlareSolverr endpoint sat unused and Cloudflare challenges failed silently.
+                // Best-effort: a failure must not abort startup.
+                try
+                {
+                    await settingsService.PushBridgePreferencesAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to push bridge preferences to the RPC host at startup; continuing.");
+                }
                 AppDbContext db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
                 await db.Database.MigrateAsync(cancellationToken).ConfigureAwait(false);
                 await BackfillMappingStatusAsync(db, cancellationToken).ConfigureAwait(false);
@@ -183,7 +238,7 @@ namespace RensaioBackend.Services.Background
 
                 // Ensure the local contributor database exists and is migrated.
                 // Path is derived from DefaultConnection (sibling contributor.db).
-                await EnsureContributionDbAsync(_config, cancellationToken).ConfigureAwait(false);
+                await EnsureContributionDbAsync(_config, _logger, cancellationToken).ConfigureAwait(false);
 
                 //await db.Database.ExecuteSqlRawAsync("PRAGMA busy_timeout=5000;", cancellationToken).ConfigureAwait(false);
                 await _fixes.FixThumbnailsOfSeriesWithMissingThumbnailsAsync(cancellationToken).ConfigureAwait(false);
@@ -248,18 +303,10 @@ namespace RensaioBackend.Services.Background
                 _logger.LogWarning("Starting initial series integrity verification at startup. This may take a while depending on the library size and archive file sizes.");
                 await jobManagement.EnqueueJobAsync(JobType.VerifyAllSeries, (string?)null, Priority.Low, "VerifyAllSeries", null, null, "Default", cancellationToken).ConfigureAwait(false);
 
-                // Repair any wrong auto-linkages created before this version (or by the
-                // contribution import above) so clients converge on the fixed mappings.
-                try
-                {
-                    var repair = scope.ServiceProvider.GetRequiredService<RensaioBackend.Services.Metadata.MappingConflictRepairService>();
-                    await repair.RepairAsync(cancellationToken).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Startup mapping conflict repair failed");
-                }
-
+                // Wrong-auto-linkage repair, contribution title reconciliation and provider-cover
+                // backfill are NOT run here: they now run strictly sequentially (and under the
+                // contribution DB gate) in ContributionRepairBackgroundService, started as a worker
+                // below. This guarantees repair always completes BEFORE reconciliation starts.
                 _workerCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 var workerToken = _workerCts.Token;
                 _workerTasks.Add(StartWorker<JobQueueHostedService>(workerToken));
@@ -267,6 +314,9 @@ namespace RensaioBackend.Services.Background
                 _workerTasks.Add(StartWorker<MetadataBackgroundScanService>(workerToken));
                 _workerTasks.Add(StartWorker<ContributionUploadBackgroundService>(workerToken));
                 _workerTasks.Add(StartWorker<ContributionImportBackgroundService>(workerToken));
+                // Single orchestrator: conflict repair → title reconciliation → cover backfill,
+                // run strictly sequentially under the contribution DB gate.
+                _workerTasks.Add(StartWorker<ContributionRepairBackgroundService>(workerToken));
 
                 // One-shot seeding sweep. Only started when --seed was supplied; without it
                 // the worker is never registered and has zero cost.
@@ -318,16 +368,18 @@ namespace RensaioBackend.Services.Background
         {
             var task = Task.Run(async () =>
             {
-                using var scope = _scopeFactory.CreateScope();
-                var worker = scope.ServiceProvider.GetRequiredService<TWorker>();
                 try
                 {
+                    using var scope = _scopeFactory.CreateScope();
+                    // Resolution lives INSIDE the try: a missing DI registration would otherwise
+                    // throw before the catch and silently fault the task, so the worker never runs.
+                    var worker = scope.ServiceProvider.GetRequiredService<TWorker>();
                     await worker.ExecuteAsync(workerToken).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) { }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Worker crashed");
+                    _logger.LogError(ex, "Worker {Worker} crashed", typeof(TWorker).Name);
                 }
             });
             return task;

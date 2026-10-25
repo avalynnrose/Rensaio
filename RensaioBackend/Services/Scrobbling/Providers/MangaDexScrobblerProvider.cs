@@ -10,7 +10,6 @@ using System.Collections.Concurrent;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
-using System.Threading.RateLimiting;
 
 namespace RensaioBackend.Services.Scrobbling.Providers;
 
@@ -35,6 +34,7 @@ public class MangaDexScrobblerProvider : IScrobblerProvider
 
     private const string AuthBase = "https://auth.mangadex.org/realms/mangadex/protocol/openid-connect";
     private const string ApiBase = "https://api.mangadex.org";
+    public string[] SupportedTypes => new[] { "Manga", "Manhwa", "Manhua" };
 
     public ExternalSeriesProvider ProviderType => ExternalSeriesProvider.MangaDex;
     public ProviderFeatures Features => ProviderFeatures.Scrobbling | ProviderFeatures.Metadata;
@@ -46,16 +46,6 @@ public class MangaDexScrobblerProvider : IScrobblerProvider
     public string? ImageTemplateUrl => "https://uploads.mangadex.org/covers/{0}";
     public bool RequiresOAuth => true;
     public bool SupportsDirectAuth => true;
-// MangaDex rate limit: 5 requests per second
-// Token bucket ensures we never exceed that, with a small queue for brief bursts.
-private static readonly TokenBucketRateLimiter _rateLimiter = new(new TokenBucketRateLimiterOptions
-{
-    TokenLimit = 5,
-    TokensPerPeriod = 5,
-    ReplenishmentPeriod = TimeSpan.FromSeconds(1),
-    QueueLimit = 2,
-    QueueProcessingOrder = QueueProcessingOrder.OldestFirst
-});
 
 private static readonly BoundedStringDecimalMap _dedupState = new();
 
@@ -149,7 +139,7 @@ private static readonly BoundedStringDecimalMap _dedupState = new();
     /// Refreshes an expired access token.
     /// Uses personal client credentials if set, otherwise falls back to global config.
     /// </summary>
-    public async Task<ScrobblerTokenResult> RefreshTokenAsync(string refreshToken)
+    public async Task<ScrobblerTokenResult> RefreshTokenAsync(string refreshToken, CancellationToken token = default)
     {
         try
         {
@@ -173,7 +163,7 @@ private static readonly BoundedStringDecimalMap _dedupState = new();
 
             await EnforceRateLimitAsync();
             var response = await _httpClient.PostAsync($"{AuthBase}/token",
-                new FormUrlEncodedContent(formData));
+                new FormUrlEncodedContent(formData), token);
 
             var json = await response.Content.ReadFromJsonAsync<MdTokenResponse>();
             if (json == null || string.IsNullOrEmpty(json.AccessToken))
@@ -216,7 +206,7 @@ private static readonly BoundedStringDecimalMap _dedupState = new();
 
                     if (expiresAt.HasValue && expiresAt.Value < DateTime.UtcNow.AddMinutes(5))
                     {
-                        var refreshResult = await RefreshTokenAsync(payload.RefreshToken);
+                        var refreshResult = await RefreshTokenAsync(payload.RefreshToken, token);
                         if (refreshResult.Success && refreshResult.AccessToken != null)
                         {
                             // Build new payload with updated refresh token + preserved client credentials
@@ -249,7 +239,7 @@ private static readonly BoundedStringDecimalMap _dedupState = new();
 
     public async Task<List<ScrobblerSearchResult>> SearchSeriesAsync(string query, CancellationToken token = default)
     {
-        _logger.LogInformation("MangaDex: searching for '{Query}'", query);
+        _logger.LogInformation("{provider}: searching for '{Query}'", ExternalSeriesProvider.MangaDex, query);
         _httpClient.ApplyBearerToken(_accessToken);
 
         await EnforceRateLimitAsync();
@@ -330,7 +320,7 @@ private static readonly BoundedStringDecimalMap _dedupState = new();
     /// </summary>
     public async Task<SeriesMetadataResult?> FetchSeriesMetadataAsync(string externalSeriesId, CancellationToken token = default)
     {
-        _logger.LogInformation("MangaDex: fetching metadata for id '{Id}'", externalSeriesId);
+        _logger.LogInformation("{provider}: fetching metadata for id '{Id}'", ExternalSeriesProvider.MangaDex, externalSeriesId);
         if (string.IsNullOrWhiteSpace(externalSeriesId)) return null;
         try
         {
@@ -367,8 +357,10 @@ private static readonly BoundedStringDecimalMap _dedupState = new();
                 foreach (var kvp in attr.Links)
                 {
                     var canonical = _resolver.NormalizeSiteSlug(kvp.Key, ProviderType);
-                    if (canonical != null && !string.IsNullOrWhiteSpace(kvp.Value))
-                        linkedSites.Add($"{canonical}:{kvp.Value}");
+                    if (canonical == null || string.IsNullOrWhiteSpace(kvp.Value)) continue;
+                    // Skip placeholder "0" ids (e.g. myanimelist:0) — never a real cross-site edge.
+                    if (long.TryParse(kvp.Value.Trim(), out long numeric) && numeric <= 0) continue;
+                    linkedSites.Add($"{canonical}:{kvp.Value}");
                 }
 
             return new SeriesMetadataResult
@@ -383,7 +375,7 @@ private static readonly BoundedStringDecimalMap _dedupState = new();
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "MangaDex detail failed for id '{Id}'", externalSeriesId);
+            _logger.LogWarning(ex, "{provider} detail failed for id '{Id}'", ExternalSeriesProvider.MangaDex, externalSeriesId);
             return null;
         }
     }
@@ -511,13 +503,13 @@ private static readonly BoundedStringDecimalMap _dedupState = new();
     // ── Rate Limiting ──
 
     /// <summary>
-    /// Enforces the MangaDex rate limit of 5 requests per second using a token bucket.
-    /// Waits asynchronously until a token is available.
+    /// Enforces MangaDex's documented global rate limit of 5 requests per second
+    /// (https://api.mangadex.org/docs/2-limitations/) using the process-wide shared
+    /// token bucket in <see cref="ProviderRateLimits"/>. Waits asynchronously until
+    /// a token is available.
     /// </summary>
-    private static async ValueTask EnforceRateLimitAsync()
-    {
-        using var lease = await _rateLimiter.AcquireAsync(permitCount: 1);
-    }
+    private static ValueTask EnforceRateLimitAsync()
+        => ProviderRateLimits.EnforceMangaDexAsync();
 
     // ── Private Helpers ──
 

@@ -119,6 +119,18 @@ public sealed class CatalogGrpcService : CatalogService.CatalogServiceBase
         }).ConfigureAwait(false);
     }
 
+    public override async Task<JsonResult> GetMangaUrl(SourceMangaRequest request, ServerCallContext context)
+    {
+        return await ExecuteAsync(request.Source, context, async source =>
+        {
+            Manga manga = RpcJson.Deserialize<Manga>(request.MangaJson) ?? throw new SourceNotFoundException("Missing manga payload.");
+            string url = await _runner.RunAsync(
+                () => source.GetMangaUrlAsync(manga, context.CancellationToken)).ConfigureAwait(false);
+
+            return new JsonResult { Json = RpcJson.Serialize(url ?? string.Empty) };
+        }).ConfigureAwait(false);
+    }
+
     public override async Task<JsonResult> GetPreferences(SourceRef request, ServerCallContext context)
     {
         return await ExecuteAsync(request, context, source =>

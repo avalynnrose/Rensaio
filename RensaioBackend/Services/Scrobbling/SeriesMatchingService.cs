@@ -9,9 +9,11 @@ using RensaioBackend.Models.Dto;
 using RensaioBackend.Models.Enums;
 using RensaioBackend.Services.Metadata;
 using RensaioBackend.Services.Scrobbling.Abstractions;
+using RensaioBackend.Utils.ImageHashing;
 using RensaioBackend.Services.Series;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
+using SeriesEntity = RensaioBackend.Models.Database.SeriesEntity;
 
 namespace RensaioBackend.Services.Scrobbling;
 
@@ -31,6 +33,7 @@ public class SeriesMatchingService
     private readonly SeriesStateService _seriesStateService;
     private readonly SettingsService _settings;
     private readonly ThumbCacheService _thumbCache;
+    private readonly ImageMatchCore _imageMatchCore;
     private readonly ILogger<SeriesMatchingService> _logger;
     private readonly MetadataLinkEngine _linkEngine;
     private readonly Contributions.ContributionPropagationService _contributionSync;
@@ -49,6 +52,7 @@ public class SeriesMatchingService
         SeriesStateService seriesStateService,
         SettingsService settings,
         ThumbCacheService thumbCache,
+        ImageMatchCore imageMatchCore,
         ILogger<SeriesMatchingService> logger,
         MetadataLinkEngine linkEngine,
         Contributions.ContributionPropagationService contributionSync)
@@ -60,6 +64,7 @@ public class SeriesMatchingService
         _seriesStateService = seriesStateService;
         _settings = settings;
         _thumbCache = thumbCache;
+        _imageMatchCore = imageMatchCore;
         _logger = logger;
         _linkEngine = linkEngine;
         _contributionSync = contributionSync;
@@ -157,10 +162,65 @@ public class SeriesMatchingService
         var scrobbler = _providerFactory.GetProvider(provider);
         if (scrobbler == null) return [];
         await scrobbler.EnsureAuthenticatedAsync(userId, token);
+
+        // "Direct reference" support: a "#<id>" id or the provider's series URL resolves to a
+        // single candidate via a DETAIL fetch (no search). The result is only SUGGESTED — the user
+        // still confirms it — so this never links automatically.
+        if (DirectSeriesReference.TryParse(scrobbler, query, out var directId))
+        {
+            var direct = await ResolveDirectResultAsync(scrobbler, directId, token).ConfigureAwait(false);
+            if (direct != null)
+            {
+                await _thumbCache.PopulateThumbsAsync(new[] { direct }, token: token);
+                _logger.LogDebug("{Provider}: direct reference '{Query}' resolved to id {Id}", provider, query, directId);
+                return [direct];
+            }
+            _logger.LogDebug("{Provider}: direct reference '{Query}' could not be resolved (id {Id})", provider, query, directId);
+            return [];
+        }
+
         var results = await scrobbler.SearchSeriesAsync(query, token);
         // Rewrite provider cover URLs through the image cache (Cloudflare bypass + etag + cache).
         await _thumbCache.PopulateThumbsAsync(results, token: token);
         return results;
+    }
+
+    /// <summary>
+    /// Builds the single "direct reference" candidate for a provider id: a DETAIL fetch is preferred
+    /// (rich title/alternates/cover), falling back to a minimal result carrying only the id when the
+    /// provider has no detail endpoint or it fails. The URL is not part of the DTO — the UI links via
+    /// the provider's series URL template.
+    /// </summary>
+    private async Task<ScrobblerSearchResult?> ResolveDirectResultAsync(
+        IExternalSeriesProvider scrobbler, string externalId, CancellationToken token)
+    {
+        if (string.IsNullOrWhiteSpace(externalId)) return null;
+        try
+        {
+            var detail = await scrobbler.FetchSeriesMetadataAsync(externalId, token).ConfigureAwait(false);
+            if (detail != null)
+            {
+                return new ScrobblerSearchResult
+                {
+                    ExternalId = string.IsNullOrWhiteSpace(detail.ExternalId) ? externalId : detail.ExternalId,
+                    Title = detail.Title,
+                    AlternateTitles = detail.AlternativeTitles ?? [],
+                    CoverUrl = detail.CoverUrl,
+                    LinkedSitesIds = detail.LinkedSitesIds ?? []
+                };
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "{Provider}: direct detail fetch failed for id {Id}", scrobbler.ProviderType, externalId);
+        }
+
+        // No detail endpoint (or it failed): still surface the id so the user can confirm it.
+        return new ScrobblerSearchResult { ExternalId = externalId, Title = externalId };
     }
 
     /// <summary>Confirm a manual match — writes the global SeriesMapping (app-wide).</summary>
@@ -449,7 +509,7 @@ public class SeriesMatchingService
             var seriesIgnored = await _db.SeriesMappings
                 .CountAsync(m => m.Provider == config.Provider
                     && (m.MappingStatus == SeriesMappingStatus.ForeverIgnored
-                        || m.MappingStatus == SeriesMappingStatus.TemporaryIgnored), token);
+                        || m.MappingStatus == SeriesMappingStatus.ManualIgnore), token);
             result.Add(new SyncStatusDto
             {
                 Provider = config.Provider,
@@ -560,12 +620,74 @@ public class SeriesMatchingService
         var bestExternalId = best.Id;
         var bestExternalTitle = best.SearchTitle;
         var bestResult = resultLookup.GetValueOrDefault(bestExternalId);
+        // Capture the RAW provider cover URL before it is rewritten through the image cache.
+        var bestRawCoverUrl = bestResult?.CoverUrl;
         // Rewrite the raw provider cover through the image cache before it is surfaced to the
         // frontend (either in the suggested-match row or after auto-match). Never persisted.
         if (bestResult != null)
             await _thumbCache.PopulateThumbsAsync(bestResult, token: token);
 
         const int autoMatchThreshold = 95;
+        const int imageCorroborateThreshold = 80;
+
+        // Image (PDQ) corroboration: a borderline title match (80..94%) whose cover matches the
+        // local series cover is promoted to an auto-match. Image alone never creates a match, and
+        // a confident title match (>=95%) needs no image.
+        if (bestPercentage >= imageCorroborateThreshold && bestPercentage < autoMatchThreshold
+            && !string.IsNullOrWhiteSpace(bestRawCoverUrl))
+        {
+            try
+            {
+                _logger.LogInformation(
+                    "Auto-match series {SeriesId}: borderline title {Title}% on {Provider} -> {ExternalId}; checking cover image",
+                    series.Id, bestPercentage, provider, bestExternalId);
+                var localHash = await _imageMatchCore
+                    .GetLocalHashAsync(series.ThumbnailUrl, series.Sources?.FirstOrDefault(s => !string.IsNullOrWhiteSpace(s.MihonProviderId))?.MihonProviderId, token)
+                    .ConfigureAwait(false);
+                if (localHash is { IsEmpty: false })
+                {
+                    var candidateHash = await _imageMatchCore.GetProviderHashAsync(bestRawCoverUrl, token).ConfigureAwait(false);
+                    if (candidateHash is { IsEmpty: false }
+                        && ImageMatcher.TryCompare(localHash.Value, candidateHash.Value, out var distance, out var pct))
+                    {
+                        if (ImageMatchScoring.IsSameImage(distance))
+                        {
+                            _logger.LogInformation(
+                                "Auto-match image corroborated series {SeriesId} provider {Provider} -> {ExternalId} (title {Title}%, image dist {Distance} → {Pct}%)",
+                                series.Id, provider, bestExternalId, bestPercentage, distance, pct);
+                            bestPercentage = autoMatchThreshold;
+                        }
+                        else
+                        {
+                            _logger.LogInformation(
+                                "Auto-match image mismatch series {SeriesId} provider {Provider} -> {ExternalId} (image dist {Distance} → {Pct}%; not corroborated)",
+                                series.Id, provider, bestExternalId, distance, pct);
+                        }
+                    }
+                    else
+                    {
+                        _logger.LogInformation(
+                            "Auto-match series {SeriesId} provider {Provider}: cover could not be compared (local or candidate hash unavailable)",
+                            series.Id, provider);
+                    }
+                }
+                else
+                {
+                    _logger.LogInformation(
+                        "Auto-match series {SeriesId} provider {Provider}: local cover could not be hashed — image corroboration skipped",
+                        series.Id, provider);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogInformation(ex, "Auto-match image corroboration failed for series {SeriesId}", series.Id);
+            }
+        }
+
         if (bestPercentage < autoMatchThreshold)
         {
             _logger.LogDebug("Auto-match suggested (score {Score}%) series {SeriesId} provider {Provider} -> {ExternalId}",
@@ -644,7 +766,7 @@ public class SeriesMatchingService
             if (existing.MappingStatus == SeriesMappingStatus.UserConfirmed ||
                 existing.MappingStatus == SeriesMappingStatus.Blocked ||
                 existing.MappingStatus == SeriesMappingStatus.ForeverIgnored ||
-                existing.MappingStatus == SeriesMappingStatus.TemporaryIgnored)
+                existing.MappingStatus == SeriesMappingStatus.ManualIgnore)
             {
                 _logger.LogDebug("Auto-match kept existing status {Status} for series {SeriesId} provider {Provider}",
                     existing.MappingStatus, series.Id, provider);
@@ -722,8 +844,11 @@ public class SeriesMatchingService
 
             var titleIds = localCandidates.Select(TitleEntity.DeriveId).Distinct().ToHashSet();
 
-            var mappingTitles = await _contributorDb.MappingTitles
-                .Where(mt => titleIds.Contains(mt.TitleId))
+            // Only LIVE links count: a tombstoned association must not resolve a mapping.
+            var mappingTitles = await _contributorDb.SeriesTitles
+                .Where(mt => titleIds.Contains(mt.TitleId)
+                    && mt.Version != ContributionVersionLogicalDelete
+                    && mt.Version != ContributionVersionUploadedDelete)
                 .AsNoTracking()
                 .ToListAsync(token).ConfigureAwait(false);
             if (mappingTitles.Count == 0) return null;
@@ -731,7 +856,7 @@ public class SeriesMatchingService
             // Prefer the mapping that links the MAIN title, then the one with the most shared titles.
             var mainTitleId = TitleEntity.DeriveId(series.Title);
             var mappingId = mappingTitles
-                .GroupBy(mt => mt.MappingId)
+                .GroupBy(mt => mt.SeriesId)
                 .OrderByDescending(g => g.Any(mt => mt.TitleId == mainTitleId) ? 1 : 0)
                 .ThenByDescending(g => g.Count())
                 .First().Key;
@@ -739,7 +864,7 @@ public class SeriesMatchingService
             // Uploaded rows are -2 (NOT >= 0): use the tombstone test, otherwise a first-match
             // lookup returns nothing once the row has been exported to the cloud.
             var row = await _contributorDb.Metadata
-                .Where(m => m.MappingId == mappingId
+                .Where(m => m.SeriesId == mappingId
                     && m.ProviderId == (int)provider
                     && m.Version != ContributionVersionLogicalDelete
                     && m.Version != ContributionVersionUploadedDelete

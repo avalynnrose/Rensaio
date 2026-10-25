@@ -36,9 +36,9 @@ namespace Mihon.ExtensionsBridge.Core.Runtime
             return repo?.Clone();
         }
 
-        public RepositoryGroup? FindExtension(string name)
+        public RepositoryGroup? FindExtension(string name, bool includeTemporary = false)
         {
-            return _internalExtensionManager.FindExtension(name)?.Clone();
+            return _internalExtensionManager.FindExtension(name, includeTemporary)?.Clone();
         }
 
         public Task<IExtensionInterop> GetInteropAsync(RepositoryGroup entry, CancellationToken token = default)
@@ -46,9 +46,9 @@ namespace Mihon.ExtensionsBridge.Core.Runtime
             return _internalExtensionManager.GetInteropAsync(entry, token);
         }
 
-        public List<RepositoryGroup> ListExtensions()
+        public List<RepositoryGroup> ListExtensions(bool includeTemporary = false)
         {
-            List<RepositoryGroup> grps = _internalExtensionManager.ListExtensions();
+            List<RepositoryGroup> grps = _internalExtensionManager.ListExtensions(includeTemporary);
             return grps.ConvertAll(x => x.Clone());
         }
 

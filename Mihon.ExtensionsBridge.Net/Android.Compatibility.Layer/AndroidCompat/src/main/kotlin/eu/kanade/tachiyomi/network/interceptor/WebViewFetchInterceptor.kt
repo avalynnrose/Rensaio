@@ -1,20 +1,15 @@
 package eu.kanade.tachiyomi.network.interceptor
 
 import android.annotation.SuppressLint
-import android.app.Application
-import android.os.Handler
-import android.os.Looper
 import android.util.Base64
 import android.util.Log
-import android.webkit.JavascriptInterface
-import android.webkit.WebSettings
-import android.webkit.WebView
-import android.webkit.WebViewClient
+import android.webkit.CookieHandlerBridge
 import extension.bridge.Settings
-import extension.bridge.cef.RendererGate
+import extension.bridge.browser.BrowserHostGateway
 import eu.kanade.tachiyomi.network.sourceMetadata
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import okhttp3.Headers.Companion.toHeaders
 import okhttp3.Interceptor
@@ -24,14 +19,9 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.Buffer
-import uy.kohesive.injekt.Injekt
-import uy.kohesive.injekt.api.get
-import xyz.nulldev.androidcompat.webkit.WebViewPool
 import java.io.IOException
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicReference
+import java.net.HttpCookie
+import java.net.URI
 
 /**
  * An OkHttp interceptor that executes HTTP requests through a WebView using JavaScript `fetch` API.
@@ -107,90 +97,10 @@ class WebViewFetchInterceptor(
     private val loadUrl: String? = null,
 ) : Interceptor {
 
-    private val handler = Handler(Looper.getMainLooper())
-    private val context: Application by lazy { Injekt.get() }
     private val interceptorName: String = this::class.simpleName ?: "WebViewFetchInterceptor"
-    private val json = Json
 
-    /**
-     * Per-entry dispatcher registered ONCE with the WebView. `current` points at the live
-     * request's [JsInterface]; swapping it is atomic and never requires removing/readding the
-     * JS interface, so pooled reuse has no add/remove ordering race.
-     *
-     * The JS page calls `window.android.onResponse(...)` / `window.android.onError(...)`, so this
-     * object must expose exactly those methods (the KCEF provider maps all declared member
-     * functions). Each call is forwarded to the current request's handler. `current` is deliberately
-     * not a public property so no extra accessors leak into the JS surface.
-     */
-    private class Dispatcher(
-        initial: JsInterface,
-    ) {
-        private val current: AtomicReference<JsInterface> = AtomicReference(initial)
-
-        fun bind(next: JsInterface) {
-            current.set(next)
-        }
-
-        @JavascriptInterface
-        fun onResponse(
-            statusCode: Int,
-            statusMessage: String,
-            headers: String,
-            bodyBase64: String,
-        ) {
-            current.get().onResponse(statusCode, statusMessage, headers, bodyBase64)
-        }
-
-        @JavascriptInterface
-        fun onError(error: String) {
-            current.get().onError(error)
-        }
-    }
-
-    private val dispatchers = ConcurrentHashMap<Long, Dispatcher>()
-
-    companion object {
-        private const val DELAY_MILLIS: Long = 1000
-        private const val JS_INTERFACE_NAME = "android"
-    }
-
-    internal class FetchResponse(
-        var statusCode: Int = 0,
-        var statusMessage: String = "",
-        var headers: String = "",
-        var bodyBase64: String = "",
-        var error: String = "",
-    )
-
-    internal class JsInterface(
-        private val latch: CountDownLatch,
-        var response: FetchResponse = FetchResponse(),
-    ) {
-        @JavascriptInterface
-        fun onResponse(
-            statusCode: Int,
-            statusMessage: String,
-            headers: String,
-            bodyBase64: String,
-        ) {
-            response.statusCode = statusCode
-            response.statusMessage = statusMessage
-            response.headers = headers
-            response.bodyBase64 = bodyBase64
-            Log.d(
-                "WebViewFetchInterceptor",
-                "WebView fetch response: status=$statusCode, message=$statusMessage, bodySize=${bodyBase64.length} bytes (base64), headersLength=${headers.length}",
-            )
-            latch.countDown()
-        }
-
-        @JavascriptInterface
-        fun onError(error: String) {
-            response.error = error
-            Log.e("WebViewFetchInterceptor", "WebView fetch error: $error")
-            latch.countDown()
-        }
-    }
+    // NOTE: the WebViewPool/Dispatcher/JsInterface machinery was removed with JCEF. The interceptor
+    // now delegates Tier-1 fetches to BrowserHostGateway and degrades to the direct OkHttp chain.
 
     /**
      * Intercepts the HTTP request and either processes it through WebView or proceeds normally.
@@ -250,299 +160,192 @@ class WebViewFetchInterceptor(
      */
     @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
     private fun proceedWithWebView(chain: Interceptor.Chain, request: Request): Response {
-        val poolEnabled = WebViewPool.isEnabled()
-        val latch = CountDownLatch(1)
-        var webView: WebView? = null
-        var poolEntry: WebViewPool.Entry? = null
-        val jsInterface = JsInterface(latch)
-
-        // Prepare request data
-        val requestUrl = request.url.toString()
-        val requestMethod = request.method
-        val requestHeaders = request.headers.toMultimap().mapValues {
-            it.value.lastOrNull() ?: ""
-        }.toMutableMap()
-
-        // Get User-Agent from headers
-        val userAgent = request.header("User-Agent") ?: ""
-
-        // Get contentType from body if available, otherwise from headers
-        val contentType = request.body?.contentType()?.toString() ?: ""
-
-        // If body has contentType, use it in headers instead of the one from headers
-        if (contentType.isNotEmpty()) {
-            requestHeaders["Content-Type"] = contentType
+        // Tier-1 fast path: when a .NET browser host is installed (Patchright/Playwright) and has
+        // capacity, execute the fetch through it. JCEF has been removed, so when the host is
+        // unavailable or fails the only remaining fallback is the direct OkHttp chain.
+        if (BrowserHostGateway.capacityAvailable()) {
+            val hostResponse = tryBrowserHost(request)
+            if (hostResponse != null) {
+                return hostResponse
+            }
         }
 
-        // Convert body to string (always use string format)
-        val bodyString = request.body?.let { body ->
-            val buffer = Buffer()
-            body.writeTo(buffer)
-            buffer.readUtf8()
-        } ?: ""
-
-        Log.d(
+        Log.w(
             "WebViewFetchInterceptor",
-            "Starting WebView fetch: method=$requestMethod, url=$requestUrl, contentType=$contentType, hasBody=${bodyString.isNotEmpty()}, bodySize=${bodyString.length} chars",
+            "Browser host unavailable or failed for ${request.url}; falling back to direct network",
         )
-
-        // JavaScript script that performs the fetch
-        val jsScript = """
-            (function() {
-                const requestUrl = ${requestUrl.asJsonLiteral()};
-                const requestMethod = ${requestMethod.asJsonLiteral()};
-                const requestHeaders = ${requestHeaders.asJsonLiteral()};
-                const bodyString = ${bodyString.asJsonLiteral()};
-                const userAgent = ${userAgent.asJsonLiteral()};
-
-                // Prepare body (always use string format)
-                let body = null;
-                if (bodyString && bodyString.length > 0) {
-                    body = bodyString;
-                }
-
-                // Prepare headers
-                const headers = new Headers();
-                for (const [key, value] of Object.entries(requestHeaders)) {
-                    headers.append(key, value);
-                }
-
-                // Ensure User-Agent is set
-                if (userAgent && userAgent.length > 0) {
-                    headers.set('User-Agent', userAgent);
-                }
-
-                // Perform fetch
-                fetch(requestUrl, {
-                    method: requestMethod,
-                    headers: headers,
-                    body: body,
-                    credentials: 'include',
-                    mode: 'cors',
-                    cache: 'no-store',
-                })
-                .then(async (response) => {
-                    // Read body as ArrayBuffer
-                    const arrayBuffer = await response.arrayBuffer();
-
-                    // Convert ArrayBuffer to base64
-                    const bytes = new Uint8Array(arrayBuffer);
-                    let binary = '';
-                    for (let i = 0; i < bytes.length; i++) {
-                        binary += String.fromCharCode(bytes[i]);
-                    }
-                    const bodyBase64 = btoa(binary);
-
-                    // Convert headers to JSON string
-                    const headersObj = {};
-                    response.headers.forEach((value, key) => {
-                        headersObj[key] = value;
-                    });
-                    const headersJson = JSON.stringify(headersObj);
-
-                    // Call Android interface
-                    window.android.onResponse(
-                        response.status,
-                        response.statusText,
-                        headersJson,
-                        bodyBase64
-                    );
-                })
-                .catch((error) => {
-                    window.android.onError(error.toString());
-                });
-                return true;
-            })();
-        """.trimIndent()
-
-        // Fast advisory check: if the renderer budget is already exhausted (authoritative count
-        // lives in RendererGate, updated by KcefWebViewProvider when browsers are created/destroyed),
-        // degrade to the direct network chain instead of posting work to the main looper that will
-        // be refused by the provider anyway. This covers interceptor, pool, AND extension-owned
-        // WebViews (e.g. Keiyoushi-style runWebView) with a single source of truth.
-        if (!RendererGate.canSpawn()) {
-            Log.w(
-                "WebViewFetchInterceptor",
-                "Renderer budget exhausted (${RendererGate.stats()}); falling back to direct network",
-            )
-            return chain.proceed(request)
-        }
-
-        try {
-            if (poolEnabled) {
-                poolEntry = WebViewPool.acquire(request.url.host)
-                if (poolEntry == null) {
-                    Log.w(
-                        "WebViewFetchInterceptor",
-                        "WebView pool saturated (${WebViewPool.stats()}); falling back to direct network",
-                    )
-                    return chain.proceed(request)
-                }
-                // Bind (or reuse) the per-entry dispatcher BEFORE the looper block runs, so a
-                // reused WebView's JS interface already points at this request's JsInterface.
-                val dispatcher = dispatchers.computeIfAbsent(poolEntry.id) { Dispatcher(jsInterface) }
-                dispatcher.bind(jsInterface)
-            }
-
-            val entry = poolEntry
-            handler.post {
-                try {
-                    val wv =
-                        if (entry != null && entry.webView != null) {
-                            // Reuse an existing pooled WebView (same host -> same CefClient/cookie context).
-                            entry.webView!!
-                        } else {
-                            val created = WebView(context)
-                            if (entry != null) {
-                                WebViewPool.attach(entry, created)
-                            }
-                            created
-                        }
-                    webView = wv
-
-                    with(wv.settings) {
-                        javaScriptEnabled = true
-                        domStorageEnabled = true
-                        databaseEnabled = true
-                        useWideViewPort = false
-                        loadWithOverviewMode = false
-                        userAgentString = request.header("User-Agent")
-                        mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                    }
-
-                    // Register the dispatcher ONCE per WebView (only on first creation). On reuse
-                    // the dispatcher is already bound and simply points at the current handler
-                    // (bound above, before the looper hop).
-                    if (entry != null && entry.webView == null) {
-                        val dispatcher = dispatchers.computeIfAbsent(entry.id) { Dispatcher(jsInterface) }
-                        wv.addJavascriptInterface(dispatcher, JS_INTERFACE_NAME)
-                    }
-
-                    wv.webViewClient = object : WebViewClient() {
-                        override fun onPageFinished(view: WebView, url: String) {
-                            // Execute script after page loads
-                            view.evaluateJavascript(jsScript) { result ->
-                                // Handle JavaScript errors here
-                                if (result == null) {
-                                    Log.e("WebViewFetchInterceptor", "JavaScript evaluation returned null")
-                                    jsInterface.onError("Error executing JavaScript script")
-                                }
-                            }
-                        }
-                    }
-
-                    // Establish context by using the same domain as the request
-                    val baseUrl = loadUrl ?: "${request.url.scheme}://${request.url.host}/"
-                    wv.loadDataWithBaseURL(baseUrl, " ", "text/html", null, null)
-                } catch (t: Throwable) {
-                    // Fail fast instead of hanging for the full timeout: the provider refuses to
-                    // spawn a browser when the renderer budget was exhausted between our advisory
-                    // canSpawn() check and the looper hop (rare race). Surface it as a WebView error
-                    // so the interceptor throws immediately and the request can degrade.
-                    Log.w("WebViewFetchInterceptor", "Failed to start WebView fetch: ${t.message}", t)
-                    jsInterface.onError("Failed to start WebView: ${t.message ?: t.javaClass.simpleName}")
-                }
-            }
-
-            // Wait for response
-            val success = latch.await(timeout, TimeUnit.SECONDS)
-
-            if (!success) {
-                Log.e(
-                    "WebViewFetchInterceptor",
-                    "Timeout waiting for WebView response after ${timeout}s",
-                )
-                throw IOException("Timeout executing request in WebView")
-            }
-
-            val fetchResponse = jsInterface.response
-
-            if (fetchResponse.error.isNotEmpty()) {
-                Log.e("WebViewFetchInterceptor", "WebView returned error: ${fetchResponse.error}")
-                throw IOException("WebView error: ${fetchResponse.error}")
-            }
-
-            // Decode body from base64
-            val bodyBytes = if (fetchResponse.bodyBase64.isNotEmpty()) {
-                Base64.decode(fetchResponse.bodyBase64, Base64.NO_WRAP)
-            } else {
-                ByteArray(0)
-            }
-
-            // Convert JSON headers to OkHttp Headers
-            val responseHeaders = try {
-                val headersMap =
-                    if (fetchResponse.headers.isNotBlank()) {
-                        json.decodeFromString<Map<String, String>>(fetchResponse.headers)
-                    } else {
-                        emptyMap()
-                    }
-                headersMap.toHeaders()
-            } catch (e: Exception) {
-                Log.w("WebViewFetchInterceptor", "Failed to parse response headers: ${e.message}")
-                okhttp3.Headers.headersOf()
-            }
-
-            // Determine content type
-            val contentTypeHeader = responseHeaders["Content-Type"]
-            val mediaType = contentTypeHeader?.toMediaType() ?: "application/octet-stream".toMediaType()
-
-            Log.d(
-                "WebViewFetchInterceptor",
-                "Building response: statusCode=${fetchResponse.statusCode}, statusMessage=${fetchResponse.statusMessage}, bodySize=${bodyBytes.size} bytes, contentType=$contentTypeHeader",
-            )
-
-            // Build Response
-            return Response.Builder()
-                .request(request)
-                .protocol(Protocol.HTTP_1_1)
-                .code(fetchResponse.statusCode)
-                .message(fetchResponse.statusMessage)
-                .headers(responseHeaders)
-                .body(bodyBytes.toResponseBody(mediaType))
-                .build()
-        } catch (t: Throwable) {
-            // On timeout/error: deterministically evict (destroy) the pooled WebView so its
-            // renderer process is torn down instead of leaking.
-            poolEntry?.let { entry ->
-                WebViewPool.evict(entry, "interceptor-failure")
-            }
-            throw t
-        } finally {
-            // Success: keep the pooled WebView idle for reuse (the pool's idle sweep will evict it
-            // once idleTimeoutMs elapses). Failure: already evicted above.
-            poolEntry?.let { entry ->
-                // Drop the dispatcher only when the entry is being destroyed; otherwise keep it
-                // bound so reuse has no add/remove race.
-                if (entry.closed) {
-                    dispatchers.remove(entry.id)
-                }
-                WebViewPool.release(entry)
-            }
-            // Prune dispatcher entries whose pool entry was evicted by the watchdog sweep
-            // (idle timeout or LRU) between requests — those WebViews are gone, so their
-            // dispatchers must not accumulate.
-            if (dispatchers.size > WebViewPool.size() + 16) {
-                val live = dispatchers.keys.filter { !WebViewPool.contains(it) }
-                live.forEach(dispatchers::remove)
-            }
-
-            // Pooling disabled: the per-request WebView must be destroyed deterministically now
-            // that JS work is done (latch counted down) or timed out. Post to the main looper to
-            // match the existing teardown pattern (never call WebView.destroy off-looper).
-            if (!poolEnabled) {
-                val wv2 = webView
-                if (wv2 != null) {
-                    handler.postDelayed(
-                        { runCatching { wv2.destroy() } },
-                        DELAY_MILLIS,
-                    )
-                }
-            }
-        }
+        return chain.proceed(request)
     }
-}
 
 private fun String.asJsonLiteral(): String = Json.encodeToString(this)
 
 private fun Map<String, String>.asJsonLiteral(): String = Json.encodeToString(this)
+
+/**
+ * Wire DTOs for the single JSON hop across the IKVM boundary (BrowserRequest <-> BrowserResponse).
+ * These mirror the .NET contracts in Mihon.ExtensionsBridge.Models/Abstractions/Browser and are
+ * serialized with the same camelCase property names.
+ */
+@Serializable
+internal data class BrowserHostRequest(
+    val url: String,
+    val method: String = "GET",
+    val headers: Map<String, String> = emptyMap(),
+    val body: String? = null,
+    val contextUrl: String? = null,
+    val timeoutSeconds: Int = 60,
+    val waitUntil: String? = null,
+    val cookies: List<BrowserHostCookie> = emptyList(),
+)
+
+/** Engine-neutral cookie, mirroring the .NET BrowserCookie contract. */
+@Serializable
+internal data class BrowserHostCookie(
+    val name: String,
+    val value: String,
+    val domain: String = "",
+    val path: String = "/",
+    val secure: Boolean = false,
+    val httpOnly: Boolean = false,
+    val expires: Double? = null,
+)
+
+@Serializable
+internal data class BrowserHostResponse(
+    val statusCode: Int = 0,
+    val statusMessage: String = "",
+    val headers: Map<String, String> = emptyMap(),
+    val bodyBase64: String = "",
+    val cookies: List<BrowserHostCookie> = emptyList(),
+    val error: String? = null,
+)
+
+private val hostJson = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+
+/**
+ * Tier-1 execution through the .NET browser host. Returns `null` (so the caller falls back to
+ * JCEF / the direct chain) when the host is not installed, errors, or returns an error payload.
+ *
+ * Cookie unification (plan §12.2): the JVM cookie store stays the source of truth. Its cookies
+ * are seeded into the browser before the fetch, and the browser's cookies (notably a freshly
+ * obtained `cf_clearance`) are merged back afterwards so subsequent OkHttp calls carry them.
+ */
+private fun tryBrowserHost(request: Request): Response? {
+    return try {
+        val requestHeaders = request.headers.toMultimap()
+            .mapValues { it.value.lastOrNull() ?: "" }
+            .toMutableMap()
+        val contentType = request.body?.contentType()?.toString()
+        if (!contentType.isNullOrEmpty()) {
+            requestHeaders["Content-Type"] = contentType
+        }
+        val bodyString = request.body?.let { body ->
+            val buffer = Buffer()
+            body.writeTo(buffer)
+            buffer.readUtf8()
+        }
+
+        val payload = hostJson.encodeToString(
+            BrowserHostRequest(
+                url = request.url.toString(),
+                method = request.method,
+                headers = requestHeaders,
+                body = bodyString,
+                contextUrl = "${request.url.scheme}://${request.url.host}/",
+                cookies = readJvmCookies(request.url.toString()),
+            ),
+        )
+
+        val raw = BrowserHostGateway.host().execute(payload)
+        val parsed = hostJson.decodeFromString<BrowserHostResponse>(raw)
+
+        if (!parsed.error.isNullOrEmpty()) {
+            Log.w("WebViewFetchInterceptor", "Browser host error: ${parsed.error}; falling back")
+            return null
+        }
+
+        // Merge the browser's cookies back into the JVM store (source of truth).
+        writeJvmCookies(request.url.toString(), parsed.cookies)
+
+        val bodyBytes = if (parsed.bodyBase64.isNotEmpty()) {
+            Base64.decode(parsed.bodyBase64, Base64.NO_WRAP)
+        } else {
+            ByteArray(0)
+        }
+
+        val responseHeaders = parsed.headers.toHeaders()
+        val mediaType = responseHeaders["Content-Type"]?.toMediaType()
+            ?: "application/octet-stream".toMediaType()
+
+        Response.Builder()
+            .request(request)
+            .protocol(Protocol.HTTP_1_1)
+            .code(parsed.statusCode)
+            .message(parsed.statusMessage)
+            .headers(responseHeaders)
+            .body(bodyBytes.toResponseBody(mediaType))
+            .build()
+    } catch (t: Throwable) {
+        Log.w("WebViewFetchInterceptor", "Browser host execution failed: ${t.message}; falling back", t)
+        null
+    }
+}
+
+/**
+ * Reads the JVM cookie store for [url] and converts it to the host's cookie DTOs. The JVM store
+ * remains the source of truth (plan §12.2), so this is the seeding direction.
+ */
+private fun readJvmCookies(url: String): List<BrowserHostCookie> {
+    return runCatching {
+        val uri = URI(url)
+        val manager = CookieHandlerBridge.ensureDefaultHandler()
+        manager.cookieStore.get(uri).map { cookie ->
+            BrowserHostCookie(
+                name = cookie.name,
+                value = cookie.value,
+                domain = cookie.domain ?: uri.host ?: "",
+                path = cookie.path ?: "/",
+                secure = cookie.secure,
+                httpOnly = cookie.isHttpOnly,
+                expires = cookie.maxAge.takeIf { it > 0 }?.let { System.currentTimeMillis() / 1000.0 + it },
+            )
+        }
+    }.getOrElse { t ->
+        Log.w("WebViewFetchInterceptor", "Failed to read JVM cookies for $url: ${t.message}")
+        emptyList()
+    }
+}
+
+/**
+ * Merges browser-observed cookies (e.g. a solved `cf_clearance`) into the JVM cookie store so
+ * subsequent OkHttp requests reuse the cleared session.
+ */
+private fun writeJvmCookies(url: String, cookies: List<BrowserHostCookie>) {
+    if (cookies.isEmpty()) {
+        return
+    }
+
+    runCatching {
+        val uri = URI(url)
+        val manager = CookieHandlerBridge.ensureDefaultHandler()
+        for (cookie in cookies) {
+            val httpCookie = HttpCookie(cookie.name, cookie.value).apply {
+                domain = cookie.domain.ifBlank { uri.host ?: "" }
+                path = cookie.path.ifBlank { "/" }
+                this.secure = cookie.secure
+                isHttpOnly = cookie.httpOnly
+                cookie.expires?.let { expiry ->
+                    val secondsLeft = (expiry - System.currentTimeMillis() / 1000.0).toLong()
+                    if (secondsLeft > 0) {
+                        maxAge = secondsLeft
+                    }
+                }
+            }
+            manager.cookieStore.add(uri, httpCookie)
+        }
+        Log.d("WebViewFetchInterceptor", "Merged ${cookies.size} browser cookies into the JVM store for $url")
+    }.onFailure { t ->
+        Log.w("WebViewFetchInterceptor", "Failed to merge browser cookies for $url: ${t.message}")
+    }
+}
+}

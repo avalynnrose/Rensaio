@@ -72,8 +72,12 @@ public sealed class SourceCallRunner
         _logger = logger;
     }
 
-    private static bool IsRetryableHttpStatus(int status)
-        => status == 429 || status == 404;
+    private static bool IsRetryableHttpStatus(int? status)
+        // 429/404 keep their historical meaning; additionally retry transient transport/connect
+        // failures (no HTTP status at all — e.g. "Failed to connect to host:443"), request
+        // timeouts (408) and all 5xx. Without the null case a DNS/connect failure is surfaced
+        // as 500 by the caller and never retried, which is exactly the failure this guards.
+        => status is null || status == 429 || status == 404 || status == 408 || status >= 500;
 
     private static TimeSpan ComputeBackoff(int attempt)
     {
@@ -112,13 +116,13 @@ public sealed class SourceCallRunner
                 }
                 catch (HttpRequestException httpEx)
                 {
-                    int status = (int?)httpEx.StatusCode ?? 500;
+                    int? status = (int?)httpEx.StatusCode;
                     if (IsRetryableHttpStatus(status) && attempt < DefaultMaxRetries)
                     {
                         TimeSpan delay = ComputeBackoff(attempt);
                         _logger.LogDebug(
                             "Retrying source call (attempt {Attempt}/{Max}) after {Delay}s due to HTTP {Status}",
-                            attempt + 1, DefaultMaxRetries, delay.TotalSeconds, status);
+                            attempt + 1, DefaultMaxRetries, delay.TotalSeconds, status?.ToString() ?? "transport failure");
                         await Task.Delay(delay, token).ConfigureAwait(false);
                         continue;
                     }

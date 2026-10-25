@@ -10,6 +10,7 @@ using RensaioBackend.Services.Scrobbling;
 using RensaioBackend.Services.Scrobbling.Abstractions;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
+using SeriesEntity = RensaioBackend.Models.Database.SeriesEntity;
 
 namespace RensaioBackend.Services.Metadata;
 
@@ -41,6 +42,22 @@ public class MetaDataLinkEntry
 
     /// <summary>Provider-native JSON payload from the detail call (persisted to SeriesMappingEntity.MetaData).</summary>
     public string? MetaData { get; set; }
+
+    // ── Image (PDQ) match diagnostics ───────────────────────────────────────
+    // Populated only when the image matcher ran for this entry (both covers hashed). Null when no
+    // image comparison happened (no local cover, no provider cover, or hashing failed). Not persisted.
+
+    /// <summary>Hamming distance (0..256) between the local cover and the selected provider cover.</summary>
+    public int? ImageDistance { get; set; }
+
+    /// <summary>PDQ similarity percentage (0..100) derived from <see cref="ImageDistance"/> (higher = closer).</summary>
+    public int? ImageSimilarity { get; set; }
+
+    /// <summary>True when the covers are the same image (distance within the PDQ threshold).</summary>
+    public bool ImageMatched { get; set; }
+
+    /// <summary>True when the image drove the selection (tie-break or corroboration).</summary>
+    public bool ImageUsed { get; set; }
 }
 
 /// <summary>
@@ -120,14 +137,20 @@ public class MetadataLinkEngine
         var total = seriesIds.Count;
 
         // Only series with pending work are scanned: at least one enabled provider row is
-        // Unmatched, Blocked-with-id (a DIFFERENT id may still be matched), or carries an expired
-        // TemporaryIgnored. Settled series (active links, forever-ignored, hard-blocked empty
-        // rows, non-expired temporary-ignores) are skipped entirely.
-        var allMappings = await _db.SeriesMappings
-            .Where(m => m.SeriesId != null)
-            .ToListAsync(token);
+        // Unmatched or Blocked-with-id (a DIFFERENT id may still be matched). Settled series
+        // (active links, forever-ignored, manual-ignored, hard-blocked empty rows) are skipped.
+        // Index mappings by series ONCE. The per-series attention check previously scanned the
+        // whole mapping list for every series (O(series × mappings)) — on a large library that
+        // stalled the whole scan before any progress.
+        var mappingsBySeries = (await _db.SeriesMappings
+                .Where(m => m.SeriesId != null)
+                .ToListAsync(token))
+            .GroupBy(m => m.SeriesId!.Value)
+            .ToDictionary(g => g.Key, g => g.ToList());
         var enabledProviders = await GetEnabledProviderSetAsync(token).ConfigureAwait(false);
-        var threshold = DateTime.UtcNow.AddMonths(-1);
+
+        _logger.LogInformation("Metadata scan started: {SeriesCount} series, {ProviderCount} enabled provider(s)",
+            total, enabledProviders.Count);
 
         if (_hubReport != null)
         {
@@ -144,15 +167,20 @@ public class MetadataLinkEngine
         foreach (var id in seriesIds)
         {
             if (token.IsCancellationRequested) break;
-            if (!SeriesNeedsAttention(id, allMappings, enabledProviders, threshold))
+            var seriesMappings = mappingsBySeries.TryGetValue(id, out var sm) ? sm : new();
+            if (!SeriesNeedsAttention(seriesMappings, enabledProviders))
             {
                 summary.SkippedSeries++;
                 continue;
             }
+            _logger.LogInformation("Metadata scan: series {Index}/{Total} ({SeriesId}) starting ({Linked} linked so far, {Skipped} skipped)",
+                summary.ProcessedSeries + summary.SkippedSeries + 1, total, id, summary.LinkedProviderEntries, summary.SkippedSeries);
             var result = await LinkSeriesAsync(id, token, enabledProviders).ConfigureAwait(false);
             summary.ProcessedSeries++;
             summary.LinkedProviderEntries += result.Links.Count;
             summary.SuggestedEntries += result.Suggestions.Count;
+            _logger.LogInformation("Metadata scan: series {SeriesId} done — {Links} linked, {Suggestions} suggested",
+                id, result.Links.Count, result.Suggestions.Count);
 
             if (_hubReport != null)
             {
@@ -220,9 +248,8 @@ public class MetadataLinkEngine
         // 1. Load the existing status-aware mappings and derive block/skip rules.
         //  - Blocked rows: id-level RULE — that provider must never link to that exact id, but may
         //    automatch a DIFFERENT id later. Record the blocked ids; do not seed them as nodes/edges.
-        //  - ForeverIgnored: provider-level skip — don't seed, don't search, don't re-link.
-        //  - TemporaryIgnored: provider-level skip UNLESS expired (LinkedDate + 1 month <= now):
-        //    the ignore is cleared to Unmatched so the provider is searched again this pass.
+        //  - ForeverIgnored / ManualIgnore: provider-level skip — don't seed, don't search, don't
+        //    re-link (both are settled refusals with no expiration).
         //  - AutoMatched / UserConfirmed / Unmatched-with-id: seed normally as the link graph roots.
         var existingMappings = await _db.SeriesMappings
             .Where(m => m.SeriesId == seriesId)
@@ -231,10 +258,6 @@ public class MetadataLinkEngine
         var blockedIds = new Dictionary<ExternalSeriesProvider, HashSet<string>>();
         var skippedProviders = new HashSet<ExternalSeriesProvider>();
         var seeds = new List<MetadataLinkSeed>();
-        // Expired TemporaryIgnored rows cleared in-memory this pass (persisted with the run).
-        var reEvaluatedIgnores = new List<SeriesMappingEntity>();
-        var now = DateTime.UtcNow;
-        var ignoreThreshold = now.AddMonths(-1); // LinkedDate + 1 month <= now  <=>  LinkedDate <= now - 1 month
 
         foreach (var mapping in existingMappings)
         {
@@ -252,25 +275,10 @@ public class MetadataLinkEngine
                 continue;
             }
 
-            if (mapping.MappingStatus == SeriesMappingStatus.ForeverIgnored)
+            if (mapping.MappingStatus == SeriesMappingStatus.ForeverIgnored ||
+                mapping.MappingStatus == SeriesMappingStatus.ManualIgnore)
             {
-                skippedProviders.Add(mapping.Provider);
-                continue;
-            }
-
-            if (mapping.MappingStatus == SeriesMappingStatus.TemporaryIgnored)
-            {
-                if (mapping.LinkedDate != null && mapping.LinkedDate <= ignoreThreshold)
-                {
-                    // The ignore has expired → re-evaluate the provider NOW: clear the ignore so
-                    // it is searched again and the stale row can be re-linked / relabeled below.
-                    mapping.MappingStatus = SeriesMappingStatus.Unmatched;
-                    mapping.ExternalSeriesId = string.Empty;
-                    mapping.LinkedDate = null;
-                    mapping.UpdateDate = now;
-                    reEvaluatedIgnores.Add(mapping);
-                    continue;
-                }
+                // Both are settled refusals with no expiration — never re-searched.
                 skippedProviders.Add(mapping.Provider);
                 continue;
             }
@@ -288,11 +296,11 @@ public class MetadataLinkEngine
 
         // 2. Determine the metadata providers to query (order matters: hub first) and authenticate.
         //    ONLY pending providers are actually searched: a provider row that is already settled
-        //    (active link, ForeverIgnored, hard-blocked, or a non-expired TemporaryIgnored) is never
-        //    re-evaluated — a Scan / Scan-All re-scans just the non-matched and expired-ignore rows.
-        //    This is the per-provider equivalent of SeriesNeedsAttention: matched providers stay
-        //    untouched, unmatched/expired-ignore providers get one re-evaluation pass.
-        var pendingProviders = GetPendingProviders(existingMappings, ignoreThreshold, enabledProviders);
+        //    (active link, ForeverIgnored, ManualIgnore, hard-blocked) is never re-evaluated — a
+        //    Scan / Scan-All re-scans just the non-matched rows. This is the per-provider equivalent
+        //    of SeriesNeedsAttention: matched providers stay untouched, unmatched providers get one
+        //    re-evaluation pass.
+        var pendingProviders = GetPendingProviders(existingMappings, enabledProviders);
         var providers = _support.GetMetadataProvidersInOrder()
             .Where(p => pendingProviders.Contains(p.ProviderType))
             .ToList();
@@ -305,6 +313,7 @@ public class MetadataLinkEngine
         //     SeriesEntity.Genre, category comes from SeriesEntity.Type. When the provider cannot
         //     search the series, the (series, provider) relation is settled as ForeverIgnored
         //     ("ignoredAlways") so that provider is never searched for this series again.
+        var now = DateTime.UtcNow;
         foreach (var provider in providers)
         {
             if (!provider.CanSearchSeries(series.Genre, series.Type))
@@ -333,6 +342,12 @@ public class MetadataLinkEngine
         MetadataMatchResult? match = null;
         var nodes = new Dictionary<ExternalSeriesProvider, MetaDataLinkEntry>();
 
+        // Local cover + owning Mihon provider for image (PDQ) corroboration of borderline title
+        // matches. Absent/empty → the matcher simply behaves as title-only.
+        var localCoverUrl = string.IsNullOrWhiteSpace(series.ThumbnailUrl) ? null : series.ThumbnailUrl;
+        var mihonProviderId = series.Sources?
+            .FirstOrDefault(s => !string.IsNullOrWhiteSpace(s.MihonProviderId))?.MihonProviderId;
+
         if (gotContributionHit)
         {
             result.ProvidersSearched = 0; // no provider search on a hit
@@ -359,7 +374,7 @@ public class MetadataLinkEngine
             {
                 var localCandidates = _titleMatcher.BuildTitleCandidates(series);
                 var residualMatch = await _matchCore.MatchAsync(localCandidates, residualProviders, seeds, blockedIds,
-                    skippedProviders, enabledProviders, token).ConfigureAwait(false);
+                    skippedProviders, enabledProviders, token, localCoverUrl, mihonProviderId).ConfigureAwait(false);
                 result.ProvidersSearched = residualMatch.ProvidersSearched;
                 // Merge residual suggestions.
                 foreach (var s in residualMatch.Suggestions)
@@ -386,7 +401,7 @@ public class MetadataLinkEngine
             // 3. Run the shared matcher (search + second pass + cross-site propagation).
             var localCandidates = _titleMatcher.BuildTitleCandidates(series);
             match = await _matchCore.MatchAsync(localCandidates, providers, seeds, blockedIds,
-                skippedProviders, enabledProviders, token).ConfigureAwait(false);
+                skippedProviders, enabledProviders, token, localCoverUrl, mihonProviderId).ConfigureAwait(false);
             result.ProvidersSearched = match.ProvidersSearched;
             result.Suggestions = match.Suggestions;
 
@@ -401,7 +416,7 @@ public class MetadataLinkEngine
             }
 
             // 5.5 Materialize Unmatched rows: for every enabled metadata provider that ended up with no
-            //     active link (and no Blocked/TemporaryIgnored/ForeverIgnored decision), persist an empty
+            //     active link (and no Blocked/ManualIgnore/ForeverIgnored decision), persist an empty
             //     SeriesMappings row (status = Unmatched, external id = ""). This makes a manual mapping
             //     possible in the External Mappings page even when the automatch found nothing.
             nodes = match.Links.ToDictionary(l => l.Provider, l => l);
@@ -411,17 +426,6 @@ public class MetadataLinkEngine
         //     contribution link did not cover and that ended up with no decision, persist an empty
         //     SeriesMappings row (status = Unmatched, external id = "") so it stays manually linkable.
         await MaterializeUnmatchedAsync(seriesId, existingMappings, providers, nodes, skippedProviders, token).ConfigureAwait(false);
-
-        // 5.6 Persist expired TemporaryIgnored clears (relevant when no match was found and no
-        // upsert ran in this pass — the row must not stay Ignored past its review date).
-        if (reEvaluatedIgnores.Count > 0)
-        {
-            try { await _db.SaveChangesAsync(token).ConfigureAwait(false); }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to persist re-evaluated TemporaryIgnored mappings for series {SeriesId}", seriesId);
-            }
-        }
 
         // 6. Sync rensaio.json via the existing service (best effort).
         await SyncRensaioJsonAsync(seriesId, token);
@@ -461,8 +465,8 @@ public class MetadataLinkEngine
     /// high-confidence nodes. A hit means NO metadata/scrobbler provider search is needed — the
     /// community already established these matches; only metadata detail fetches may follow for
     /// providers that are connected.
-    /// Local provider-level refusals (hard Blocked / sealed block / ForeverIgnored / non-expired
-    /// TemporaryIgnored) and CanSearchSeries skips always win over the contribution links.
+    /// Local provider-level refusals (hard Blocked / sealed block / ForeverIgnored / ManualIgnore)
+    /// and CanSearchSeries skips always win over the contribution links.
     /// </summary>
     private async Task<List<MetaDataLinkEntry>> TryGetContributionLinksAsync(
         SeriesEntity series,
@@ -484,15 +488,18 @@ public class MetadataLinkEngine
 
             // 2. Mappings sharing any of these titles; prefer the one that links the MAIN title,
             //    then the one with the most titles in common.
-            var mappingTitles = await _contributorDb.MappingTitles
-                .Where(mt => titleIds.Contains(mt.TitleId))
+            // Only LIVE links count: a tombstoned association must not resolve a mapping.
+            var seriesTitles = await _contributorDb.SeriesTitles
+                .Where(mt => titleIds.Contains(mt.TitleId)
+                    && mt.Version != ContributionVersionLogicalDelete
+                    && mt.Version != ContributionVersionUploadedDelete)
                 .AsNoTracking()
                 .ToListAsync(token).ConfigureAwait(false);
-            if (mappingTitles.Count == 0) return [];
+            if (seriesTitles.Count == 0) return [];
 
             var mainTitleId = TitleEntity.DeriveId(series.Title);
-            var mappingId = mappingTitles
-                .GroupBy(mt => mt.MappingId)
+            var mappingId = seriesTitles
+                .GroupBy(mt => mt.SeriesId)
                 .OrderByDescending(g => g.Any(mt => mt.TitleId == mainTitleId) ? 1 : 0)
                 .ThenByDescending(g => g.Count())
                 .First().Key;
@@ -501,14 +508,14 @@ public class MetadataLinkEngine
             //    Uploaded rows are -2 (NOT >= 0), so "not a tombstone" is the correct live test;
             //    a `Version >= 0` filter would silently return nothing after the first upload.
             var metadata = await _contributorDb.Metadata
-                .Where(m => m.MappingId == mappingId
+                .Where(m => m.SeriesId == mappingId
                     && m.Version != ContributionVersionLogicalDelete
                     && m.Version != ContributionVersionUploadedDelete)
                 .AsNoTracking()
                 .ToListAsync(token).ConfigureAwait(false);
 
             // Provider-level local rules: a locally hard-off provider (Blocked empty id / sealed
-            // block / ForeverIgnored / non-expired TemporaryIgnored) or a CanSearchSeries skip
+            // block / ForeverIgnored / ManualIgnore) or a CanSearchSeries skip
             // cannot receive a contribution link.
             bool ProviderLocallyOff(ExternalSeriesProvider p)
             {
@@ -520,7 +527,7 @@ public class MetadataLinkEngine
                         string.IsNullOrWhiteSpace(m.ExternalSeriesId)) return true;
                     if (m.IsAutoSealedBlock) return true;
                     if (m.MappingStatus == SeriesMappingStatus.ForeverIgnored) return true;
-                    if (m.MappingStatus == SeriesMappingStatus.TemporaryIgnored) return true;
+                    if (m.MappingStatus == SeriesMappingStatus.ManualIgnore) return true;
                 }
                 return false;
             }
@@ -686,7 +693,7 @@ public class MetadataLinkEngine
                 }
                 else if ((blocked.MappingStatus == SeriesMappingStatus.AutoMatched
                     || blocked.MappingStatus == SeriesMappingStatus.Unmatched
-                    || blocked.MappingStatus == SeriesMappingStatus.TemporaryIgnored)
+                    || blocked.MappingStatus == SeriesMappingStatus.ManualIgnore)
                     && hasRealId)
                 {
                     // Existing row is not a user decision → convert it to the id-scoped block and
@@ -715,11 +722,10 @@ public class MetadataLinkEngine
 
             if (existing != null)
             {
-                // Never overwrite a user decision: Blocked / ForeverIgnored / TemporaryIgnored are
-                // kept as-is (their ids are already excluded from search + propagation; an expired
-                // TemporaryIgnored was cleared to Unmatched upstream and never arrives here).
+                // Never overwrite a user decision: Blocked / ForeverIgnored / ManualIgnore are
+                // kept as-is (their ids are already excluded from search + propagation).
                 if (existing.MappingStatus == SeriesMappingStatus.ForeverIgnored ||
-                    existing.MappingStatus == SeriesMappingStatus.TemporaryIgnored)
+                    existing.MappingStatus == SeriesMappingStatus.ManualIgnore)
                     return;
 
                 // Blocked is an id-level rule only: reaching this point means the node carries a
@@ -826,7 +832,7 @@ public class MetadataLinkEngine
     /// <summary>
     /// Creates an empty (Unmatched) <see cref="SeriesMappingEntity"/> row for each enabled metadata
     /// provider that ended this pass without a linked node AND without an existing row that already
-    /// records a decision (Blocked / TemporaryIgnored / ForeverIgnored / active id row / Unmatched).
+    /// records a decision (Blocked / ManualIgnore / ForeverIgnored / active id row / Unmatched).
     /// This makes every provider visible and manually linkable in the External Mappings page even when
     /// automatching found nothing, while never overriding user decisions.
     /// </summary>
@@ -914,19 +920,17 @@ public class MetadataLinkEngine
     /// True when the series has at least one ENABLED provider that needs (re-)evaluation:
     /// no mapping row, an active link row with an empty/stale external id, a
     /// <see cref="SeriesMappingStatus.Blocked"/> row carrying an id (a DIFFERENT id may still be
-    /// matched — the block is id-scoped, not provider-scoped), or an expired
-    /// <see cref="SeriesMappingStatus.TemporaryIgnored"/> (LinkedDate + 1 month <= threshold).
+    /// matched — the block is id-scoped, not provider-scoped).
     /// Settled states return false: active link with id, <see cref="SeriesMappingStatus.Unmatched"/>
     /// (a previous pass already searched; no match found — re-searching is wasted work), ForeverIgnored,
-    /// hard-blocked (empty-id) row, and non-expired TemporaryIgnored.
+    /// hard-blocked (empty-id) row, and <see cref="SeriesMappingStatus.ManualIgnore"/>.
     /// A series with an active link on one provider and an Unmatched row on another is SKIPPED.
     /// </summary>
-    public bool SeriesNeedsAttention(Guid seriesId, List<SeriesMappingEntity> allMappings,
-        HashSet<ExternalSeriesProvider> enabledProviders, DateTime threshold)
+    public bool SeriesNeedsAttention(List<SeriesMappingEntity> seriesMappings,
+        HashSet<ExternalSeriesProvider> enabledProviders)
     {
         if (enabledProviders.Count == 0) return false;
 
-        var seriesMappings = allMappings.Where(m => m.SeriesId == seriesId).ToList();
         if (seriesMappings.Count == 0) return true; // no rows → every enabled provider is unmatched
 
         var covered = 0;
@@ -963,9 +967,8 @@ public class MetadataLinkEngine
                     break;
                 case SeriesMappingStatus.ForeverIgnored:
                     break; // settled
-                case SeriesMappingStatus.TemporaryIgnored:
-                    if (m.LinkedDate != null && m.LinkedDate <= threshold) return true; // expired → re-evaluate
-                    break; // settled until review date
+                case SeriesMappingStatus.ManualIgnore:
+                    break; // settled refusal, no expiration
             }
         }
 
@@ -985,15 +988,14 @@ public class MetadataLinkEngine
     /// <summary>
     /// Returns the set of providers that have pending (re-)evaluation work for this series:
     /// - NO mapping row at all (never scanned → search),
-    /// - an <see cref="SeriesMappingStatus.Unmatched"/> row (previously searched, no match → re-search),
-    /// - an expired <see cref="SeriesMappingStatus.TemporaryIgnored"/> (re-evaluate).
+    /// - an <see cref="SeriesMappingStatus.Unmatched"/> row (previously searched, no match → re-search).
     /// Settled providers (active link with id, stale empty-id active row, ForeverIgnored, ALL
     /// Blocked rows — including id-scoped: the block is a refusal and a different id is only a
-    /// manual decision — and non-expired TemporaryIgnored) are EXCLUDED.
+    /// manual decision — and ManualIgnore) are EXCLUDED.
     /// Scan/Scan-All must re-scan ONLY these pending cases — never matched or refused providers.
     /// </summary>
     private static HashSet<ExternalSeriesProvider> GetPendingProviders(
-        List<SeriesMappingEntity> mappings, DateTime ignoreThreshold,
+        List<SeriesMappingEntity> mappings,
         HashSet<ExternalSeriesProvider>? enabledProviders = null)
     {
         var pending = new HashSet<ExternalSeriesProvider>();
@@ -1021,11 +1023,8 @@ public class MetadataLinkEngine
                 case SeriesMappingStatus.ForeverIgnored:
                     settled.Add(m.Provider);
                     break;
-                case SeriesMappingStatus.TemporaryIgnored:
-                    if (m.LinkedDate != null && m.LinkedDate <= ignoreThreshold)
-                        pending.Add(m.Provider); // expired → re-evaluate
-                    else
-                        settled.Add(m.Provider);
+                case SeriesMappingStatus.ManualIgnore:
+                    settled.Add(m.Provider);
                     break;
             }
         }

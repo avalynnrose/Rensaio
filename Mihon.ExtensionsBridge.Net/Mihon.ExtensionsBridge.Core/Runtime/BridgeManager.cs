@@ -1,9 +1,11 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using extension.bridge;
+using Mihon.ExtensionsBridge.Core.Browser;
 using Mihon.ExtensionsBridge.Core.Extensions;
 using Mihon.ExtensionsBridge.Models;
 using Mihon.ExtensionsBridge.Models.Abstractions;
+using Mihon.ExtensionsBridge.Models.Abstractions.Browser;
 using Mihon.ExtensionsBridge.Core.Abstractions;
 
 namespace Mihon.ExtensionsBridge.Core.Runtime
@@ -167,36 +169,49 @@ namespace Mihon.ExtensionsBridge.Core.Runtime
                         update = true;
                     }
                 }
-                if (prefs.Cef != null)
+                // NOTE: the Cef.* -> Kotlin settings push was removed with JCEF. There are no
+                // cef* settings any more; browser behaviour is driven entirely by Browser.* and
+                // the paths come from the injected IWorkingFolderStructure.
+                if (prefs.Browser != null)
                 {
-                    if (prefs.Cef.MaxRenderers > 0 && prefs.Cef.MaxRenderers != config.getCefMaxRenderers())
+                    if (prefs.Browser.Enabled != config.getBrowserEnabled())
                     {
-                        config.setCefMaxRenderers(prefs.Cef.MaxRenderers);
+                        config.setBrowserEnabled(prefs.Browser.Enabled);
                         update = true;
                     }
-                    if (prefs.Cef.IdleTimeoutMs > 0 && prefs.Cef.IdleTimeoutMs != config.getCefIdleTimeoutMs())
+                    if (prefs.Browser.Provider != config.getBrowserProvider())
                     {
-                        config.setCefIdleTimeoutMs(prefs.Cef.IdleTimeoutMs);
+                        config.setBrowserProvider(prefs.Browser.Provider ?? "patchright");
                         update = true;
                     }
-                    if (prefs.Cef.WebViewPoolEnabled != config.getCefWebViewPoolEnabled())
+                    if (prefs.Browser.Headless != config.getBrowserHeadless())
                     {
-                        config.setCefWebViewPoolEnabled(prefs.Cef.WebViewPoolEnabled);
+                        config.setBrowserHeadless(prefs.Browser.Headless);
                         update = true;
                     }
-                    if (prefs.Cef.Enabled != config.getCefEnabled())
+                    if (prefs.Browser.Stealth != config.getBrowserStealth())
                     {
-                        config.setCefEnabled(prefs.Cef.Enabled);
+                        config.setBrowserStealth(prefs.Browser.Stealth);
                         update = true;
                     }
-                    if (prefs.Cef.PumpActiveIntervalMs > 0 && prefs.Cef.PumpActiveIntervalMs != config.getCefPumpActiveIntervalMs())
+                    if ((prefs.Browser.Channel ?? "") != config.getBrowserChannel())
                     {
-                        config.setCefPumpActiveIntervalMs(prefs.Cef.PumpActiveIntervalMs);
+                        config.setBrowserChannel(prefs.Browser.Channel ?? "");
                         update = true;
                     }
-                    if (prefs.Cef.PumpIdleIntervalMs > 0 && prefs.Cef.PumpIdleIntervalMs != config.getCefPumpIdleIntervalMs())
+                    if (prefs.Browser.MaxConcurrency > 0 && prefs.Browser.MaxConcurrency != config.getBrowserMaxConcurrentPages())
                     {
-                        config.setCefPumpIdleIntervalMs(prefs.Cef.PumpIdleIntervalMs);
+                        config.setBrowserMaxConcurrentPages(prefs.Browser.MaxConcurrency);
+                        update = true;
+                    }
+                    if (prefs.Browser.IdleTimeoutMs > 0 && prefs.Browser.IdleTimeoutMs != config.getBrowserIdleTimeoutMs())
+                    {
+                        config.setBrowserIdleTimeoutMs(prefs.Browser.IdleTimeoutMs);
+                        update = true;
+                    }
+                    if (prefs.Browser.PoolEnabled != config.getBrowserPoolEnabled())
+                    {
+                        config.setBrowserPoolEnabled(prefs.Browser.PoolEnabled);
                         update = true;
                     }
                 }
@@ -212,9 +227,13 @@ namespace Mihon.ExtensionsBridge.Core.Runtime
                     int.TryParse(originalPort, out port);
                     if (prefs.SocksProxy.Port != port)
                     {
-                        string set = originalPort.ToString();
-                        if (set == "0")
-                            set = "";
+                        // BUG (pre-existing): this used to write back `originalPort` — the OLD value —
+                        // so the port a user set was never persisted (and an empty stored value kept
+                        // resetting it to ""). That empty port then reached SystemProxyBridge, which
+                        // (correctly) refuses to apply an HTTP proxy with an invalid port. Persist the
+                        // INCOMING port, treating 0 as "unset" (empty string, matching the historical
+                        // representation).
+                        string set = prefs.SocksProxy.Port > 0 ? prefs.SocksProxy.Port.ToString() : "";
                         config.setSocksProxyPort(set);
                         update = true;
                     }
@@ -233,7 +252,43 @@ namespace Mihon.ExtensionsBridge.Core.Runtime
                         config.setSocksProxyPassword(prefs.SocksProxy.Password);
                         update = true;
                     }
+                    // Scheme + CA + TLS-trust: drives whether the JVM chain uses SOCKS or an HTTP
+                    // proxy, and whether the proxy's terminating CA is trusted.
+                    string scheme = string.IsNullOrWhiteSpace(prefs.SocksProxy.Scheme) ? "socks5" : prefs.SocksProxy.Scheme;
+                    if (scheme != config.getProxyScheme())
+                    {
+                        config.setProxyScheme(scheme);
+                        update = true;
+                    }
+                    if ((prefs.SocksProxy.CaCertPath ?? "") != config.getCaCertPath())
+                    {
+                        config.setCaCertPath(prefs.SocksProxy.CaCertPath ?? "");
+                        update = true;
+                    }
+                    if (prefs.SocksProxy.IgnoreTlsErrors != config.getIgnoreTlsErrors())
+                    {
+                        config.setIgnoreTlsErrors(prefs.SocksProxy.IgnoreTlsErrors);
+                        update = true;
+                    }
                 }
+
+                // The browser subsystem is a SECOND consumer of the same proxy group. Its warm-up
+                // runs before this push, so without an explicit re-apply a proxy saved in Settings
+                // would never reach Patchright (every session would egress directly). Routed through
+                // the service provider to avoid a circular dependency.
+                try
+                {
+                    if (prefs.SocksProxy is not null &&
+                        _serviceProvider.GetService<IBrowserAutomationService>() is BrowserAutomationService browser)
+                    {
+                        browser.ApplyProxyPreferences(prefs.SocksProxy);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Failed to push proxy preferences into the browser subsystem.");
+                }
+
                 if (update)
                 {
                     ConfigKt.setSettings(config);

@@ -18,6 +18,17 @@ namespace RensaioBackend.Extensions
             string sourceId = split[1];
             return (packageName, sourceId);
         }
+        /// <summary>
+        /// Builds the canonical Mihon provider id (<c>package|sourceId</c>) from its raw parts.
+        /// Returns null when either part is missing, so callers can treat "unknown provider" as
+        /// a plain null rather than an empty id.
+        /// </summary>
+        public static string? BuildMihonProviderId(string? package, long sourceId)
+        {
+            if (string.IsNullOrWhiteSpace(package))
+                return null;
+            return package + "|" + sourceId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
         public static string GetMihonProviderId(this TachiyomiExtension ext, TachiyomiSource src)
         {
             return ext.Package+"|" + src.Id;

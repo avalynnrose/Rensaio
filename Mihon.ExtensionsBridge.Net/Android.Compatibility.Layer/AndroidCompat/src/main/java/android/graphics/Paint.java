@@ -834,13 +834,22 @@ public class Paint {
         }
     }
 
+    // OPTION A (headless): previously this instantiated a heavyweight java.awt.Canvas and used
+    // Canvas.getFontMetrics(...). A Canvas is a heavyweight component and forces AWT to select
+    // the windowed toolkit (sun.awt.windows.WToolkit) whose native eventLoop thread later calls
+    // back into IKVM with no valid per-thread JNIEnv (JavaVM.GetEnv NRE). Font/LineMetrics are
+    // lightweight and need no toolkit/peer, so the headless toolkit is kept.
+    private static final java.awt.font.FontRenderContext DEFAULT_FRC =
+            new java.awt.font.FontRenderContext((java.awt.geom.AffineTransform) null, false, false);
+
     public float getFontMetrics(FontMetrics metrics) {
-        java.awt.Canvas c = new java.awt.Canvas();
-        java.awt.FontMetrics m = c.getFontMetrics(mTypeface.getFont());
-        metrics.top = m.getMaxDescent();
+        Font font = mTypeface.getFont();
+        java.awt.font.LineMetrics m = font.getLineMetrics("", DEFAULT_FRC);
+        // Preserve the original field mapping/order used by this compat layer.
+        metrics.top = m.getDescent();
         metrics.ascent = m.getAscent();
         metrics.descent = m.getDescent();
-        metrics.bottom = m.getMaxAscent();
+        metrics.bottom = m.getAscent();
         metrics.leading = m.getLeading();
         return m.getLeading();
     }

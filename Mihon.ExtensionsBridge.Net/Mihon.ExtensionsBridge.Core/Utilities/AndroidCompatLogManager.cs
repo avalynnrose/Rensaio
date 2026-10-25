@@ -15,8 +15,17 @@ namespace Mihon.ExtensionsBridge.Core.Utilities
             ArgumentNullException.ThrowIfNull(logger);
             lock (SyncRoot)
             {
-           
-                var minimum = DetermineMinimumLevel(logger);
+                // ── DIAGNOSTIC OPT-IN (RENSAIO_RPC_VERBOSE=1) ───────────────────────────────
+                // The JVM drops anything below its own floor BEFORE it reaches .NET
+                // (AndroidCompatLogForwarder starts at INFO), so JVM debug lines — all of the
+                // webview telemetry — need the floor lowered here as well as on the .NET side.
+                // OFF by default so normal operation stays quiet.
+                bool verbose = string.Equals(
+                    Environment.GetEnvironmentVariable("RENSAIO_RPC_VERBOSE"),
+                    "1",
+                    StringComparison.OrdinalIgnoreCase);
+
+                var minimum = verbose ? AndroidCompatLogLevel.DEBUG : DetermineMinimumLevel(logger);
                 AndroidCompatLogBridge.setMinimumLevel(minimum);
             }
         }

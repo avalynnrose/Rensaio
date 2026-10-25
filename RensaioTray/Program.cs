@@ -13,14 +13,16 @@ static class Program
     [STAThread]
     public static void Main(string[] args)
     {
-        Environment.SetEnvironmentVariable("IKVM_VERBOSE", "1");
 
         // Initialize the zero-dependency crash logger as early as possible.
         // EnvironmentSetup.Path is resolved in the static constructor, so it
         // is safe to use here even before InitializeAsync() is called.
+
+
+        /*
         var crashLogDir = System.IO.Path.Combine(EnvironmentSetup.Path, "logs");
         FallbackCrashLogger.Initialize(crashLogDir);
-
+        */
        
         // Install the Windows Vectored Exception Handler (VEH) to catch native
         // crashes (AccessViolation, StackOverflow, etc.) that managed handlers
@@ -30,6 +32,8 @@ static class Program
         //NativeCrashHandler.Install();
         // Register FIRST-CHANCE exception handler to catch exceptions that are
         // thrown and caught internally — these never reach UnhandledException.
+
+        /*
         AppDomain.CurrentDomain.FirstChanceException += (sender, e) =>
         {
             var source = e.Exception?.Source ?? "";
@@ -54,11 +58,13 @@ static class Program
                     "TRAY FIRSTCHANCE: " + e.Exception?.GetType().Name + " from " + source);
             }
         };
-
+        */
         // Register global exception traps BEFORE any application code runs.
         // These handlers capture crashes that bypass Avalonia's and
         // AspNetCore's error pipelines (native crashes, StackOverflowException,
         // finalizer thread crashes, unobserved task exceptions, silent kills).
+        
+        /*
         AppDomain.CurrentDomain.UnhandledException += (sender, e) =>
         {
             var ex = e.ExceptionObject as Exception;
@@ -80,15 +86,13 @@ static class Program
             try { state = Environment.HasShutdownStarted ? "shutdown-started" : "normal"; } catch { }
             FallbackCrashLogger.Write("TRAY ProcessExit fired (HasShutdownStarted=" + state + ")");
             try { Log.Information("TRAY ProcessExit fired (HasShutdownStarted={State})", state); } catch { }
-            try { /* NativeCrashHandler.Uninstall(); */ } catch { }
+            try { NativeCrashHandler.Uninstall(); } catch { }
             try { Log.CloseAndFlush(); } catch { }
         };
+        */
 
-        // Desktop hosts the extension runtime IN-PROCESS, so the JVM starts here. Set the
-        // AWT headless property (and verbose IKVM logging) BEFORE the first Java call, as
-        // this is what keeps JCEF on the headless/OSR path.
-        java.lang.System.setProperty("java.awt.headless", "true");
-
+        // The tray is decoupled from IKVM/CEF: the JVM runs in the extension runtime
+        // process (Rensaio.RPC), not here. No java.lang.* access in this process.
         if (!EnvironmentSetup.IsApplicationAlreadyRunning())
         {
             try
@@ -104,7 +108,7 @@ static class Program
             }
             catch (Exception ex)
             {
-                FallbackCrashLogger.WriteException(ex, "TRAY AVALONIA STARTUP FAILED");
+                //FallbackCrashLogger.WriteException(ex, "TRAY AVALONIA STARTUP FAILED");
                 // Log any critical startup errors.
                 Console.WriteLine($"Application startup failed: {ex.Message}");
             }

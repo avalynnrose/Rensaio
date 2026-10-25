@@ -23,9 +23,11 @@ public sealed class ContributionSnapshotV1
     [JsonPropertyName("t")]
     public List<TitleEntity> Titles { get; set; } = [];
     [JsonPropertyName("m")]
-    public List<MappingTitleEntity> Mappings { get; set; } = [];
+    public List<SeriesTitleEntity> Mappings { get; set; } = [];
     [JsonPropertyName("s")]
     public List<ContributionSourceEntity> Sources { get; set; } = [];
+    [JsonPropertyName("x")]
+    public List<ContributionSourceSeriesEntity> SourceSeries { get; set; } = [];
     [JsonPropertyName("i")]
     public List<ContributionSeriesEntity> Series { get; set; } = [];
     [JsonPropertyName("d")]

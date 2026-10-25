@@ -11,10 +11,10 @@ namespace RensaioBackend.Services.Contributions;
 /// is produced:
 ///   * Title identity is deterministic (MD5(Normalize(title)) → Guid), so the same title
 ///     from any extension collapses onto one row.
-///   * A mapping is resolved by title overlap (preferring the mapping that already links
+///   * A series is resolved by title overlap (preferring the series that already links
 ///     the main title) and created only when none exists.
 ///   * Source identity is the deterministic (package + sourceId) key.
-///   * Series identity is the deterministic (package + sourceId + url) key.
+///   * Series-entry identity is the deterministic (package + sourceId + url) key.
 ///
 /// IMPORTANT — idempotency within a unit of work: a sweep performs many of these calls
 /// before a single <see cref="SaveAsync"/>. A query alone is therefore NOT enough to
@@ -37,6 +37,56 @@ public sealed class ContributionGraphWriter
     public ContributionGraphWriter(ContributionDbContext db)
     {
         _db = db;
+    }
+
+    /// <summary>
+    /// Upserts the many-to-many <c>SourceSeries</c> association for a (source, series entry) pair,
+    /// reviving a tombstoned row instead of inserting a duplicate that would violate the composite
+    /// key. Idempotent within a unit of work (checks the change tracker first).
+    /// </summary>
+    public async Task EnsureSourceSeriesAsync(Guid sourceEntityId, Guid seriesEntityId, CancellationToken token)
+    {
+        var row = FindTracked<ContributionSourceSeriesEntity>(
+            e => e.SourceId == sourceEntityId && e.SeriesEntityId == seriesEntityId);
+        row ??= await _db.SourceSeries
+            .FirstOrDefaultAsync(ss => ss.SourceId == sourceEntityId && ss.SeriesEntityId == seriesEntityId, token)
+            .ConfigureAwait(false);
+
+        if (row == null)
+        {
+            _db.SourceSeries.Add(new ContributionSourceSeriesEntity
+            {
+                SourceId = sourceEntityId,
+                SeriesEntityId = seriesEntityId,
+                Version = VersionAddOrUpdate
+            });
+            return;
+        }
+
+        if (ContributionVersions.IsDeleted(row.Version))
+        {
+            row.Version = VersionAddOrUpdate;
+            _db.Entry(row).Property(ss => ss.Version).IsModified = true;
+        }
+    }
+
+    /// <summary>
+    /// Retires the <c>SourceSeries</c> association for a (source, series entry) pair when it exists,
+    /// leaving an already-tombstoned row untouched. Used when a source stops contributing an entry.
+    /// </summary>
+    public async Task RetireSourceSeriesAsync(Guid sourceEntityId, Guid seriesEntityId, CancellationToken token)
+    {
+        var row = FindTracked<ContributionSourceSeriesEntity>(
+            e => e.SourceId == sourceEntityId && e.SeriesEntityId == seriesEntityId);
+        row ??= await _db.SourceSeries
+            .FirstOrDefaultAsync(ss => ss.SourceId == sourceEntityId && ss.SeriesEntityId == seriesEntityId, token)
+            .ConfigureAwait(false);
+
+        if (row == null || ContributionVersions.IsDeleted(row.Version))
+            return;
+
+        row.Version = VersionLogicalDelete;
+        _db.Entry(row).Property(ss => ss.Version).IsModified = true;
     }
 
     /// <summary>
@@ -105,120 +155,145 @@ public sealed class ContributionGraphWriter
     }
 
     /// <summary>
-    /// Resolves the mapping that owns these titles, or creates a new one. Prefers the
-    /// mapping already linking the main title, then any mapping linked to one of the
-    /// titles, then a fresh mapping.
+    /// Resolves the series that owns these titles, or creates a new one. Prefers the
+    /// series already linking the main title, then any series linked to one of the
+    /// titles, then a fresh series.
+    ///
+    /// Returns the resolved series id plus <c>Created</c>, which is <c>true</c> only when NO
+    /// existing (live or in-unit-of-work) series association was found and a brand-new
+    /// <see cref="SeriesEntity"/> was added. The sweep uses this to decide whether a series is
+    /// "new" for the incremental metadata-match gate.
     /// </summary>
-    public async Task<Guid> ResolveMappingAsync(
+    public async Task<(Guid SeriesId, bool Created)> ResolveSeriesAsync(
         Dictionary<string, Guid> titleIds, string mainTitle, CancellationToken token)
     {
         var seriesTitleIds = titleIds.Values.Distinct().ToList();
         if (seriesTitleIds.Count == 0)
-            return CreateMapping().Id;
+            return (CreateSeries().Id, true);
 
         var mainId = titleIds.TryGetValue(TitleEntity.Normalize(mainTitle), out var resolvedMain)
             ? resolvedMain
             : (Guid?)null;
 
-        // Persisted links.
-        var mappingTitles = await _db.MappingTitles
-            .Where(mt => seriesTitleIds.Contains(mt.TitleId))
+        // 1. Persisted LIVE links for these titles. A tombstoned link (-1/-3) must NOT
+        //    count as a series association: per the model, a title belongs to a series only
+        //    through a LIVE SeriesTitles row. Otherwise an orphaned/tombstoned link would
+        //    make every new title collapse onto a stale series (the giant-cluster bug).
+        var seriesTitles = await _db.SeriesTitles
+            .Where(mt => seriesTitleIds.Contains(mt.TitleId)
+                && mt.Version != VersionLogicalDelete
+                && mt.Version != ContributionVersions.UploadedDelete)
             .AsNoTracking()
             .ToListAsync(token).ConfigureAwait(false);
 
-        // Links created earlier in this unit of work (e.g. by an adjacent series in the
-        // same sweep batch) — otherwise each series would mint its own mapping.
-        var trackedLinks = _db.ChangeTracker.Entries<MappingTitleEntity>()
+        // 2. Links created earlier in this unit of work (e.g. by an adjacent series in the
+        //    same sweep batch) — SCOPED to this series' titles. Without the Where filter the
+        //    and LIVE-version check, an UNRELATED tracked link would be picked up by the
+        //    `viaAny` fallback below and a brand-new title would be merged onto whatever series
+        //    was processed earlier in the unit of work. SaveChangesAsync does not detach, so
+        //    this leak was cumulative over the whole sweep.
+        var trackedLinks = _db.ChangeTracker.Entries<SeriesTitleEntity>()
             .Select(e => e.Entity)
+            .Where(mt => seriesTitleIds.Contains(mt.TitleId) && ContributionVersions.IsLive(mt.Version))
             .ToList();
 
-        IEnumerable<MappingTitleEntity> allLinks = mappingTitles.Concat(trackedLinks);
+        IEnumerable<SeriesTitleEntity> allLinks = seriesTitles.Concat(trackedLinks);
 
         if (mainId.HasValue)
         {
-            var viaMain = allLinks.FirstOrDefault(mt => mt.TitleId == mainId.Value)?.MappingId;
+            var viaMain = allLinks.FirstOrDefault(mt => mt.TitleId == mainId.Value)?.SeriesId;
             if (viaMain.HasValue && viaMain.Value != Guid.Empty)
-                return viaMain.Value;
+                return (viaMain.Value, false);
         }
 
-        var viaAny = allLinks.Select(mt => mt.MappingId).FirstOrDefault(id => id != Guid.Empty);
+        var viaAny = allLinks.Select(mt => mt.SeriesId).FirstOrDefault(id => id != Guid.Empty);
         if (viaAny != Guid.Empty)
-            return viaAny;
+            return (viaAny, false);
 
-        return CreateMapping().Id;
+        return (CreateSeries().Id, true);
     }
 
-    private MappingEntity CreateMapping()
+    private SeriesEntity CreateSeries()
     {
-        var created = new MappingEntity { Id = Guid.NewGuid() };
-        _db.Mappings.Add(created);
+        var created = new SeriesEntity { Id = Guid.NewGuid() };
+        _db.Series.Add(created);
         return created;
     }
 
-    /// <summary>Links every resolved title to the mapping, tombstoning stale links.</summary>
-    public async Task SyncMappingTitlesAsync(
-        Guid mappingId, IEnumerable<Guid> titleIds, CancellationToken token)
+    /// <summary>Links every resolved title to the series, tombstoning stale links.</summary>
+    public async Task SyncSeriesTitlesAsync(
+        Guid seriesId, IEnumerable<Guid> titleIds, CancellationToken token)
     {
         var desired = titleIds.Distinct().ToHashSet();
 
-        var existingRows = await _db.MappingTitles
-            .Where(mt => mt.MappingId == mappingId)
+        var existingRows = await _db.SeriesTitles
+            .Where(mt => mt.SeriesId == seriesId)
             .AsNoTracking()
             .ToListAsync(token).ConfigureAwait(false);
 
-        // Rows created earlier in this unit of work for the same mapping.
-        var trackedRows = _db.ChangeTracker.Entries<MappingTitleEntity>()
-            .Where(e => e.Entity.MappingId == mappingId)
+        // Rows created earlier in this unit of work for the same series.
+        var trackedRows = _db.ChangeTracker.Entries<SeriesTitleEntity>()
+            .Where(e => e.Entity.SeriesId == seriesId)
             .Select(e => e.Entity)
             .ToList();
 
-        // Titles already linked to this mapping, from either source.
-        var linkedTitleIds = existingRows.Select(mt => mt.TitleId).ToHashSet();
-        linkedTitleIds.UnionWith(trackedRows.Select(mt => mt.TitleId));
+        // Titles already ACTIVELY linked to this series (LIVE rows only). A tombstoned
+        // link (pending -1 or uploaded -3) must NOT count as linked, otherwise a title
+        // that was unlinked could never be re-linked.
+        var linkedTitleIds = existingRows
+            .Where(mt => ContributionVersions.IsLive(mt.Version))
+            .Select(mt => mt.TitleId).ToHashSet();
+        linkedTitleIds.UnionWith(trackedRows
+            .Where(mt => ContributionVersions.IsLive(mt.Version))
+            .Select(mt => mt.TitleId));
 
         foreach (var titleId in desired)
         {
-            if (!linkedTitleIds.Contains(titleId))
+            if (linkedTitleIds.Contains(titleId))
+                continue;
+
+            // Resurrect a tombstoned row for this (series, title) instead of inserting a
+            // duplicate that would violate the composite key.
+            var deleted = trackedRows.FirstOrDefault(e => e.TitleId == titleId)
+                ?? existingRows.FirstOrDefault(mt => mt.TitleId == titleId);
+            if (deleted != null)
             {
-                _db.MappingTitles.Add(new MappingTitleEntity
-                {
-                    MappingId = mappingId,
-                    TitleId = titleId,
-                    Version = VersionAddOrUpdate
-                });
+                _db.SeriesTitles.Attach(deleted);
+                deleted.Version = VersionAddOrUpdate;
+                _db.Entry(deleted).Property(mt => mt.Version).IsModified = true;
                 linkedTitleIds.Add(titleId);
+                continue;
             }
+
+            _db.SeriesTitles.Add(new SeriesTitleEntity
+            {
+                SeriesId = seriesId,
+                TitleId = titleId,
+                Version = VersionAddOrUpdate
+            });
+            linkedTitleIds.Add(titleId);
         }
 
-        // Tombstone persisted links that are no longer desired. Only persisted rows are
-        // touched: a row added in this unit of work is already correct.
+        // Retire persisted links that are no longer desired. Only persisted rows are touched: a
+        // row added in this unit of work is already correct. A row that exists in the cloud
+        // (Version -2) is TOMBSTONED so the delete propagates; a never-exported row (0) is
+        // DELETED locally (no cloud copy to inform). An already-tombstoned row (-1/-3) is left in
+        // place — its delete may still be pending export, and a queued delete must not be lost.
         foreach (var row in existingRows)
         {
-            if (desired.Contains(row.TitleId) || row.Version == VersionLogicalDelete)
+            if (desired.Contains(row.TitleId) || ContributionVersions.IsDeleted(row.Version))
                 continue;
 
             // The row may already be tracked: it was attached by an earlier
-            // SyncMappingTitlesAsync call for this same mapping in this unit of work, or
+            // SyncSeriesTitlesAsync call for this same series in this unit of work, or
             // added by the propagation path. Because the query above is AsNoTracking,
             // `row` is a fresh copy in that case, and attaching it would throw an
-            // identity conflict for the (MappingId, TitleId) key. Reuse the tracked
+            // identity conflict for the (SeriesId, TitleId) key. Reuse the tracked
             // instance instead.
-            var tracked = FindTracked<MappingTitleEntity>(
-                e => e.MappingId == row.MappingId && e.TitleId == row.TitleId);
+            var tracked = FindTracked<SeriesTitleEntity>(
+                e => e.SeriesId == row.SeriesId && e.TitleId == row.TitleId);
 
-            if (tracked != null)
-            {
-                if (tracked.Version != VersionLogicalDelete)
-                {
-                    tracked.Version = VersionLogicalDelete;
-                    _db.Entry(tracked).Property(mt => mt.Version).IsModified = true;
-                }
-                continue;
-            }
-
-            _db.MappingTitles.Attach(row);
-            row.Version = VersionLogicalDelete;
-            _db.Entry(row).Property(mt => mt.Version).IsModified = true;
+            ContributionRowLifecycle.Retire(_db, tracked ?? row);
         }
     }
 
@@ -228,7 +303,7 @@ public sealed class ContributionGraphWriter
     /// </summary>
     public async Task<Guid> EnsureSourceAsync(
         string package, long sourceId, string sourceName, string sourceLanguage,
-        DateTime? lastBatchUtc, CancellationToken token)
+        DateTime? lastBatchUtc, IReadOnlyList<string>? latestIds, CancellationToken token)
     {
         var id = ContributionSourceEntity.DeriveId(package, sourceId);
 
@@ -245,81 +320,160 @@ public sealed class ContributionGraphWriter
             {
                 Id = id,
                 Package = package,
+                PackageId = ContributionSourceEntity.DerivePackageId(package),
                 SourceId = sourceId,
                 SourceName = desiredName,
                 SourceLanguage = desiredLanguage,
                 LastBatchExecutionUTC = lastBatchUtc,
+                LatestIds = latestIds?.ToList() ?? [],
                 Version = VersionAddOrUpdate
             });
             return id;
         }
 
-        // The display fields and the batch cursor are all init-only, so an update is
-        // expressed by replacing the row. Because the key is unchanged, the replacement
-        // is still a single UPDATE on SaveChanges rather than an INSERT.
-        if (!string.Equals(row.SourceName, desiredName, StringComparison.Ordinal)
-            || !string.Equals(row.SourceLanguage, desiredLanguage, StringComparison.Ordinal)
-            || row.LastBatchExecutionUTC != lastBatchUtc)
-        {
-            _db.Sources.Remove(row);
-            _db.Sources.Add(new ContributionSourceEntity
-            {
-                Id = id,
-                Package = package,
-                SourceId = sourceId,
-                SourceName = desiredName,
-                SourceLanguage = desiredLanguage,
-                LastBatchExecutionUTC = lastBatchUtc,
-                Version = VersionAddOrUpdate
-            });
-        }
+        // Update IN PLACE. Do NOT Remove+Add: ContributionSeriesEntity cascades from Sources
+        // (OnDelete.Cascade), so marking the tracked source row Deleted would cascade-delete its
+        // SeriesEntries — which are tracked in the SAME scoped DbContext used for the whole sweep —
+        // wiping the very rows the sweep just wrote (the "sources: []" bug).
+        bool changed = false;
 
+        // Backfill PackageId for rows created before the (package-scoped) normalization.
+        if (row.PackageId == Guid.Empty)
+        {
+            row.PackageId = ContributionSourceEntity.DerivePackageId(row.Package);
+            _db.Entry(row).Property(x => x.PackageId).IsModified = true;
+            changed = true;
+        }
+        if (!string.Equals(row.SourceName, desiredName, StringComparison.Ordinal))
+        {
+            row.SourceName = desiredName;
+            _db.Entry(row).Property(x => x.SourceName).IsModified = true;
+            changed = true;
+        }
+        if (!string.Equals(row.SourceLanguage, desiredLanguage, StringComparison.Ordinal))
+        {
+            row.SourceLanguage = desiredLanguage;
+            _db.Entry(row).Property(x => x.SourceLanguage).IsModified = true;
+            changed = true;
+        }
+        if (row.LastBatchExecutionUTC != lastBatchUtc)
+        {
+            row.LastBatchExecutionUTC = lastBatchUtc;
+            _db.Entry(row).Property(x => x.LastBatchExecutionUTC).IsModified = true;
+            changed = true;
+        }
+        if (latestIds != null && !row.LatestIds.SequenceEqual(latestIds))
+        {
+            row.LatestIds = latestIds.ToList();
+            _db.Entry(row).Property(x => x.LatestIds).IsModified = true;
+            changed = true;
+        }
+        if (changed)
+        {
+            row.Version = VersionAddOrUpdate;
+            _db.Entry(row).Property(x => x.Version).IsModified = true;
+        }
         return id;
     }
 
-    /// <summary>
-    /// Upserts the (mapping, source, url) series record. Updates in place when the payload
-    /// changed or the row was tombstoned; inserts otherwise.
-    /// </summary>
-    public async Task UpsertSeriesRecordAsync(
-        Guid mappingId, Guid sourceEntityId, string package, long sourceNumericId, string url,
-        ContributionRecordV1 record, CancellationToken token)
+    /// <summary>Reads a source row (batch cursor + LatestIds) for the sweep heuristic. Null when absent.</summary>
+    public async Task<ContributionSourceEntity?> GetSourceAsync(string package, long sourceId, CancellationToken token)
     {
-        var id = ContributionSeriesEntity.DeriveId(package, sourceNumericId, url);
+        var id = ContributionSourceEntity.DeriveId(package, sourceId);
+        return await _db.Sources
+            .AsNoTracking()
+            .FirstOrDefaultAsync(s => s.Id == id, token).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Upserts the <c>(series, package, url)</c> series-entry record. Updates in place when the
+    /// payload changed or the row was tombstoned; inserts otherwise. Identity is
+    /// <c>package:url</c> (source-independent), so a second source of the same package exposing the
+    /// same url reuses this row and only adds a <c>SourceSeries</c> association.
+    ///
+    /// Returns <c>true</c> when a NEW row was inserted, <c>false</c> when an existing row was
+    /// updated (including a tombstoned row revived with a fresh payload — the row already existed).
+    /// The sweep uses this to distinguish genuinely NEW entries from rows it merely re-wrote, so
+    /// its logs do not report an already-covered series as "new" on every pass.
+    /// </summary>
+    public async Task<bool> UpsertSeriesRecordAsync(
+        Guid seriesId, Guid sourceEntityId, string package, string url,
+        ContributionRecordV2 record, CancellationToken token)
+    {
+        var id = ContributionSeriesEntity.DeriveId(package, url);
 
         // Check the tracker first: a series fetched on the Popular page and again on the
         // Latest page maps to the SAME id, so the second visit must update, not insert.
         var row = FindTracked<ContributionSeriesEntity>(e => e.Id == id);
-        row ??= await _db.Series
+        row ??= await _db.SeriesEntries
             .FirstOrDefaultAsync(s => s.Id == id, token).ConfigureAwait(false);
 
         if (row == null)
         {
-            _db.Series.Add(new ContributionSeriesEntity
+            _db.SeriesEntries.Add(new ContributionSeriesEntity
             {
                 Id = id,
-                MappingId = mappingId,
+                SeriesId = seriesId,
+                PackageId = ContributionSeriesEntity.DerivePackageId(package),
                 SourceId = sourceEntityId,
                 Data = record,
                 Version = VersionAddOrUpdate
             });
-            return;
+            await EnsureSourceSeriesAsync(sourceEntityId, id, token).ConfigureAwait(false);
+            return true;
         }
 
-        // Resurrect / update when tombstoned or when the payload actually changed.
+        // The row already exists; make sure this source is associated with it (many-to-many).
+        await EnsureSourceSeriesAsync(sourceEntityId, id, token).ConfigureAwait(false);
+
+        // Backfill PackageId / representative SourceId for rows created before the normalization.
+        if (row.PackageId == Guid.Empty)
+        {
+            row.PackageId = ContributionSeriesEntity.DerivePackageId(package);
+            _db.Entry(row).Property(s => s.PackageId).IsModified = true;
+        }
+        if (row.SourceId == Guid.Empty)
+        {
+            row.SourceId = sourceEntityId;
+            _db.Entry(row).Property(s => s.SourceId).IsModified = true;
+        }
+
+        // Resurrect / update when tombstoned or when the payload actually changed. The comparison
+        // IGNORES the routine LastUpdateUTC stamp: the sweep refreshes it on every re-visit, so a
+        // full-payload compare would mark every already-covered series Modified on every page (a
+        // rewrite storm whose cost grows with the sweep). A material change on any other field still
+        // writes; the fresh stamp is persisted with that write.
+        var nextStamp = record.LastUpdateUTC;
+        record.LastUpdateUTC = row.Data?.LastUpdateUTC;
         var currentJson = System.Text.Json.JsonSerializer.Serialize(row.Data);
         var nextJson = System.Text.Json.JsonSerializer.Serialize(record);
-        if (row.Version == VersionLogicalDelete || !string.Equals(currentJson, nextJson, StringComparison.Ordinal))
+        record.LastUpdateUTC = nextStamp;
+        if (ContributionVersions.IsDeleted(row.Version) || !string.Equals(currentJson, nextJson, StringComparison.Ordinal))
         {
             row.Data = record;
-            row.SourceId = sourceEntityId;
             row.Version = VersionAddOrUpdate;
             _db.Entry(row).Property(s => s.Data).IsModified = true;
-            _db.Entry(row).Property(s => s.SourceId).IsModified = true;
             _db.Entry(row).Property(s => s.Version).IsModified = true;
         }
+
+        // The row already existed (even if revived from a tombstone): this is an update, not an insert.
+        return false;
     }
 
     /// <summary>Persists all pending contribution changes.</summary>
     public Task SaveAsync(CancellationToken token) => _db.SaveChangesAsync(token);
+
+    /// <summary>
+    /// Suppresses automatic change detection for a batch unit of work (see
+    /// <see cref="ContributionDbContext.SuppressAutoDetectChanges"/>). The sweep issues many writes
+    /// per page against one scoped context; without this, every call scans the whole change tracker.
+    /// </summary>
+    public IDisposable SuppressAutoDetectChanges() => _db.SuppressAutoDetectChanges();
+
+    /// <summary>
+    /// Detaches every tracked entity. Call after a unit of work is fully persisted to bound the
+    /// identity map; otherwise the shared scoped context accumulates every row a long sweep touched
+    /// and each subsequent query/save scans a growing tracker.
+    /// </summary>
+    public void DetachAll() => _db.ChangeTracker.Clear();
 }

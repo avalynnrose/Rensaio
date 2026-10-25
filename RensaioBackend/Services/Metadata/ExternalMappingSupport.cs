@@ -22,6 +22,13 @@ namespace RensaioBackend.Services.Metadata;
 /// </summary>
 public sealed class ExternalMappingSupport
 {
+    /// <summary>
+    /// Hard ceiling for a single provider's OAuth/token step. Without this a hung token/refresh
+    /// endpoint (or a wedged SignalR/HTTP dependency) would block the whole sequential scan
+    /// forever with no log — exactly the 4-hour silent stall this guards against.
+    /// </summary>
+    private static readonly TimeSpan AuthTimeout = TimeSpan.FromSeconds(30);
+
     private readonly AppDbContext _db;
     private readonly ExternalSeriesProviderFactory _factory;
     private readonly ILogger<ExternalMappingSupport> _logger;
@@ -102,7 +109,16 @@ public sealed class ExternalMappingSupport
 
             try
             {
-                await provider.EnsureAuthenticatedAsync(config.UserId, token).ConfigureAwait(false);
+                // Bounded: never let a single provider's token refresh stall the whole scan.
+                await provider.EnsureAuthenticatedAsync(config.UserId, token)
+                    .WaitAsync(AuthTimeout, token)
+                    .ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                _logger.LogWarning(
+                    "Metadata: authentication for provider {Provider} exceeded {Seconds}s; continuing without it.",
+                    provider.ProviderType, AuthTimeout.TotalSeconds);
             }
             catch (Exception ex)
             {

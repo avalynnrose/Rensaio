@@ -125,19 +125,25 @@ namespace Mihon.ExtensionsBridge.Core.Services
         /// <summary>
         /// Returns a snapshot list of local extension repository groups.
         /// </summary>
-        /// <param name="token">Cancellation token to observe for early termination.</param>
+        /// <param name="includeTemporary">
+        /// When false (default) groups prepared from an online repository for a sweep
+        /// (<see cref="RepositoryGroup.Temporary"/>) are excluded, so callers see only the
+        /// installed set. When true the temporary groups are included as well.
+        /// </param>
         /// <returns>A task producing a copy of the current local repository groups.</returns>
         /// <remarks>
         /// The returned list is a new instance detached from internal state. Modifying it does not affect stored groups.
         /// </remarks>
-        public List<RepositoryGroup> ListExtensions()
+        public List<RepositoryGroup> ListExtensions(bool includeTemporary = false)
         {
             if (!_localInitialized)
                 throw new InvalidOperationException("Local extensions not initialized.");
             _localExtensionsLock.Wait();
             try
             {
-                return new List<RepositoryGroup>(LocalExtensions);
+                if (includeTemporary)
+                    return new List<RepositoryGroup>(LocalExtensions);
+                return LocalExtensions.Where(g => !g.Temporary).ToList();
             }
             finally
             {
@@ -307,7 +313,7 @@ namespace Mihon.ExtensionsBridge.Core.Services
             }
         }
         public RepositoryGroup? FindExtension(RepositoryGroup grp) => FindExtension(grp.Name);
-        public RepositoryGroup? FindExtension(string name)
+        public RepositoryGroup? FindExtension(string name, bool includeTemporary = false)
         {
             if (!_localInitialized)
                 throw new InvalidOperationException("Local extensions not initialized.");
@@ -316,6 +322,8 @@ namespace Mihon.ExtensionsBridge.Core.Services
             {
                 foreach (var g in LocalExtensions)
                 {
+                    if (g.Temporary && !includeTemporary)
+                        continue;
                     if (g.Name == name)
                         return g;
                 }
@@ -382,6 +390,189 @@ namespace Mihon.ExtensionsBridge.Core.Services
             return true;
         }
 
+        /// <summary>True when a local group with the given name is currently marked temporary.</summary>
+        private bool IsTemporaryGroup(string name)
+        {
+            _localExtensionsLock.Wait();
+            try
+            {
+                foreach (var g in LocalExtensions)
+                    if (g.Name == name)
+                        return g.Temporary;
+            }
+            finally
+            {
+                _localExtensionsLock.Release();
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Prepares the given package for use, whether or not it is installed. A group that is
+        /// already present (installed or temporary) is returned as-is; an online-only package is
+        /// downloaded, compiled and registered as a <see cref="RepositoryGroup.Temporary"/> group.
+        /// </summary>
+        public async Task<RepositoryGroup?> PrepareExtensionAsync(string package, bool force = false, CancellationToken token = default)
+        {
+            if (!_localInitialized)
+                throw new InvalidOperationException("Local extensions not initialized.");
+            if (string.IsNullOrWhiteSpace(package))
+                throw new ArgumentException("Package cannot be null or whitespace.", nameof(package));
+
+            // Already present (installed or temporary) — reuse as-is.
+            var existing = FindExtensionByNameOrPackage(package, includeTemporary: true);
+            if (existing != null && !force)
+                return existing;
+
+            var repositoryManager = ServiceProviderServiceExtensions.GetService<IInternalRepositoryManager>(_serviceProvider);
+            if (repositoryManager == null)
+                throw new InvalidOperationException("RepositoryManager service is not available.");
+
+            (TachiyomiRepository? repo, TachiyomiExtension? ext) = FindOnlineExtension(repositoryManager, package);
+            if (repo == null || ext == null)
+            {
+                _logger.LogWarning("PrepareExtension: package {Package} was not found among installed extensions or online repositories.", package);
+                return null;
+            }
+
+            bool temporary = existing == null;
+            return await AddExtensionAsync(repo, ext, force, temporary, token).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Promotes a temporary group to installed (Temporary=false) without re-downloading, since
+        /// the artifacts already exist. Returns the group, or null when the package is not present.
+        /// </summary>
+        public async Task<RepositoryGroup?> PromoteExtensionAsync(string package, CancellationToken token = default)
+        {
+            if (!_localInitialized)
+                throw new InvalidOperationException("Local extensions not initialized.");
+            var group = FindExtensionByNameOrPackage(package, includeTemporary: true);
+            if (group == null)
+                return null;
+            await _localExtensionsLock.WaitAsync(token).ConfigureAwait(false);
+            try
+            {
+                if (!group.Temporary)
+                    return group;
+                group.Temporary = false;
+                foreach (var e in group.Entries)
+                    e.Temporary = false;
+            }
+            finally
+            {
+                _localExtensionsLock.Release();
+            }
+            await _workingStructure.SaveLocalRepositoryGroupsAsync(LocalExtensions, token).ConfigureAwait(false);
+            _logger.LogInformation("Promoted temporary extension group {GroupName} to installed.", group.Name);
+            return group;
+        }
+
+        /// <summary>
+        /// Releases a temporary group prepared for a sweep: disposes its cached interop and removes
+        /// it. Installed (non-temporary) groups are never affected.
+        /// </summary>
+        public async Task<bool> ReleaseExtensionAsync(string package, CancellationToken token = default)
+        {
+            if (!_localInitialized)
+                throw new InvalidOperationException("Local extensions not initialized.");
+            var group = FindExtensionByNameOrPackage(package, includeTemporary: true);
+            if (group == null || !group.Temporary)
+                return false;
+
+            await _localExtensionsLock.WaitAsync(token).ConfigureAwait(false);
+            try
+            {
+                LocalExtensions.Remove(group);
+            }
+            finally
+            {
+                _localExtensionsLock.Release();
+            }
+
+            if (InteropCache.TryRemove(group, out var interop))
+            {
+                try { interop.Dispose(); } catch (Exception ex) { _logger.LogError(ex, "Error disposing interop while releasing {GroupName}.", group.Name); }
+            }
+
+            await _workingStructure.SaveLocalRepositoryGroupsAsync(LocalExtensions, token).ConfigureAwait(false);
+            _logger.LogInformation("Released temporary extension group {GroupName}.", group.Name);
+            return true;
+        }
+
+        /// <summary>Releases every temporary group (sweep teardown / startup reclamation).</summary>
+        public async Task<int> ReleaseAllTemporaryExtensionsAsync(CancellationToken token = default)
+        {
+            if (!_localInitialized)
+                throw new InvalidOperationException("Local extensions not initialized.");
+            List<RepositoryGroup> temporary;
+            await _localExtensionsLock.WaitAsync(token).ConfigureAwait(false);
+            try
+            {
+                temporary = LocalExtensions.Where(g => g.Temporary).ToList();
+                foreach (var g in temporary)
+                    LocalExtensions.Remove(g);
+            }
+            finally
+            {
+                _localExtensionsLock.Release();
+            }
+
+            foreach (var group in temporary)
+            {
+                if (InteropCache.TryRemove(group, out var interop))
+                {
+                    try { interop.Dispose(); } catch (Exception ex) { _logger.LogError(ex, "Error disposing interop while releasing {GroupName}.", group.Name); }
+                }
+            }
+
+            if (temporary.Count > 0)
+            {
+                await _workingStructure.SaveLocalRepositoryGroupsAsync(LocalExtensions, token).ConfigureAwait(false);
+                _logger.LogInformation("Released {Count} temporary extension group(s).", temporary.Count);
+            }
+            return temporary.Count;
+        }
+
+        /// <summary>
+        /// Finds a local group by its name or by any entry's package id.
+        /// Temporary groups are excluded unless <paramref name="includeTemporary"/> is true.
+        /// </summary>
+        private RepositoryGroup? FindExtensionByNameOrPackage(string nameOrPackage, bool includeTemporary = false)
+        {
+            _localExtensionsLock.Wait();
+            try
+            {
+                foreach (var g in LocalExtensions)
+                {
+                    if (g.Temporary && !includeTemporary)
+                        continue;
+                    if (string.Equals(g.Name, nameOrPackage, StringComparison.OrdinalIgnoreCase))
+                        return g;
+                    if (g.Entries.Any(e => string.Equals(e.Extension?.Package, nameOrPackage, StringComparison.OrdinalIgnoreCase)))
+                        return g;
+                }
+            }
+            finally
+            {
+                _localExtensionsLock.Release();
+            }
+            return null;
+        }
+
+        /// <summary>Finds the online repository/extension that owns the given package id.</summary>
+        private static (TachiyomiRepository?, TachiyomiExtension?) FindOnlineExtension(IInternalRepositoryManager repositoryManager, string package)
+        {
+            foreach (TachiyomiRepository repo in repositoryManager.ListOnlineRepositories())
+            {
+                var ext = repo.Extensions.FirstOrDefault(e =>
+                    string.Equals(e.Package, package, StringComparison.OrdinalIgnoreCase));
+                if (ext != null)
+                    return (repo, ext);
+            }
+            return (null, null);
+        }
+
         /// <summary>
         /// Compares online repositories against local active versions and auto-updates out-of-date extensions.
         /// </summary>
@@ -409,10 +600,13 @@ namespace Mihon.ExtensionsBridge.Core.Services
                             Version.TryParse(extension.Version, out var onlineParsed) &&
                             onlineParsed > localParsed)
                         {
-                            _logger.LogInformation("Auto-updating extension {Apk} from version {LocalVersion} to {OnlineVersion}.", extension.GetApkFilename(), localVersion, extension.Version);
+                            // A temporary (online-prepared) group always tracks the latest version,
+                            // keeping its Temporary flag; installed groups follow the normal path.
+                            bool temporary = IsTemporaryGroup(folderName);
+                            _logger.LogInformation("Auto-updating extension {Apk} from version {LocalVersion} to {OnlineVersion} (temporary={Temporary}).", extension.GetApkFilename(), localVersion, extension.Version, temporary);
                             try
                             {
-                                await AddExtensionAsync(repo, extension, false, token).ConfigureAwait(false);
+                                await AddExtensionAsync(repo, extension, false, temporary, token).ConfigureAwait(false);
                                 _logger.LogInformation("Successfully auto-updated extension {Apk} to version {Version}.", extension.GetApkFilename(), extension.Version);
                             }
                             catch (OperationCanceledException)
@@ -588,7 +782,7 @@ namespace Mihon.ExtensionsBridge.Core.Services
                 bool result = await CompileAsync(unitofWork, token).ConfigureAwait(false);
                 if (!result)
                     return null;
-                group = await UpdateEntriesAsync(group, entry, token).ConfigureAwait(false);
+                group = await UpdateEntriesAsync(group, entry, temporary: false, token).ConfigureAwait(false);
                 await _workingStructure.SaveLocalRepositoryGroupsAsync(LocalExtensions, token).ConfigureAwait(false);
                 _logger.LogInformation("Persisted local repository groups after adding/updating extension {Apk} version {Version}.", unitofWork.Entry.Extension.GetApkFilename(), unitofWork.Entry.Extension.Version);
                 return group;
@@ -671,7 +865,7 @@ namespace Mihon.ExtensionsBridge.Core.Services
             //    File.Move(srcpdbFile, destpdbFile, true);
 
         }
-        private async Task<RepositoryGroup> UpdateEntriesAsync(RepositoryGroup? group, RepositoryEntry entry, CancellationToken token = default)
+        private async Task<RepositoryGroup> UpdateEntriesAsync(RepositoryGroup? group, RepositoryEntry entry, bool temporary = false, CancellationToken token = default)
         {
             group = ResolveLocal(group);
             await _localExtensionsLock.WaitAsync(token).ConfigureAwait(false);
@@ -681,13 +875,28 @@ namespace Mihon.ExtensionsBridge.Core.Services
                 {
                     group = new RepositoryGroup();
                     group.Name = entry.Name;
+                    group.Temporary = temporary;
                     LocalExtensions.Add(group);
+                }
+                // A temporary group keeps only its newest version on disk; prune older local
+                // entries (and their version folders) once the new entry is registered, unless an
+                // installed group references the same folder.
+                if (group.Temporary)
+                {
+                    entry.Temporary = true;
+                    PruneOlderTemporaryEntries(group, entry);
+                }
+                else
+                {
+                    entry.Temporary = false;
                 }
                 RepositoryEntry? existingEntry = group.Entries.FirstOrDefault(e => e.Id == entry.Id);
                 if (existingEntry != null)
                     group.Entries.Remove(existingEntry);
                 group.Entries.Add(entry);
-                if (group.AutoUpdate)
+                // Temporary (online) groups always track the newest version, ignoring AutoUpdate
+                // and version pinning, which remain meaningful only for installed groups.
+                if (group.AutoUpdate || group.Temporary)
                 {
                     var lastEntry = group.Entries.OrderByDescending(e => e.Extension.VersionCode).First();
                     group.ActiveEntry = group.Entries.IndexOf(lastEntry);
@@ -697,6 +906,39 @@ namespace Mihon.ExtensionsBridge.Core.Services
             finally
             {
                 _localExtensionsLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// Removes older temporary versions of a group so only the newest version remains on
+        /// disk. Called under <see cref="_localExtensionsLock"/>. A version folder is deleted
+        /// only when no installed (non-temporary) entry references it.
+        /// </summary>
+        private void PruneOlderTemporaryEntries(RepositoryGroup group, RepositoryEntry keep)
+        {
+            var stale = group.Entries
+                .Where(e => !ReferenceEquals(e, keep) && e.Id != keep.Id)
+                .ToList();
+            if (stale.Count == 0)
+                return;
+            foreach (var old in stale)
+                group.Entries.Remove(old);
+            foreach (var old in stale)
+            {
+                try
+                {
+                    string folder = _workingStructure.GetExtensionVersionFolder(old);
+                    bool referencedByInstalled = LocalExtensions
+                        .Where(g => !g.Temporary)
+                        .SelectMany(g => g.Entries)
+                        .Any(e => string.Equals(_workingStructure.GetExtensionVersionFolder(e), folder, StringComparison.OrdinalIgnoreCase));
+                    if (!referencedByInstalled && Directory.Exists(folder))
+                        Directory.Delete(folder, recursive: true);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to prune older temporary version folder for {GroupName}.", group.Name);
+                }
             }
         }
         private async Task<ExtensionWorkUnit?> Dex2JarAsync(ExtensionWorkUnit unitofWork, CancellationToken token = default)
@@ -798,7 +1040,15 @@ namespace Mihon.ExtensionsBridge.Core.Services
         /// <item><description>Update local repository groups, set active version (respecting <c>DoNotAutoUpdate</c>), and persist.</description></item>
         /// </list>
         /// </remarks>
-        public async Task<RepositoryGroup?> AddExtensionAsync(TachiyomiRepository repository, TachiyomiExtension extension, bool force = false, CancellationToken token = default)
+        public Task<RepositoryGroup?> AddExtensionAsync(TachiyomiRepository repository, TachiyomiExtension extension, bool force = false, CancellationToken token = default)
+            => AddExtensionAsync(repository, extension, force, temporary: false, token);
+
+        /// <summary>
+        /// Adds or updates a local extension from the specified repository, optionally marking
+        /// the resulting group/entry as <see cref="RepositoryGroup.Temporary"/> (prepared from an
+        /// online repository for a sweep rather than installed).
+        /// </summary>
+        public async Task<RepositoryGroup?> AddExtensionAsync(TachiyomiRepository repository, TachiyomiExtension extension, bool force, bool temporary, CancellationToken token = default)
         {
             if (!_localInitialized)
                 throw new InvalidOperationException("Local extensions not initialized.");
@@ -807,7 +1057,7 @@ namespace Mihon.ExtensionsBridge.Core.Services
             if (extension == null) throw new ArgumentNullException(nameof(extension));
             try
             {
-                (RepositoryGroup? group, RepositoryEntry? entry) = await FindRepositoryEntryFromExtensionAsync(extension, token).ConfigureAwait(false);
+                (RepositoryGroup? group, RepositoryEntry? entry) = await FindRepositoryEntryFromExtensionAsync(extension, token, includeTemporary: true).ConfigureAwait(false);
                 if (entry != null && !force)
                 {
                     _logger.LogInformation("Extension {Apk} version {Version} already present; skipping (force={Force}).", extension.GetApkFilename(), extension.Version, force);
@@ -818,7 +1068,8 @@ namespace Mihon.ExtensionsBridge.Core.Services
                     Name = extension.GetName(),
                     Extension = extension,
                     RepositoryId = repository.Id,
-                    IsLocal = false
+                    IsLocal = false,
+                    Temporary = temporary
                 };
                 unitofWork = new ExtensionWorkUnit();
                 unitofWork.Entry = entry;
@@ -833,7 +1084,7 @@ namespace Mihon.ExtensionsBridge.Core.Services
                 bool worked = await CompileAsync(unitofWork, token). ConfigureAwait(false);
                 if (!worked)
                     return null;
-                group = await UpdateEntriesAsync(group, entry, token). ConfigureAwait(false);
+                group = await UpdateEntriesAsync(group, entry, temporary, token). ConfigureAwait(false);
                 await _workingStructure.SaveLocalRepositoryGroupsAsync(LocalExtensions, token). ConfigureAwait(false);
                 _logger.LogInformation("Persisted local repository groups after adding/updating extension {Apk} version {Version}.", extension.GetApkFilename(), extension.Version);
                 return group;
@@ -902,7 +1153,7 @@ namespace Mihon.ExtensionsBridge.Core.Services
         /// <remarks>
         /// An entry is considered valid only if its APK, JAR, icon, and compiled DLL files exist under the configured extensions folder.
         /// </remarks>
-        private async Task<(RepositoryGroup?, RepositoryEntry?)> FindRepositoryEntryFromExtensionAsync(TachiyomiExtension extension, CancellationToken token = default)
+        private async Task<(RepositoryGroup?, RepositoryEntry?)> FindRepositoryEntryFromExtensionAsync(TachiyomiExtension extension, CancellationToken token = default, bool includeTemporary = false)
         {
             RepositoryGroup? foundGroup = null;
             string name = extension.GetName();
@@ -913,6 +1164,8 @@ namespace Mihon.ExtensionsBridge.Core.Services
                 {
                     foreach (RepositoryGroup rg in LocalExtensions)
                     {
+                        if (rg.Temporary && !includeTemporary)
+                            continue;
                         if (rg.Name == name)
                             foundGroup = rg;
                         foreach (RepositoryEntry entry in rg.Entries)

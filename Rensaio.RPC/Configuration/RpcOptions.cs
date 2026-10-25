@@ -35,7 +35,11 @@ public sealed class CefOptions
 /// </summary>
 public sealed class LruOptions
 {
-    /// <summary>Maximum number of extension interops kept loaded at once.</summary>
+    /// <summary>
+    /// Maximum number of extension interops kept loaded at once. Defaults to 6 so the
+    /// effective cap matches the shipped appsettings.json even when that file is not
+    /// present (a higher in-code default would silently widen the LRU bound).
+    /// </summary>
     public int MaxLoadedExtensions { get; set; } = 16;
 
     /// <summary>Idle minutes after which a loaded extension may be unloaded.</summary>

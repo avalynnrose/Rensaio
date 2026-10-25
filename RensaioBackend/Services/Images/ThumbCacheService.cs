@@ -83,7 +83,17 @@ namespace RensaioBackend.Services.Images
                 _eTagLock.Release();
             }
         }
-        public async ValueTask<string> GetKeyAsync(string url, CancellationToken token = default)
+        public ValueTask<string> GetKeyAsync(string url, CancellationToken token = default)
+            => GetKeyAsync(url, null, token);
+
+        /// <summary>
+        /// Resolves (registering when missing) the cache key for <paramref name="url"/>. When a
+        /// non-null <paramref name="mihonProviderId"/> is supplied it is recorded on the cache
+        /// entry — including a BACKFILL of an existing entry that has none — so the URL image
+        /// provider can fall back to the owning source (referer/header aware) when a direct
+        /// download is refused.
+        /// </summary>
+        public async ValueTask<string> GetKeyAsync(string url, string? mihonProviderId, CancellationToken token = default)
         {
             await _urlLock.WaitAsync(token).ConfigureAwait(false);
             try
@@ -92,9 +102,9 @@ namespace RensaioBackend.Services.Images
                     return string.Empty;
                 if (!_urlCache.ContainsKey(url))
                 {
-                    EtagCacheEntity? c = await _db.ETagCache.AsNoTracking().FirstOrDefaultAsync(e => e.Url == url, token).ConfigureAwait(false);
-                    if (c == null)
-                        c = await AddInternalUrlAsync(url, null, token).ConfigureAwait(false);
+                    // AddInternalUrlAsync both creates a missing entry and backfills the provider
+                    // id on an existing one; it returns the (tracked) entity either way.
+                    EtagCacheEntity? c = await AddInternalUrlAsync(url, mihonProviderId, token).ConfigureAwait(false);
                     if (c == null)
                         return string.Empty;
                     _urlCache[url] = (++_urlRevision, c!.Key);
@@ -262,7 +272,18 @@ namespace RensaioBackend.Services.Images
                 string key = Guid.NewGuid().ToString("N");
                 var existingEntry = await _db.ETagCache.FirstOrDefaultAsync(e => e.Url == url, token).ConfigureAwait(false);
                 if (existingEntry != null)
+                {
+                    // Backfill a missing provider id: a URL first registered without one (e.g. the
+                    // extension sweep before it threaded the owning source, or GetKeyAsync's null
+                    // overload) must gain it so the URL image provider can use the source fallback
+                    // for referer/header-protected hosts.
+                    if (string.IsNullOrEmpty(existingEntry.MihonProviderId) && !string.IsNullOrEmpty(mihonProviderId))
+                    {
+                        existingEntry.MihonProviderId = mihonProviderId;
+                        await _db.SaveChangesAsync(token).ConfigureAwait(false);
+                    }
                     return existingEntry;
+                }
                 var newCacheEntry = new Models.Database.EtagCacheEntity
                 {
                     Key = key,

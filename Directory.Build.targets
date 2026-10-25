@@ -16,13 +16,10 @@
   -->
   <PropertyGroup>
     <RpcIsolationConsumer Condition="'$(MSBuildProjectName)' == 'RensaioBackend' or '$(MSBuildProjectName)' == 'RensaioTray'">true</RpcIsolationConsumer>
-    <!-- Headless RPC (Docker/Linux fallback). -->
+    <!-- The single RPC child host, shared by Docker and the desktop tray. -->
     <RpcProjectPath>$(MSBuildThisFileDirectory)Rensaio.RPC\Rensaio.RPC.csproj</RpcProjectPath>
-    <!-- Desktop RPC (Avalonia-hosted; the preferred child on Windows). -->
-    <DesktopRpcProjectPath>$(MSBuildThisFileDirectory)Rensaio.DesktopRPC\Rensaio.DesktopRPC.csproj</DesktopRpcProjectPath>
-    <!-- Both RPC hosts target net8.0; these are their deterministic build output dirs. -->
+    <!-- Rensaio.RPC targets net8.0; this is its deterministic build output dir. -->
     <RpcOutputDir>$(MSBuildThisFileDirectory)Rensaio.RPC\bin\$(Configuration)\net8.0</RpcOutputDir>
-    <DesktopRpcOutputDir>$(MSBuildThisFileDirectory)Rensaio.DesktopRPC\bin\$(Configuration)\net8.0</DesktopRpcOutputDir>
   </PropertyGroup>
 
   <Target Name="BuildAndCopyRpcProcess"
@@ -42,21 +39,8 @@
              BuildInParallel="false"
              ContinueOnError="WarnAndContinue" />
 
-    <!-- Build the Avalonia desktop RPC too (Windows preference). WarnAndContinue so a
-         non-Windows/dev box without the Avalonia workload still produces the headless RPC. -->
-    <MSBuild Projects="$(DesktopRpcProjectPath)"
-             Targets="Build"
-             Properties="Configuration=$(Configuration)"
-             BuildInParallel="false"
-             ContinueOnError="WarnAndContinue"
-             Condition="'$(OS)' == 'Windows_NT' and Exists('$(DesktopRpcProjectPath)')" />
-
     <ItemGroup>
       <_RpcProcessFiles Include="$(RpcOutputDir)\**\*.*" />
-      <!-- Desktop RPC files are copied into the SAME rpc folder; distinct file names,
-           so the two hosts coexist and the supervisor picks by name/OS. -->
-      <_RpcProcessFiles Include="$(DesktopRpcOutputDir)\**\*.*"
-                        Condition="'$(OS)' == 'Windows_NT' and Exists('$(DesktopRpcOutputDir)')" />
     </ItemGroup>
 
     <!--

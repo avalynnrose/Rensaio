@@ -12,13 +12,16 @@ namespace RensaioBackend.Services.Contributions;
 /// <summary>
 /// Uploads the local contribution database's pending changes (Version 0 = add/update,
 /// -1 = delete) to the Cloudflare contribution worker (/upload), then marks them
-/// uploaded by setting Version = -2.
+/// uploaded: 0 → -2 (Uploaded), -1 → -3 (UploadedDelete). The two uploaded variants
+/// behave exactly like their pending counterparts — they only mean "already exported".
+/// See <see cref="ContributionVersions"/>.
 /// </summary>
 public class ContributionUploadService
 {
-    private const int VersionAddOrUpdate = 0;
-    private const int VersionLogicalDelete = -1;
-    private const int VersionUploaded = -2;
+    private const int VersionAddOrUpdate = ContributionVersions.AddOrUpdate;
+    private const int VersionLogicalDelete = ContributionVersions.PendingDelete;
+    private const int VersionUploaded = ContributionVersions.Uploaded;
+    private const int VersionUploadedDelete = ContributionVersions.UploadedDelete;
 
     private readonly ContributionDbContext _contributorDb;
     private readonly SettingsService _settingsService;
@@ -52,6 +55,14 @@ public class ContributionUploadService
     /// <summary>
     /// Builds a ContributionSnapshotV1 from all rows with Version 0 or -1, POSTs it to
     /// the worker, and on success flips those rows to Version -2 (Uploaded).
+    ///
+    /// The snapshot is sent in MULTIPLE bounded requests (see <see cref="BuildBatches"/>).
+    /// A single /upload carrying the whole dataset makes one Worker invocation run every
+    /// row's D1 statement (≈5 per series), which exceeds the Cloudflare Worker CPU/time
+    /// limit for large exports. Each batch is a self-contained snapshot slice whose rows
+    /// are internally consistent (a mapping's titles never straddle two batches), so the
+    /// worker's per-request mapping-id resolution and single-ownership rules stay correct.
+    ///
     /// When <paramref name="force"/> is set, ALL local rows (including already-uploaded
     /// Version -2) are included — used after a cloud wipe to re-upload the full dataset.
     /// </summary>
@@ -81,16 +92,17 @@ public class ContributionUploadService
         }
 
         // Load pending rows (Version 0 = add/update, -1 = delete). With force,
-        // include already-uploaded (Version -2) rows so a cloud wipe is repopulated.
+        // include already-uploaded rows (-2 live, -3 uploaded delete) so a cloud wipe
+        // is repopulated with the full dataset.
         var pendingVersions = force
-            ? new[] { VersionAddOrUpdate, VersionLogicalDelete, VersionUploaded }
+            ? new[] { VersionAddOrUpdate, VersionLogicalDelete, VersionUploaded, VersionUploadedDelete }
             : new[] { VersionAddOrUpdate, VersionLogicalDelete };
 
         var titles = await _contributorDb.Titles
             .Where(t => pendingVersions.Contains(t.Version))
             .AsNoTracking()
             .ToListAsync(token).ConfigureAwait(false);
-        var mappingTitles = await _contributorDb.MappingTitles
+        var mappingTitles = await _contributorDb.SeriesTitles
             .Where(mt => pendingVersions.Contains(mt.Version))
             .AsNoTracking()
             .ToListAsync(token).ConfigureAwait(false);
@@ -98,7 +110,7 @@ public class ContributionUploadService
             .Where(s => pendingVersions.Contains(s.Version))
             .AsNoTracking()
             .ToListAsync(token).ConfigureAwait(false);
-        var series = await _contributorDb.Series
+        var series = await _contributorDb.SeriesEntries
             .Where(s => pendingVersions.Contains(s.Version))
             .AsNoTracking()
             .ToListAsync(token).ConfigureAwait(false);
@@ -106,38 +118,28 @@ public class ContributionUploadService
             .Where(m => pendingVersions.Contains(m.Version))
             .AsNoTracking()
             .ToListAsync(token).ConfigureAwait(false);
+        var sourceSeries = await _contributorDb.SourceSeries
+            .Where(ss => pendingVersions.Contains(ss.Version))
+            .AsNoTracking()
+            .ToListAsync(token).ConfigureAwait(false);
 
         int total =
             titles.Count + mappingTitles.Count + sources.Count +
-            series.Count + metadata.Count;
+            series.Count + metadata.Count + sourceSeries.Count;
 
         if (total == 0)
         {
             return ContributionUploadResult.Succeeded(0, 0, 0, 0, 0, 0, 0);
         }
 
-        // Force re-upload: rows already marked Uploaded (Version -2) must NOT be
-        // serialized as v:-2 — the worker's validateRow only accepts 0 (upsert)
-        // or -1 (delete). Normalize them to 0 (add/update) so the full dataset is
-        // re-sent as upserts. Genuine tombstones (-1) are preserved as deletes.
+        // Force re-upload: rows already marked Uploaded (-2 live, -3 uploaded delete)
+        // must NOT be serialized as v:-2/-3 — the worker's validateRow only accepts 0
+        // (upsert) or -1 (delete). Normalize -2 → 0 and -3 → -1 so the full dataset is
+        // re-sent using only the two wire versions the worker understands.
         if (force)
         {
-            NormalizeVersionToUpsert(titles, mappingTitles, sources, series, metadata);
+            NormalizeVersionsForWire(titles, mappingTitles, sources, series, metadata, sourceSeries);
         }
-
-        // Build the snapshot payload using the 1-letter JSON field names the worker expects.
-        var snapshot = new ContributionSnapshotV1
-        {
-            SchemaVersion = ContributionSnapshotV1.CurrentSchemaVersion,
-            GeneratedUtc = DateTime.UtcNow,
-            // The snapshot's top-level Version is informational; the worker merges blindly.
-            Version = 0,
-            Titles = titles,
-            Mappings = mappingTitles,
-            Sources = sources,
-            Series = series,
-            Metadata = metadata,
-        };
 
         var options = new JsonSerializerOptions(JsonSerializerDefaults.Web)
         {
@@ -147,55 +149,228 @@ public class ContributionUploadService
         string endpoint = settings.ContributionServerUrl.TrimEnd('/') +
             "/upload?contributor=" + Uri.EscapeDataString(settings.ContributionContributorId);
 
+        List<UploadBatch> batches = BuildBatches(titles, mappingTitles, sources, series, metadata, sourceSeries);
+        _logger.LogInformation(
+            "Contribution upload: {Total} rows split into {Batches} request(s) to stay under the worker CPU limit.",
+            total, batches.Count);
+
+        var failedLists = new HashSet<string>(StringComparer.Ordinal);
+        var errorMessages = new List<string>();
+        int processedTotal = 0;
+
         using var client = _httpClientFactory.CreateClient("ContributionUpload");
         try
         {
-            using var response = await client.PostAsJsonAsync(endpoint, snapshot, options, token).ConfigureAwait(false);
-
-            if (!response.IsSuccessStatusCode)
+            foreach (UploadBatch batch in batches)
             {
-                string body = await response.Content.ReadAsStringAsync(token).ConfigureAwait(false);
-                return ContributionUploadResult.Failed(
-                    $"Contribution worker rejected upload ({response.StatusCode}): {Truncate(body, 500)}");
+                // Same 1-letter JSON field names the worker expects; the top-level Version is
+                // informational (the worker merges blindly).
+                var snapshot = new ContributionSnapshotV1
+                {
+                    SchemaVersion = ContributionSnapshotV1.CurrentSchemaVersion,
+                    GeneratedUtc = DateTime.UtcNow,
+                    Version = 0,
+                    Titles = batch.Titles,
+                    Mappings = batch.Mappings,
+                    Sources = batch.Sources,
+                    Series = batch.Series,
+                    Metadata = batch.Metadata,
+                    SourceSeries = batch.SourceSeries,
+                };
+
+                using var response = await client.PostAsJsonAsync(endpoint, snapshot, options, token).ConfigureAwait(false);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    string body = await response.Content.ReadAsStringAsync(token).ConfigureAwait(false);
+                    return ContributionUploadResult.Failed(
+                        $"Contribution worker rejected upload ({response.StatusCode}): {Truncate(body, 500)}");
+                }
+
+                // Parse the worker's JSON response. `errors` contains per-row failures
+                // (entity list + index); a subset may still have been persisted.
+                string responseBody = await response.Content.ReadAsStringAsync(token).ConfigureAwait(false);
+                var workerResponse = DeserializeWorkerResponse(responseBody);
+                processedTotal += workerResponse?.Processed ?? batch.Total;
+
+                if (workerResponse?.Errors is { Count: > 0 })
+                {
+                    foreach (var error in workerResponse.Errors)
+                        failedLists.Add(error.List);
+                    errorMessages.AddRange(workerResponse.Errors.Select(e => e.ToString()));
+                }
             }
-
-            // Parse the worker's JSON response. `errors` contains per-row failures
-            // (entity list + index). Only mark rows uploaded when they truly landed.
-            string responseBody = await response.Content.ReadAsStringAsync(token).ConfigureAwait(false);
-            var workerResponse = DeserializeWorkerResponse(responseBody);
-            int processed = workerResponse?.Processed ?? titles.Count;
-
-            if (workerResponse?.Errors is { Count: > 0 })
-            {
-                var errorDetails = string.Join("; ", workerResponse.Errors.Take(50).Select(e => e.ToString()));
-                _logger.LogWarning(
-                    "Contribution worker reported {ErrorCount} per-row errors: {Errors}",
-                    workerResponse.Errors.Count,
-                    errorDetails);
-                // The worker may still have persisted a subset. Don't blind-mark;
-                // mark uploaded only for lists with zero errors so the failed rows
-                // remain pending for a retry.
-                var failedLists = workerResponse.Errors.Select(e => e.List).ToHashSet();
-                await MarkUploadedForListsAsync(failedLists, token).ConfigureAwait(false);
-
-                return ContributionUploadResult.Succeeded(
-                    titles.Count, mappingTitles.Count, sources.Count,
-                    series.Count, metadata.Count, total, processed, errorDetails);
-            }
-
-            // No per-row errors → everything landed.
-            await MarkUploadedAsync(token).ConfigureAwait(false);
-
-            return ContributionUploadResult.Succeeded(
-                titles.Count, mappingTitles.Count, sources.Count,
-                series.Count, metadata.Count, total, processed);
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
         {
-            _logger.LogError(ex, "Contribution upload HTTP failure");
+            _logger.LogError(ex, "Contribution upload HTTP failure after {Processed} rows", processedTotal);
             return ContributionUploadResult.Failed(
                 $"Failed to reach contribution worker: {ex.Message}");
         }
+
+        // Mark uploaded ONCE, after every request returned HTTP 200. Rows whose list reported
+        // per-row errors stay pending so a retry re-sends just them; everything else is done.
+        string? workerErrors = errorMessages.Count > 0
+            ? string.Join("; ", errorMessages.Distinct().Take(50))
+            : null;
+
+        if (failedLists.Count > 0)
+        {
+            _logger.LogWarning(
+                "Contribution worker reported {ErrorCount} per-row errors across {Batches} request(s): {Errors}",
+                errorMessages.Count, batches.Count, workerErrors);
+            await MarkUploadedForListsAsync(failedLists, token).ConfigureAwait(false);
+        }
+        else
+        {
+            await MarkUploadedAsync(token).ConfigureAwait(false);
+        }
+
+        return ContributionUploadResult.Succeeded(
+            titles.Count, mappingTitles.Count, sources.Count,
+            series.Count, metadata.Count, total, processedTotal, workerErrors);
+    }
+
+    /// <summary>
+    /// Max rows per /upload request. Keeps each Worker invocation's D1 statement count
+    /// (≈1 per row; a mapping row costs a couple more) well under the Cloudflare CPU/time
+    /// budget. Batches are grouped by mapping, so this tracks series rather than raw rows.
+    /// </summary>
+    private const int RowsPerUploadBatch = 2000;
+
+    /// <summary>
+    /// One self-contained ContributionSnapshotV1 slice. Every id set is internally consistent:
+    /// a mapping's titles + series records always travel together, so the worker can resolve
+    /// mapping ids and enforce single-title-ownership within each request.
+    /// </summary>
+    private sealed class UploadBatch
+    {
+        public List<TitleEntity> Titles { get; } = [];
+        public List<SeriesTitleEntity> Mappings { get; } = [];
+        public List<ContributionSourceEntity> Sources { get; } = [];
+        public List<ContributionSeriesEntity> Series { get; } = [];
+        public List<ContributionMetadataEntity> Metadata { get; } = [];
+        public List<ContributionSourceSeriesEntity> SourceSeries { get; } = [];
+
+        public int Total =>
+            Titles.Count + Mappings.Count + Sources.Count + Series.Count + Metadata.Count + SourceSeries.Count;
+    }
+
+    /// <summary>
+    /// Splits the upload into bounded, self-contained batches grouped by mapping so a mapping's
+    /// titles/series never straddle two requests (keeping the worker's mapping-id resolution and
+    /// single-ownership rules correct). The shared source registry is included in every batch
+    /// (idempotent upsert); orphan titles and all metadata rows go to the last batch.
+    /// </summary>
+    private static List<UploadBatch> BuildBatches(
+        List<TitleEntity> titles,
+        List<SeriesTitleEntity> mappingTitles,
+        List<ContributionSourceEntity> sources,
+        List<ContributionSeriesEntity> series,
+        List<ContributionMetadataEntity> metadata,
+        List<ContributionSourceSeriesEntity> sourceSeries)
+    {
+        var titlesById = titles.ToDictionary(t => t.Id);
+
+        // Combine mapping-titles and series rows that share a mapping id into one unit, so a
+        // mapping (its title links + its series records) is never split across batches.
+        var seriesByMapping = series.GroupBy(s => s.SeriesId)
+            .ToDictionary(g => g.Key, g => g.ToList());
+        var mappingTitlesByMapping = mappingTitles.GroupBy(mt => mt.SeriesId)
+            .ToDictionary(g => g.Key, g => g.ToList());
+
+        var units = new List<(Guid MappingId, int Weight)>();
+        foreach (var mappingId in seriesByMapping.Keys.Concat(mappingTitlesByMapping.Keys).Distinct())
+        {
+            int weight = (seriesByMapping.TryGetValue(mappingId, out var s) ? s.Count : 0)
+                + (mappingTitlesByMapping.TryGetValue(mappingId, out var mt) ? mt.Count : 0);
+            units.Add((mappingId, Math.Max(weight, 1)));
+        }
+
+        // Deterministic order so retries/resends are stable and batches are reproducible.
+        units.Sort((a, b) => a.MappingId.CompareTo(b.MappingId));
+
+        var batches = new List<UploadBatch>();
+        var current = new UploadBatch();
+        var emittedTitleIds = new HashSet<Guid>();
+
+        foreach (var unit in units)
+        {
+            if (current.Total > 0 && current.Total + unit.Weight > RowsPerUploadBatch)
+            {
+                batches.Add(current);
+                current = new UploadBatch();
+            }
+
+            if (mappingTitlesByMapping.TryGetValue(unit.MappingId, out var mts))
+            {
+                foreach (var mt in mts)
+                {
+                    current.Mappings.Add(mt);
+                    // Emit the referenced title in the SAME batch so the worker's per-request
+                    // FK/upsert ordering (t → m → i → d) is satisfied.
+                    if (titlesById.TryGetValue(mt.TitleId, out var title) && emittedTitleIds.Add(title.Id))
+                        current.Titles.Add(title);
+                }
+            }
+
+            if (seriesByMapping.TryGetValue(unit.MappingId, out var srs))
+                current.Series.AddRange(srs);
+        }
+
+        if (current.Total > 0)
+            batches.Add(current);
+
+        // Orphan titles (not referenced by any mapping row) and every metadata row go to the
+        // last batch — metadata carries its own mapping reference via ensureMapping.
+        var last = batches.Count > 0 ? batches[^1] : null;
+        foreach (var title in titles)
+        {
+            if (emittedTitleIds.Add(title.Id))
+            {
+                if (last == null)
+                {
+                    last = new UploadBatch();
+                    batches.Add(last);
+                }
+                last.Titles.Add(title);
+            }
+        }
+
+        if (metadata.Count > 0)
+        {
+            if (last == null)
+            {
+                last = new UploadBatch();
+                batches.Add(last);
+            }
+            last.Metadata.AddRange(metadata);
+        }
+
+        if (batches.Count == 0)
+            batches.Add(new UploadBatch());
+
+        // Sources are a small shared registry — include every one in every batch (idempotent
+        // upsert) so no series in any batch references a source the worker hasn't seen yet.
+        if (sources.Count > 0)
+        {
+            foreach (var batch in batches)
+                batch.Sources.AddRange(sources);
+        }
+
+        // Association rows go to the last batch (idempotent upsert; a delete needs no order).
+        if (sourceSeries.Count > 0)
+        {
+            var la = batches.Count > 0 ? batches[^1] : null;
+            if (la == null)
+            {
+                la = new UploadBatch();
+                batches.Add(la);
+            }
+            la.SourceSeries.AddRange(sourceSeries);
+        }
+
+        return batches;
     }
 
     /// <summary>
@@ -211,16 +386,19 @@ public class ContributionUploadService
             _contributorDb.Titles.Where(t => t.Version == VersionAddOrUpdate || t.Version == VersionLogicalDelete),
             token).ConfigureAwait(false);
         updated += await ExecuteVersionBumpAsync(
-            _contributorDb.MappingTitles.Where(mt => mt.Version == VersionAddOrUpdate || mt.Version == VersionLogicalDelete),
+            _contributorDb.SeriesTitles.Where(mt => mt.Version == VersionAddOrUpdate || mt.Version == VersionLogicalDelete),
             token).ConfigureAwait(false);
         updated += await ExecuteVersionBumpAsync(
             _contributorDb.Sources.Where(s => s.Version == VersionAddOrUpdate || s.Version == VersionLogicalDelete),
             token).ConfigureAwait(false);
         updated += await ExecuteVersionBumpAsync(
-            _contributorDb.Series.Where(s => s.Version == VersionAddOrUpdate || s.Version == VersionLogicalDelete),
+            _contributorDb.SeriesEntries.Where(s => s.Version == VersionAddOrUpdate || s.Version == VersionLogicalDelete),
             token).ConfigureAwait(false);
         updated += await ExecuteVersionBumpAsync(
             _contributorDb.Metadata.Where(m => m.Version == VersionAddOrUpdate || m.Version == VersionLogicalDelete),
+            token).ConfigureAwait(false);
+        updated += await ExecuteVersionBumpAsync(
+            _contributorDb.SourceSeries.Where(ss => ss.Version == VersionAddOrUpdate || ss.Version == VersionLogicalDelete),
             token).ConfigureAwait(false);
 
         if (updated > 0)
@@ -236,7 +414,11 @@ public class ContributionUploadService
         foreach (T row in rows)
         {
             var versionProp = typeof(T).GetProperty(nameof(ContributionSourceEntity.Version));
-            versionProp?.SetValue(row, VersionUploaded);
+            // Pending add/update (0) → -2 (Uploaded); pending delete (-1) → -3 (UploadedDelete).
+            // The two tombstones are DISTINCT: a delete that is flipped to -2 would look LIVE
+            // again (see ContributionVersions.IsLive), resurrecting a removed row on the page.
+            var current = (int?)versionProp?.GetValue(row) ?? ContributionVersions.Uploaded;
+            versionProp?.SetValue(row, ContributionVersions.ToUploaded(current));
         }
 
         // Attach may be needed if AsNoTracking state was used; rows from a tracked query are fine.
@@ -267,7 +449,7 @@ public class ContributionUploadService
         if (!skip("m"))
         {
             updated += await ExecuteVersionBumpAsync(
-                _contributorDb.MappingTitles.Where(mt => mt.Version == VersionAddOrUpdate || mt.Version == VersionLogicalDelete),
+                _contributorDb.SeriesTitles.Where(mt => mt.Version == VersionAddOrUpdate || mt.Version == VersionLogicalDelete),
                 token).ConfigureAwait(false);
         }
         if (!skip("s"))
@@ -279,13 +461,19 @@ public class ContributionUploadService
         if (!skip("i"))
         {
             updated += await ExecuteVersionBumpAsync(
-                _contributorDb.Series.Where(s => s.Version == VersionAddOrUpdate || s.Version == VersionLogicalDelete),
+                _contributorDb.SeriesEntries.Where(s => s.Version == VersionAddOrUpdate || s.Version == VersionLogicalDelete),
                 token).ConfigureAwait(false);
         }
         if (!skip("d"))
         {
             updated += await ExecuteVersionBumpAsync(
                 _contributorDb.Metadata.Where(m => m.Version == VersionAddOrUpdate || m.Version == VersionLogicalDelete),
+                token).ConfigureAwait(false);
+        }
+        if (!skip("x"))
+        {
+            updated += await ExecuteVersionBumpAsync(
+                _contributorDb.SourceSeries.Where(ss => ss.Version == VersionAddOrUpdate || ss.Version == VersionLogicalDelete),
                 token).ConfigureAwait(false);
         }
 
@@ -309,27 +497,31 @@ public class ContributionUploadService
     }
 
     /// <summary>
-    /// Force-reupload helper: any row already marked Uploaded (Version -2) is
-    /// treated as an add/update (0) on the wire. Tombstones (-1) are preserved.
+    /// Force-reupload helper: maps the uploaded variants back to the two wire versions the
+    /// worker accepts — Uploaded (-2) → AddOrUpdate (0), UploadedDelete (-3) → delete (-1).
     /// Executed on detached/AsNoTracking lists, so no EF state is disturbed.
     /// </summary>
-    private static void NormalizeVersionToUpsert(
+    private static void NormalizeVersionsForWire(
         List<TitleEntity> titles,
-        List<MappingTitleEntity> mappingTitles,
+        List<SeriesTitleEntity> mappingTitles,
         List<ContributionSourceEntity> sources,
         List<ContributionSeriesEntity> series,
-        List<ContributionMetadataEntity> metadata)
+        List<ContributionMetadataEntity> metadata,
+        List<ContributionSourceSeriesEntity> sourceSeries)
     {
-        foreach (var t in titles)
-            if (t.Version == VersionUploaded) t.Version = VersionAddOrUpdate;
-        foreach (var mt in mappingTitles)
-            if (mt.Version == VersionUploaded) mt.Version = VersionAddOrUpdate;
-        foreach (var s in sources)
-            if (s.Version == VersionUploaded) s.Version = VersionAddOrUpdate;
-        foreach (var s in series)
-            if (s.Version == VersionUploaded) s.Version = VersionAddOrUpdate;
-        foreach (var m in metadata)
-            if (m.Version == VersionUploaded) m.Version = VersionAddOrUpdate;
+        static int Wire(int version) => version switch
+        {
+            VersionUploaded => VersionAddOrUpdate,
+            VersionUploadedDelete => VersionLogicalDelete,
+            _ => version,
+        };
+
+        foreach (var t in titles) t.Version = Wire(t.Version);
+        foreach (var mt in mappingTitles) mt.Version = Wire(mt.Version);
+        foreach (var s in sources) s.Version = Wire(s.Version);
+        foreach (var s in series) s.Version = Wire(s.Version);
+        foreach (var m in metadata) m.Version = Wire(m.Version);
+        foreach (var ss in sourceSeries) ss.Version = Wire(ss.Version);
     }
 
     private static string Truncate(string value, int max) =>

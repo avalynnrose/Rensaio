@@ -47,10 +47,12 @@ public interface IExternalSeriesProvider
     /// <summary>Whether this provider supports direct password-based authentication.</summary>
     bool SupportsDirectAuth { get; }
 
+    string[] SupportedTypes { get; }
+
     // ── Auth: OAuth ──
     Task<ScrobblerAuthUrlResult> GetAuthorizationUrlAsync(string redirectUri, string state);
     Task<ScrobblerTokenResult> ExchangeCodeAsync(string code, string redirectUri);
-    Task<ScrobblerTokenResult> RefreshTokenAsync(string refreshToken);
+    Task<ScrobblerTokenResult> RefreshTokenAsync(string refreshToken, CancellationToken token = default);
 
     // ── Auth: Direct (password grant) ──
     Task<ScrobblerTokenResult> AuthenticateDirectAsync(DirectAuthRequest request);

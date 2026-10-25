@@ -26,6 +26,7 @@ message ContributionSnapshotV1 {
   repeated ContributionSourceEntity sources = 6;
   repeated ContributionSeriesEntity series = 7;
   repeated ContributionMetadataEntity metadata = 8;
+  repeated SourceSeriesEntity source_series = 9;
 }
 
 message TitleEntity {
@@ -47,18 +48,40 @@ message ContributionSourceEntity {
   string source_name = 4;
   string source_language = 5;
   string last_batch_utc = 6;  // optional
+  repeated string latest_ids = 8;  // ordered series-entry ids of the last GetLatest run
   int32 v = 7;
+  string package_id = 9;  // MD5("package") as canonical hex (optional for pre-normalization rows)
 }
 
 message ContributionSeriesEntity {
-  string id = 1;   // MD5("package:sourceId:url") as canonical hex
+  string id = 1;   // MD5("package:url") as canonical hex
   string mapping_id = 2;
-  string source_id = 3;
-  ContributionRecordV1 data = 4;
+  string source_id = 3;   // representative source (canonical set in source_series)
+  ContributionRecordV2 data = 4;
   int32 v = 5;
+  // optional; UTC timestamp the entry was manually verified (absent = unverified).
+  // One-way toward the cloud: a set value propagates, a local clear never re-uploads.
+  string verified_date_utc = 6;
+  // DERIVED flag: the owning series has at least one live Metadata row (a real link or an
+  // Unmatched placeholder). true = a metadata pass was already attempted for the series;
+  // false = it still needs one. Never authoritative — recomputable from the graph. true does
+  // NOT mean "matched" (that requires an AutoMatched/UserConfirmed mapping_status).
+  bool metadata = 7;
+  string package_id = 8;  // MD5("package") as canonical hex (optional for pre-normalization rows)
 }
 
-message ContributionRecordV1 {
+// Many-to-many association between a source and a series entry (composite key
+// source_id + series_id). One series entry may be contributed by many sources.
+message SourceSeriesEntity {
+  string source_id = 1;
+  string series_id = 2;  // ContributionSeriesEntity.id
+  int32 v = 3;
+}
+
+// V2 is the current record schema. Field numbers 1..8 are unchanged from V1;
+// url (9) and memo (10) were appended. A V1 payload has schema_version=1 and no
+// url; the decoding client tombstones such legacy entries automatically.
+message ContributionRecordV2 {
   uint32 schema_version = 1;
   string title_id = 2;
   string thumbnail_url = 3;  // optional
@@ -67,6 +90,8 @@ message ContributionRecordV1 {
   bool seen_in_latest = 6;
   double last_chapter = 7;   // optional (decimal)
   string last_update_utc = 8; // optional
+  string url = 9;            // optional
+  string memo = 10;          // optional
 }
 
 message ContributionMetadataEntity {

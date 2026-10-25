@@ -5,6 +5,7 @@ using Mihon.ExtensionsBridge.Models.Abstractions;
 using Mihon.ExtensionsBridge.Models.Extensions;
 using Rensaio.RPC.Contracts;
 using Rensaio.RPC.Contracts.V1;
+using RensaioBackend.Services.Scrobbling.Providers;
 
 namespace RensaioBackend.Services.Rpc;
 
@@ -85,6 +86,7 @@ public sealed class RpcSourceInterop : ISourceInterop
 
     public async Task<MangaUpdate> GetDetailsAndChaptersAsync(Manga manga, CancellationToken token = default)
     {
+        await ProviderRateLimits.EnforceSourceMethodAsync(_descriptor.PackageId, token).ConfigureAwait(false);
         var (channel, headers) = await _bridge.GetCallContextAsync(token).ConfigureAwait(false);
         var client = new CatalogService.CatalogServiceClient(channel);
         JsonResult r = await GuardedAsync(() => client.GetDetailsAndChaptersAsync(
@@ -95,6 +97,7 @@ public sealed class RpcSourceInterop : ISourceInterop
 
     public async Task<List<ParsedChapter>> GetChaptersAsync(Manga manga, CancellationToken token = default)
     {
+        await ProviderRateLimits.EnforceSourceMethodAsync(_descriptor.PackageId, token).ConfigureAwait(false);
         var (channel, headers) = await _bridge.GetCallContextAsync(token).ConfigureAwait(false);
         var client = new CatalogService.CatalogServiceClient(channel);
         JsonResult r = await GuardedAsync(() => client.GetChaptersAsync(
@@ -105,12 +108,23 @@ public sealed class RpcSourceInterop : ISourceInterop
 
     public async Task<ParsedManga> GetDetailsAsync(Manga manga, CancellationToken token = default)
     {
+        await ProviderRateLimits.EnforceSourceMethodAsync(_descriptor.PackageId, token).ConfigureAwait(false);
         var (channel, headers) = await _bridge.GetCallContextAsync(token).ConfigureAwait(false);
         var client = new CatalogService.CatalogServiceClient(channel);
         JsonResult r = await GuardedAsync(() => client.GetDetailsAsync(
             new SourceMangaRequest { Source = Ref(), MangaJson = RpcJson.Serialize(manga) }, headers, null, token)
             .ResponseAsync).ConfigureAwait(false);
         return RpcJson.Deserialize<ParsedManga>(r.Json) ?? new ParsedManga();
+    }
+
+    public async Task<string> GetMangaUrlAsync(Manga manga, CancellationToken token = default)
+    {
+        var (channel, headers) = await _bridge.GetCallContextAsync(token).ConfigureAwait(false);
+        var client = new CatalogService.CatalogServiceClient(channel);
+        JsonResult r = await GuardedAsync(() => client.GetMangaUrlAsync(
+            new SourceMangaRequest { Source = Ref(), MangaJson = RpcJson.Serialize(manga) }, headers, null, token)
+            .ResponseAsync).ConfigureAwait(false);
+        return RpcJson.Deserialize<string>(r.Json) ?? string.Empty;
     }
 
     public Task<ContentTypeStream> GetPageImageAsync(Page page, CancellationToken token = default)
@@ -139,6 +153,7 @@ public sealed class RpcSourceInterop : ISourceInterop
     {
         try
         {
+            await ProviderRateLimits.EnforceSourceImageAsync(_descriptor.PackageId, token).ConfigureAwait(false);
             var (channel, headers) = await _bridge.GetCallContextAsync(token).ConfigureAwait(false);
             using var call = start(channel, headers);
 
@@ -166,6 +181,7 @@ public sealed class RpcSourceInterop : ISourceInterop
 
     public async Task<MangaList> GetLatestAsync(int page, CancellationToken token = default)
     {
+        await ProviderRateLimits.EnforceSourceMethodAsync(_descriptor.PackageId, token).ConfigureAwait(false);
         var (channel, headers) = await _bridge.GetCallContextAsync(token).ConfigureAwait(false);
         var client = new CatalogService.CatalogServiceClient(channel);
         JsonResult r = await GuardedAsync(() => client.GetLatestAsync(
@@ -175,6 +191,7 @@ public sealed class RpcSourceInterop : ISourceInterop
 
     public async Task<List<Page>> GetPagesAsync(Chapter chapter, CancellationToken token = default)
     {
+        await ProviderRateLimits.EnforceSourceMethodAsync(_descriptor.PackageId, token).ConfigureAwait(false);
         var (channel, headers) = await _bridge.GetCallContextAsync(token).ConfigureAwait(false);
         var client = new CatalogService.CatalogServiceClient(channel);
         JsonResult r = await GuardedAsync(() => client.GetPagesAsync(
@@ -185,6 +202,7 @@ public sealed class RpcSourceInterop : ISourceInterop
 
     public async Task<MangaList> GetPopularAsync(int page, CancellationToken token = default)
     {
+        await ProviderRateLimits.EnforceSourceMethodAsync(_descriptor.PackageId, token).ConfigureAwait(false);
         var (channel, headers) = await _bridge.GetCallContextAsync(token).ConfigureAwait(false);
         var client = new CatalogService.CatalogServiceClient(channel);
         JsonResult r = await GuardedAsync(() => client.GetPopularAsync(
@@ -194,6 +212,7 @@ public sealed class RpcSourceInterop : ISourceInterop
 
     public async Task<MangaList> SearchAsync(int page, string query, CancellationToken token = default)
     {
+        await ProviderRateLimits.EnforceSourceMethodAsync(_descriptor.PackageId, token).ConfigureAwait(false);
         var (channel, headers) = await _bridge.GetCallContextAsync(token).ConfigureAwait(false);
         var client = new CatalogService.CatalogServiceClient(channel);
         JsonResult r = await GuardedAsync(() => client.SearchAsync(

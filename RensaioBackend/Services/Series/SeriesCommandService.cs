@@ -643,6 +643,22 @@ namespace RensaioBackend.Services.Series
                     if (res==null)
                         return JobResult.Failed;
 
+                    // END-OF-CATALOGUE GUARD.
+                    //
+                    // The loop only exits on `upToDate`, and that flag is set inside the per-series
+                    // body — which never runs for an empty page. So an empty page made the loop
+                    // hammer the source indefinitely (observed: Kagane page 30 onward returning
+                    // items=0, one request per second, forever). An empty page means either the
+                    // catalogue is exhausted or the source is rate-limiting/erroring and returning
+                    // nothing; in both cases continuing is wrong. Stop and let the run finish.
+                    if (res.Mangas.Count == 0)
+                    {
+                        _logger.LogInformation(
+                            "GetLatest {provider}: page {page} returned 0 items — treating as end of catalogue and stopping. Pages scanned: {pages}",
+                            provider, page, page - 1);
+                        break;
+                    }
+
                     SettingsDto s = await _settings.GetSettingsAsync(token).ConfigureAwait(false);
                     // Cap concurrency: each details/chapters fetch crosses the IKVM boundary and
                     // consumes process thread budget shared with CEF (see SourceTimeoutGate).
@@ -655,6 +671,18 @@ namespace RensaioBackend.Services.Series
                         .GroupBy(ss => string.IsNullOrEmpty(ss.Url) ? ss.Title : ss.Url, StringComparer.Ordinal)
                         .Select(g => g.First())
                         .ToList();
+
+                    // DIAGNOSTIC (temporary): what each page actually yielded.
+                    //
+                    // The loop only exits when `upToDate` is set, and that flag is set INSIDE the
+                    // per-series body — which never executes for an empty page. So an empty (or
+                    // repeating) page pages forever, producing thousands of per-series calls from a
+                    // catalogue that only has a few entries on page 1. This line shows whether pages
+                    // are empty, repeating, or genuinely different, which is the only way to tell
+                    // whether the fault is in the data we return or in the termination logic.
+                    _logger.LogDebug(
+                        "GetLatest {provider} page {page}: items={items}, unique={unique}, upToDate={upToDate}",
+                        provider, page, res.Mangas.Count, uniqueMangas.Count, upToDate);
                     await Parallel.ForEachAsync(uniqueMangas, new ParallelOptions
                     {
                         CancellationToken = token,

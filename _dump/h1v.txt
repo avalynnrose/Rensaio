@@ -1,0 +1,115 @@
+Classfile /c:/Users/mpiva/source/repos/Rensaio/_dump/h1.class
+  Last modified Oct 17, 2026; size 570 bytes
+  SHA-256 checksum 689880957dbb7998d27e00cb096074f974097bdf29931458e83820efac8f2e57
+public final class h1 extends r1
+  minor version: 0
+  major version: 49
+  flags: (0x0031) ACC_PUBLIC, ACC_FINAL, ACC_SUPER
+  this_class: #2                          // h1
+  super_class: #4                         // r1
+  interfaces: 0, fields: 1, methods: 2, attributes: 0
+Constant pool:
+   #1 = Utf8               h1
+   #2 = Class              #1             // h1
+   #3 = Utf8               r1
+   #4 = Class              #3             // r1
+   #5 = Utf8               n
+   #6 = Utf8               I
+   #7 = Utf8               decodeElementIndex
+   #8 = Utf8               (Lkotlinx/serialization/descriptors/SerialDescriptor;)I
+   #9 = Utf8               java/lang/Object
+  #10 = Class              #9             // java/lang/Object
+  #11 = Utf8               getClass
+  #12 = Utf8               ()Ljava/lang/Class;
+  #13 = NameAndType        #11:#12        // getClass:()Ljava/lang/Class;
+  #14 = Methodref          #10.#13        // java/lang/Object.getClass:()Ljava/lang/Class;
+  #15 = Utf8               a
+  #16 = Utf8               Ls1;
+  #17 = NameAndType        #15:#16        // a:Ls1;
+  #18 = Fieldref           #4.#17         // r1.a:Ls1;
+  #19 = Utf8               s1
+  #20 = Class              #19            // s1
+  #21 = Utf8               b
+  #22 = Utf8               J
+  #23 = NameAndType        #21:#22        // b:J
+  #24 = Fieldref           #20.#23        // s1.b:J
+  #25 = Utf8               Lokio/BufferedSource;
+  #26 = NameAndType        #15:#25        // a:Lokio/BufferedSource;
+  #27 = Fieldref           #20.#26        // s1.a:Lokio/BufferedSource;
+  #28 = Utf8               okio/BufferedSource
+  #29 = Class              #28            // okio/BufferedSource
+  #30 = Utf8               exhausted
+  #31 = Utf8               ()Z
+  #32 = NameAndType        #30:#31        // exhausted:()Z
+  #33 = InterfaceMethodref #29.#32        // okio/BufferedSource.exhausted:()Z
+  #34 = NameAndType        #5:#6          // n:I
+  #35 = Fieldref           #2.#34         // h1.n:I
+  #36 = Utf8               <init>
+  #37 = Utf8               (Ls1;Lkotlinx/serialization/descriptors/SerialDescriptor;Ln1;ZI)V
+  #38 = NameAndType        #36:#37        // "<init>":(Ls1;Lkotlinx/serialization/descriptors/SerialDescriptor;Ln1;ZI)V
+  #39 = Methodref          #4.#38         // r1."<init>":(Ls1;Lkotlinx/serialization/descriptors/SerialDescriptor;Ln1;ZI)V
+  #40 = Utf8               Code
+{
+  public int n;
+    descriptor: I
+    flags: (0x0001) ACC_PUBLIC
+
+  public final int decodeElementIndex(kotlinx.serialization.descriptors.SerialDescriptor);
+    descriptor: (Lkotlinx/serialization/descriptors/SerialDescriptor;)I
+    flags: (0x0011) ACC_PUBLIC, ACC_FINAL
+    Code:
+      stack=4, locals=5, args_size=2
+         0: aload_1
+         1: invokevirtual #14                 // Method java/lang/Object.getClass:()Ljava/lang/Class;
+         4: pop
+         5: aload_0
+         6: getfield      #18                 // Field r1.a:Ls1;
+         9: astore_1
+        10: aload_1
+        11: getfield      #24                 // Field s1.b:J
+        14: lconst_0
+        15: lcmp
+        16: istore_2
+        17: iload_2
+        18: iflt          35
+        21: iload_2
+        22: ifgt          30
+        25: iconst_1
+        26: istore_3
+        27: goto          45
+        30: iconst_0
+        31: istore_3
+        32: goto          45
+        35: aload_1
+        36: getfield      #27                 // Field s1.a:Lokio/BufferedSource;
+        39: invokeinterface #33,  1           // InterfaceMethod okio/BufferedSource.exhausted:()Z
+        44: istore_3
+        45: iload_3
+        46: ifeq          51
+        49: iconst_m1
+        50: ireturn
+        51: aload_0
+        52: getfield      #35                 // Field n:I
+        55: iconst_1
+        56: iadd
+        57: istore        4
+        59: aload_0
+        60: iload         4
+        62: putfield      #35                 // Field n:I
+        65: iload         4
+        67: ireturn
+
+  public h1(s1, kotlinx.serialization.descriptors.SerialDescriptor, n1, boolean, int);
+    descriptor: (Ls1;Lkotlinx/serialization/descriptors/SerialDescriptor;Ln1;ZI)V
+    flags: (0x1001) ACC_PUBLIC, ACC_SYNTHETIC
+    Code:
+      stack=6, locals=6, args_size=6
+         0: aload_0
+         1: aload_1
+         2: aload_2
+         3: aload_3
+         4: iload         4
+         6: iload         5
+         8: invokespecial #39                 // Method r1."<init>":(Ls1;Lkotlinx/serialization/descriptors/SerialDescriptor;Ln1;ZI)V
+        11: return
+}

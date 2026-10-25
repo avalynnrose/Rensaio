@@ -3,15 +3,19 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Checkbox } from "@/components/ui/checkbox";
 import { LazyImage } from "@/components/ui/lazy-image";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import * as TooltipPrimitive from "@radix-ui/react-tooltip";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { ExternalLink, Search, Ban, RotateCcw, EyeOff, RefreshCw, Clock, Check, AlertCircle, Layers, ShieldAlert, CloudUpload } from 'lucide-react';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogClose } from "@/components/ui/dialog";
+import { ExternalLink, Search, Ban, RotateCcw, EyeOff, RefreshCw, Clock, Check, AlertCircle, Layers, ShieldAlert, ShieldCheck, ShieldX, CloudUpload, GitMerge, Scissors } from 'lucide-react';
 import { useQueryClient } from '@tanstack/react-query';
 import { getProgressHub } from '@/lib/api/signalr/progressHub';
 import { JobType, ProgressStatus } from '@/lib/api/types';
 import { useContributionUpload } from '@/lib/api/hooks/useContributionUpload';
+import { useDebounce } from '@/lib/hooks/useDebounce';
 import { useToast } from '@/hooks/use-toast';
 import {
   useContributionMappings,
@@ -22,6 +26,11 @@ import {
   useContributionMappingsUnblock,
   useContributionMappingsIgnore,
   useContributionMappingsIgnoreAll,
+  useContributionMappingsJoin,
+  useContributionMappingsSplit,
+  useContributionMappingsVerify,
+  useContributionMappingsUnverify,
+  useContributionMappingsSmartSearch,
   contributionMappingsQueryKey,
 } from "@/lib/api/hooks/useContributionMappings";
 import { ScrobblerSearchRequester } from '@/components/comp/scrobbler/scrobbler-search-requester';
@@ -61,7 +70,7 @@ function statusBadge(status: SeriesMappingStatus) {
     case SeriesMappingStatus.Unmatched: return <Badge variant="secondary">Not matched</Badge>;
     case SeriesMappingStatus.AutoMatched: return <Badge variant="default">Auto</Badge>;
     case SeriesMappingStatus.UserConfirmed: return <Badge variant="default">User</Badge>;
-    case SeriesMappingStatus.TemporaryIgnored: return <Badge variant="secondary">Temp. ignored</Badge>;
+    case SeriesMappingStatus.ManualIgnore: return <Badge variant="secondary">Manual ignore</Badge>;
     case SeriesMappingStatus.ForeverIgnored: return <Badge variant="secondary">Disabled</Badge>;
     case SeriesMappingStatus.Blocked: return <Badge variant="destructive">Blocked</Badge>;
     default: return <Badge variant="secondary">Unknown</Badge>;
@@ -91,22 +100,30 @@ export default function ContributionPage() {
     });
   };
 
-  const [filter, setFilter] = useState<'all' | 'unmatched' | 'blocked'>('unmatched');
+  const [filter, setFilter] = useState<'all' | 'unmatched' | 'blocked' | 'manualignored'>('unmatched');
+  const [verifiedFilter, setVerifiedFilter] = useState<'all' | 'verified' | 'unverified'>('unverified');
+  const [nameInput, setNameInput] = useState('');
+  const debouncedName = useDebounce(nameInput, 300);
   const [page, setPage] = useState(0);
   const [statusFilter, setStatusFilter] = useState<number | null>(null);
   const [scanProgress, setScanProgress] = useState<string | null>(null);
   const [mappingScanStates, setMappingScanStates] = useState<Record<string, MappingScanState>>({});
+  // Join selection (mapping ids) + the confirmation dialogs for the join/split destructive ops.
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [joinOpen, setJoinOpen] = useState(false);
+  const [splitTarget, setSplitTarget] = useState<ContributionMappingGroup | null>(null);
   const [searchTarget, setSearchTarget] = useState<{
     mappingId: string;
     mappingTitle: string;
     mappingCoverUrl?: string;
     mappingTitles?: string;
+    candidateTitles?: string[];
     provider: ScrobblerProvider;
   } | null>(null);
-  const pageSize = 50;
+  const pageSize = 10;
   const queryClient = useQueryClient();
 
-  const { data, isLoading: loading } = useContributionMappings({ filter, page, pageSize, status: statusFilter });
+  const { data, isLoading: loading } = useContributionMappings({ filter, verified: verifiedFilter, page, pageSize, status: statusFilter, name: debouncedName });
   const scanAll = useContributionMappingsScanAll();
   const scanMapping = useContributionMappingsScanMapping();
   const linkMapping = useContributionMappingsLink();
@@ -114,6 +131,11 @@ export default function ContributionPage() {
   const unblock = useContributionMappingsUnblock();
   const ignore = useContributionMappingsIgnore();
   const ignoreAll = useContributionMappingsIgnoreAll();
+  const joinMappings = useContributionMappingsJoin();
+  const splitMapping = useContributionMappingsSplit();
+  const verifyMapping = useContributionMappingsVerify();
+  const unverifyMapping = useContributionMappingsUnverify();
+  const smartSearchMapping = useContributionMappingsSmartSearch();
 
   // Confirm into the contribution DB via the generic search dialog's onConfirm hook.
   const handleSearchConfirmed = useCallback(() => {
@@ -172,6 +194,61 @@ export default function ContributionPage() {
     return () => { unsubscribe?.(); };
   }, [queryClient]);
 
+  // A new filter/name invalidates the current checkbox selection (selection is kept
+  // across pages so contributions from different pages can be joined together).
+  useEffect(() => {
+    setSelectedIds(new Set());
+  }, [filter, verifiedFilter, debouncedName]);
+
+  const toggleSelect = useCallback((mappingId: string, checked: boolean) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(mappingId); else next.delete(mappingId);
+      return next;
+    });
+  }, []);
+
+  const handleJoinConfirmed = useCallback(() => {
+    const ids = Array.from(selectedIds);
+    joinMappings.mutate(ids, {
+      onSuccess: () => {
+        setJoinOpen(false);
+        setSelectedIds(new Set());
+        toast({
+          title: 'Contributions joined',
+          description: `${ids.length} contributions were merged into one series.`,
+        });
+      },
+      onError: (error) => {
+        toast({
+          title: 'Join failed',
+          description: error instanceof Error ? error.message : 'Unknown error',
+          variant: 'destructive',
+        });
+      },
+    });
+  }, [selectedIds, joinMappings, toast]);
+
+  const handleSplitConfirmed = useCallback(() => {
+    if (!splitTarget) return;
+    splitMapping.mutate(splitTarget.mappingId, {
+      onSuccess: () => {
+        toast({
+          title: 'Contribution split',
+          description: 'Each source entry is now its own series. Re-match its providers manually.',
+        });
+        setSplitTarget(null);
+      },
+      onError: (error) => {
+        toast({
+          title: 'Split failed',
+          description: error instanceof Error ? error.message : 'Unknown error',
+          variant: 'destructive',
+        });
+      },
+    });
+  }, [splitTarget, splitMapping, toast]);
+
   // Page-level gate: the Contribution page is only usable once the Contributor
   // Id has been verified against RensaioContributionDB.CF. Until then, show a
   // notice instead of any mapping/export UI.
@@ -203,8 +280,16 @@ export default function ContributionPage() {
       </div>
 
       <div className="flex flex-wrap items-center gap-3">
+        {/* Global name filter — ANDed with the status combo below. */}
+        <Input
+          value={nameInput}
+          onChange={(e) => { setNameInput(e.target.value); setPage(0); }}
+          placeholder="Filter by name…"
+          className="h-9 w-56"
+        />
+
         {/* Filter combo — left aligned, default Unmatched. */}
-        <Select value={filter} onValueChange={(v) => { setFilter(v as 'all' | 'unmatched' | 'blocked'); setPage(0); }}>
+        <Select value={filter} onValueChange={(v) => { setFilter(v as 'all' | 'unmatched' | 'blocked' | 'manualignored'); setPage(0); }}>
           <SelectTrigger className="w-40">
             <SelectValue placeholder="Unmatched" />
           </SelectTrigger>
@@ -212,10 +297,36 @@ export default function ContributionPage() {
             <SelectItem value="unmatched">Unmatched</SelectItem>
             <SelectItem value="all">All</SelectItem>
             <SelectItem value="blocked">Blocked</SelectItem>
+            <SelectItem value="manualignored">ManualIgnored</SelectItem>
+          </SelectContent>
+        </Select>
+
+        {/* Verified combo — next to the status filter, default Unverified. */}
+        <Select value={verifiedFilter} onValueChange={(v) => { setVerifiedFilter(v as 'all' | 'verified' | 'unverified'); setPage(0); }}>
+          <SelectTrigger className="w-40">
+            <SelectValue placeholder="Unverified" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="unverified">Unverified</SelectItem>
+            <SelectItem value="verified">Verified</SelectItem>
+            <SelectItem value="all">All</SelectItem>
           </SelectContent>
         </Select>
 
         <div className="ml-auto flex items-center gap-2">
+          {/* Join — appears when more than one contribution is selected. */}
+          {selectedIds.size > 1 && (
+            <Button
+              size="sm"
+              variant="outline"
+              className="gap-1"
+              onClick={() => setJoinOpen(true)}
+            >
+              <GitMerge className="h-4 w-4" />
+              Join ({selectedIds.size})
+            </Button>
+          )}
+
           {/* Export to cloud — only when the Contributor Id is verified. */}
           <Button
             size="sm"
@@ -253,8 +364,13 @@ export default function ContributionPage() {
         unblock={unblock}
         ignore={ignore}
         ignoreAll={ignoreAll}
+        verify={verifyMapping}
+        unverify={unverifyMapping}
         mappingScanStates={mappingScanStates}
         onSearch={setSearchTarget}
+        selectedIds={selectedIds}
+        onToggleSelect={toggleSelect}
+        onSplit={setSplitTarget}
       />
 
       {searchTarget && (
@@ -271,6 +387,21 @@ export default function ContributionPage() {
           seriesTitle={searchTarget.mappingTitle}
           seriesThumbnail={searchTarget.mappingCoverUrl}
           seriesAltTitles={searchTarget.mappingTitles}
+          candidateTitles={searchTarget.candidateTitles}
+          onSmartSearch={async () => {
+            const res = await smartSearchMapping.mutateAsync({
+              mappingId: searchTarget.mappingId,
+              provider: searchTarget.provider,
+            });
+            return res.results.map((h) => ({
+              externalId: h.externalId,
+              title: h.title,
+              alternateTitles: h.alternateTitles ?? [],
+              coverUrl: h.coverUrl,
+              type: h.type,
+              year: h.year,
+            }));
+          }}
           confirmLabel="Confirm Mapping"
           onConfirm={async (externalSeriesId, externalSeriesTitle) => {
             await linkMapping.mutateAsync({
@@ -282,6 +413,57 @@ export default function ContributionPage() {
           }}
         />
       )}
+
+      {/* Join confirmation — destructive merge of the selected contributions. */}
+      <Dialog open={joinOpen} onOpenChange={setJoinOpen}>
+        <DialogContent className="sm:max-w-[440px]">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <GitMerge className="h-4 w-4" />
+              Join {selectedIds.size} contributions
+            </DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground">
+            The selected contributions will be merged into a single series: their sources, titles
+            and metadata links are combined (duplicates removed) under the first selected series.
+            This cannot be undone automatically.
+          </p>
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button variant="outline" disabled={joinMappings.isPending}>Cancel</Button>
+            </DialogClose>
+            <Button onClick={handleJoinConfirmed} disabled={joinMappings.isPending}>
+              {joinMappings.isPending ? 'Joining…' : 'Join'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Split confirmation — destructive split of a multi-source contribution. */}
+      <Dialog open={!!splitTarget} onOpenChange={(open) => { if (!open) setSplitTarget(null); }}>
+        <DialogContent className="sm:max-w-[440px]">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Scissors className="h-4 w-4" />
+              Split {splitTarget?.displayTitle || 'contribution'}
+            </DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground">
+            This contribution has {splitTarget?.sources?.length ?? 0} sources. It will be split into
+            one series per source: every title and metadata link is cleared, and each new series
+            starts with its own source title only. You will need to re-match the metadata providers
+            of the new series manually.
+          </p>
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button variant="outline" disabled={splitMapping.isPending}>Cancel</Button>
+            </DialogClose>
+            <Button onClick={handleSplitConfirmed} disabled={splitMapping.isPending}>
+              {splitMapping.isPending ? 'Splitting…' : 'Split'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Pagination */}
       <div className="flex items-center gap-2">
@@ -306,17 +488,25 @@ interface MappingTableActions {
   unblock: ReturnType<typeof useContributionMappingsUnblock>;
   ignore: ReturnType<typeof useContributionMappingsIgnore>;
   ignoreAll: ReturnType<typeof useContributionMappingsIgnoreAll>;
+  verify: ReturnType<typeof useContributionMappingsVerify>;
+  unverify: ReturnType<typeof useContributionMappingsUnverify>;
   mappingScanStates?: Record<string, MappingScanState>;
   onSearch: (target: {
     mappingId: string;
     mappingTitle: string;
     mappingCoverUrl?: string;
     mappingTitles?: string;
+    candidateTitles?: string[];
     provider: ScrobblerProvider;
   }) => void;
+  /** Join selection: the set of currently-checked mapping ids. */
+  selectedIds: Set<string>;
+  onToggleSelect: (mappingId: string, checked: boolean) => void;
+  /** Opens the split confirmation for a multi-source contribution. */
+  onSplit: (group: ContributionMappingGroup) => void;
 }
 
-function MappingTable({ groups, providerMeta, loading, scanMapping, block, unblock, ignore, ignoreAll, onSearch, mappingScanStates }: {
+function MappingTable({ groups, providerMeta, loading, scanMapping, block, unblock, ignore, ignoreAll, verify, unverify, onSearch, mappingScanStates, selectedIds, onToggleSelect, onSplit }: {
   groups: ContributionMappingGroup[];
   providerMeta: ContributionMappingsPage['providerMeta'];
   loading: boolean;
@@ -339,8 +529,13 @@ function MappingTable({ groups, providerMeta, loading, scanMapping, block, unblo
               unblock={unblock}
               ignore={ignore}
               ignoreAll={ignoreAll}
+              verify={verify}
+              unverify={unverify}
               mappingScanStates={mappingScanStates}
               onSearch={onSearch}
+              selectedIds={selectedIds}
+              onToggleSelect={onToggleSelect}
+              onSplit={onSplit}
             />
           ))}
         </tbody>
@@ -351,31 +546,78 @@ function MappingTable({ groups, providerMeta, loading, scanMapping, block, unblo
 }
 
 /** Renders the grouped mapping: title header (with member-source summary + group-level Scan) + a left cover spanning all provider rows. */
-function MappingGroupRows({ group, providerMeta, scanMapping, block, unblock, ignore, ignoreAll, onSearch, mappingScanStates }: {
+function MappingGroupRows({ group, providerMeta, scanMapping, block, unblock, ignore, ignoreAll, verify, unverify, onSearch, mappingScanStates, selectedIds, onToggleSelect, onSplit }: {
   group: ContributionMappingGroup;
   providerMeta: ContributionMappingsPage['providerMeta'];
 } & MappingTableActions) {
-  const providers = group.providers ?? [];
+  // Providers ordered by display name inside the card (stable, alphabetical).
+  const providers = [...(group.providers ?? [])].sort((a, b) =>
+    (ScrobblerProvider[a.provider] ?? '').localeCompare(ScrobblerProvider[b.provider] ?? ''));
   const span = Math.max(providers.length, 1);
   const scanState = mappingScanStates?.[group.mappingId];
   const isScanning = scanState === 'scanning';
-  const sourceSummary = (group.sources ?? []).map(s => s.sourceName || s.sourceKey).filter(Boolean);
-  const altTitles = group.titles?.filter(t => t !== group.displayTitle).join(' · ') ?? '';
+  const isSelected = selectedIds.has(group.mappingId);
+  const canSplit = (group.sources?.length ?? 0) > 1;
+  // Titles (line 1): the MAIN title must always be `displayTitle` (bold), with every other
+  // title listed after it. The backend's `titles` array is an unordered automerge set, so it
+  // cannot be rendered as-is — its first entry is not necessarily the display title.
+  const rawTitles = (group.titles ?? []).map(t => t?.trim()).filter((t): t is string => !!t);
+  const displayTitle = group.displayTitle?.trim();
+  const displayTitles = displayTitle
+    ? [displayTitle, ...rawTitles.filter(t => t.toLowerCase() !== displayTitle.toLowerCase())]
+    : rawTitles;
+  // Second line under the title: one entry per member source. When the source record carries a
+  // canonical page url the entry becomes a hyperlink that opens the series page on that source.
+  const sourceSummary = (group.sources ?? [])
+    .map(s => ({
+      label: s.sourceName || s.sourceKey,
+      url: s.sourceUrl,
+    }))
+    .filter(s => !!s.label);
   return (
     <>
       <tr className="border-b bg-muted last:border-0">
         <td colSpan={7} className="py-2 pl-4 pr-3">
           <div className="flex items-center gap-2">
+            <Checkbox
+              checked={isSelected}
+              onCheckedChange={(checked) => onToggleSelect(group.mappingId, checked)}
+              className="shrink-0"
+            />
             <Layers className="h-4 w-4 shrink-0 text-muted-foreground" />
             <div className="min-w-0">
-              <span className="font-semibold">{group.displayTitle || group.mappingId}</span>
-              {sourceSummary.length > 0 && (
-                <div className="text-xs text-muted-foreground truncate max-w-[520px]">
-                  {sourceSummary.join(' · ')}
+              {displayTitles.length > 0 && (
+                <div className="truncate max-w-[520px]">
+                  {displayTitles.map((t, i) => (
+                    <React.Fragment key={`${t}-${i}`}>
+                      {i > 0 && <span className="text-muted-foreground"> · </span>}
+                      <span className={i === 0 ? 'font-semibold' : 'text-muted-foreground'}>{t}</span>
+                    </React.Fragment>
+                  ))}
                 </div>
               )}
-              {altTitles && (
-                <div className="text-xs text-muted-foreground truncate max-w-[520px]">{altTitles}</div>
+              {sourceSummary.length > 0 && (
+                <div className="text-xs text-muted-foreground truncate max-w-[520px]">
+                  {sourceSummary.map((s, i) => (
+                    <React.Fragment key={`${s.label}-${i}`}>
+                      {i > 0 && <span className="text-muted-foreground"> · </span>}
+                      {s.url ? (
+                        <a
+                          href={s.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-0.5 text-primary hover:underline"
+                          title={`Open ${s.label} page`}
+                        >
+                          {s.label}
+                          <ExternalLink className="h-3 w-3 flex-shrink-0" />
+                        </a>
+                      ) : (
+                        <span>{s.label}</span>
+                      )}
+                    </React.Fragment>
+                  ))}
+                </div>
               )}
             </div>
             <Button
@@ -384,11 +626,23 @@ function MappingGroupRows({ group, providerMeta, scanMapping, block, unblock, ig
               className="ml-auto gap-1 shrink-0"
               onClick={() => ignoreAll.mutate(group.mappingId)}
               disabled={ignoreAll.isPending}
-              title="Mark every Not matched provider for this mapping as Ignore always"
+              title="Manually ignore every Not matched provider for this mapping"
             >
               <EyeOff className="h-3.5 w-3.5" />
               {ignoreAll.isPending ? 'Ignoring…' : 'Ignore All'}
             </Button>
+            {canSplit && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1 shrink-0"
+                onClick={() => onSplit(group)}
+                title={`Split this contribution's ${group.sources.length} sources into separate series`}
+              >
+                <Scissors className="h-3.5 w-3.5" />
+                Split
+              </Button>
+            )}
             <Button
               variant="outline"
               size="sm"
@@ -420,6 +674,38 @@ function MappingGroupRows({ group, providerMeta, scanMapping, block, unblock, ig
                     ? 'Scanning…'
                     : 'Scan'}
             </Button>
+            {/* Verify / Un-Verify — after Ignore All and Scan. When already verified the
+                verification date is shown BEFORE the Un-Verify button. */}
+            {group.verifiedDateUtc ? (
+              <>
+                <span className="text-xs text-muted-foreground shrink-0">
+                  Verified {new Date(group.verifiedDateUtc).toLocaleDateString()}
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="gap-1 shrink-0"
+                  onClick={() => unverify.mutate(group.mappingId)}
+                  disabled={unverify.isPending}
+                  title="Clear the verification of every source entry of this contribution"
+                >
+                  <ShieldX className="h-3.5 w-3.5" />
+                  {unverify.isPending ? 'Un-verifying…' : 'Un-Verify'}
+                </Button>
+              </>
+            ) : (
+              <Button
+                variant="destructive"
+                size="sm"
+                className="gap-1 shrink-0"
+                onClick={() => verify.mutate(group.mappingId)}
+                disabled={verify.isPending}
+                title="Mark every source entry of this contribution as verified"
+              >
+                <ShieldCheck className="h-3.5 w-3.5" />
+                {verify.isPending ? 'Verifying…' : 'Verify'}
+              </Button>
+            )}
           </div>
         </td>
       </tr>
@@ -483,7 +769,16 @@ function MappingGroupRows({ group, providerMeta, scanMapping, block, unblock, ig
               );
             })()}
           </td>
-          <td className="py-2 pr-3">{statusBadge(m.mappingStatus)}</td>
+          <td className="py-2 pr-3">
+            <div className="flex flex-col gap-0.5">
+              {statusBadge(m.mappingStatus)}
+              {m.mappingStatus === SeriesMappingStatus.ManualIgnore && m.linkedDate && (
+                <span className="text-xs text-muted-foreground">
+                  Triggered {new Date(m.linkedDate).toLocaleDateString()}
+                </span>
+              )}
+            </div>
+          </td>
           <td className="py-2 pr-3">
             <div className="flex gap-1">
               <Button
@@ -495,6 +790,7 @@ function MappingGroupRows({ group, providerMeta, scanMapping, block, unblock, ig
                   mappingTitle: group.displayTitle || group.mappingId,
                   mappingCoverUrl: group.coverUrl,
                   mappingTitles: group.titles?.join(' · ') ?? undefined,
+                  candidateTitles: group.titles,
                   provider: m.provider,
                 })}
                 title={`Search ${ScrobblerProvider[m.provider]} for a match`}
@@ -507,7 +803,7 @@ function MappingGroupRows({ group, providerMeta, scanMapping, block, unblock, ig
                   variant="outline"
                   size="sm"
                   className="gap-1"
-                  onClick={() => unblock.mutate({ mappingId: group.mappingId, provider: m.provider.toString() })}
+                  onClick={() => unblock.mutate({ mappingId: group.mappingId, provider: m.provider.toString(), key: m.externalSeriesId })}
                   title="Unblock this provider"
                 >
                   <RotateCcw className="h-3.5 w-3.5" />
@@ -519,7 +815,7 @@ function MappingGroupRows({ group, providerMeta, scanMapping, block, unblock, ig
                     variant="outline"
                     size="sm"
                     className="gap-1"
-                    onClick={() => block.mutate({ mappingId: group.mappingId, provider: m.provider.toString() })}
+                    onClick={() => block.mutate({ mappingId: group.mappingId, provider: m.provider.toString(), key: m.externalSeriesId })}
                     title="Block this provider link"
                   >
                     <Ban className="h-3.5 w-3.5" />
@@ -527,17 +823,17 @@ function MappingGroupRows({ group, providerMeta, scanMapping, block, unblock, ig
                   </Button>
                 )
               )}
-              {/* Temporary ignore (re-evaluated after 1 month) */}
-              {m.mappingStatus !== SeriesMappingStatus.TemporaryIgnored && (
+              {/* Manual ignore (no expiration) */}
+              {m.mappingStatus !== SeriesMappingStatus.ManualIgnore && (
                 <Button
                   variant="outline"
                   size="sm"
                   className="gap-1"
                   onClick={() => ignore.mutate({ mappingId: group.mappingId, provider: m.provider.toString(), forever: false })}
-                  title="Ignore this provider for 1 month (re-evaluated afterward)"
+                  title="Manually ignore this provider (no expiration)"
                 >
                   <EyeOff className="h-3.5 w-3.5" />
-                  Ignore 1m
+                  Manual Ignore
                 </Button>
               )}
 
@@ -555,13 +851,13 @@ function MappingGroupRows({ group, providerMeta, scanMapping, block, unblock, ig
                 </Button>
               )}
 
-              {/* Un-ignore: only when the row is currently ignored (temp or forever). */}
-              {(m.mappingStatus === SeriesMappingStatus.TemporaryIgnored || m.mappingStatus === SeriesMappingStatus.ForeverIgnored) && (
+              {/* Un-ignore: only when the row is currently ignored (manual or forever). */}
+              {(m.mappingStatus === SeriesMappingStatus.ManualIgnore || m.mappingStatus === SeriesMappingStatus.ForeverIgnored) && (
                 <Button
                   variant="outline"
                   size="sm"
                   className="gap-1"
-                  onClick={() => unblock.mutate({ mappingId: group.mappingId, provider: m.provider.toString() })}
+                  onClick={() => unblock.mutate({ mappingId: group.mappingId, provider: m.provider.toString(), key: m.externalSeriesId })}
                   title="Stop ignoring this provider"
                 >
                   <RotateCcw className="h-3.5 w-3.5" />

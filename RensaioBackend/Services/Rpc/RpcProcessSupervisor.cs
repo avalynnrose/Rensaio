@@ -158,38 +158,48 @@ public sealed class RpcProcessSupervisor : BackgroundService, IRpcReadinessGate,
         _token = Guid.NewGuid().ToString("N");
         var handshakeTcs = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
 
+        // Both the tray/backend and the RPC child run from the SAME directory
+        // (AppContext.BaseDirectory = where the tray/backend exe lives). The child still runs
+        // detached with its own console and NO stdio redirection; readiness is conveyed via a
+        // handshake FILE it writes; logs flow back over gRPC (ControlService.StreamLogs).
+        string runDir = AppContext.BaseDirectory;
+        string handshakeFile = Path.Combine(runDir, "rensaio-rpc-ready.txt");
+        try { File.Delete(handshakeFile); } catch { /* best effort */ }
+
+        // Build the argument list; it is handed to ProcessStartInfo.ArgumentList below
+        // (UseShellExecute=false), which handles quoting/paths-with-spaces correctly.
+        var argList = new List<string>
+        {
+            $"--token={_token}",
+            // Parent-liveness fallback (stdin EOF is gone now). Also drives die-with-parent.
+            $"--parentpid={Environment.ProcessId}",
+            $"--handshake-file={handshakeFile}",
+        };
+        if (!string.IsNullOrWhiteSpace(BridgeFolder))
+            argList.Add($"--paths:bridge={BridgeFolder}");
+        if (!string.IsNullOrWhiteSpace(TempFolder))
+            argList.Add($"--paths:temp={TempFolder}");
+
         var psi = new ProcessStartInfo(exePath)
         {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            // RedirectStandardInput is the primary parent-death signal: we hold the
-            // write end open and never write. When this process dies — gracefully,
-            // via IDE Stop, or force-killed — the OS closes our handle and the child
-            // observes EOF on stdin. That is portable (Windows/macOS/Linux), race-free
-            // and immune to PID reuse, unlike watching the parent by pid alone.
-            RedirectStandardInput = true,
+            // Silent app: never surface a console window. The child is a console-subsystem
+            // executable, so if it were launched with a console (or from a parent that has
+            // one) Windows would allocate a fresh, visible console. CreateNoWindow only
+            // takes effect with UseShellExecute=false, so the shell is disabled here.
             UseShellExecute = false,
-            // NOTE: CreateNoWindow is intentionally NOT set. The desktop host
-            // (Rensaio.DesktopRPC) is an Avalonia app whose UI thread + CEF native
-            // callbacks appear to need a normal desktop/console process context;
-            // CREATE_NO_WINDOW changes the child's process/window-station setup and was
-            // never used by the historically-working in-process tray. Removing it makes
-            // the child's launch environment match the tray's.
-            WorkingDirectory = AppContext.BaseDirectory,
+            CreateNoWindow = true,
+            // Detached/standalone: no stdout/stderr/stdin pipes. Logs flow back over gRPC
+            // (ControlService.StreamLogs); readiness is the handshake FILE.
+            RedirectStandardOutput = false,
+            RedirectStandardError = false,
+            RedirectStandardInput = false,
+            // Run from the SAME directory as the tray/backend.
+            WorkingDirectory = runDir,
         };
-        // The backend's own bridge/temp folders are RPC's working folders now.
-        psi.ArgumentList.Add($"--token={_token}");
-        // Let RPC watch our liveness so a force-killed parent (IDE Stop, crash,
-        // taskkill /F) cannot orphan the child process.
-        //   --watch-parent arms the stdin-EOF signal (portable + PID-reuse-proof);
-        //     it is only valid because we redirected stdin above.
-        //   --parentpid is the secondary fallback signal.
-        psi.ArgumentList.Add("--watch-parent");
-        psi.ArgumentList.Add($"--parentpid={Environment.ProcessId}");
-        if (!string.IsNullOrWhiteSpace(BridgeFolder))
-            psi.ArgumentList.Add($"--paths:bridge={BridgeFolder}");
-        if (!string.IsNullOrWhiteSpace(TempFolder))
-            psi.ArgumentList.Add($"--paths:temp={TempFolder}");
+        // UseShellExecute=false re-enables ArgumentList, so arguments are passed verbatim
+        // (no manual command-line quoting required).
+        foreach (string arg in argList)
+            psi.ArgumentList.Add(arg);
 
         Process proc;
         try
@@ -204,48 +214,29 @@ public sealed class RpcProcessSupervisor : BackgroundService, IRpcReadinessGate,
 
         _process = proc;
 
-        // stdout: handshake + logs. stderr: fatal transport/startup noise.
-        var outPipe = new StdoutLogPipe(_loggerFactory.CreateLogger<StdoutLogPipe>(), "RPC");
-        var errPipe = new StdoutLogPipe(_loggerFactory.CreateLogger<StdoutLogPipe>(), "RPC:err");
-
+        // Poll the handshake file for readiness (no stdout). Logs come over gRPC.
         _ = Task.Run(async () =>
         {
             try
             {
-                while (true)
+                while (!token.IsCancellationRequested)
                 {
-                    string? line = await proc.StandardOutput.ReadLineAsync(token).ConfigureAwait(false);
-                    if (line == null)
-                        break;
-
-                    if (RpcHandshake.TryParseReadyLine(line, out int port, out int proto))
+                    if (File.Exists(handshakeFile))
                     {
-                        if (proto == RpcHandshake.ProtocolVersion)
-                            handshakeTcs.TrySetResult(port);
-                        else
-                            _logger.LogWarning("RPC protocol mismatch: RPC={Rpc} backend={Backend}.", proto, RpcHandshake.ProtocolVersion);
-                        continue;
+                        string text = await File.ReadAllTextAsync(handshakeFile, token).ConfigureAwait(false);
+                        if (RpcHandshake.TryParseReadyLine(text.Trim(), out int port, out int proto))
+                        {
+                            if (proto == RpcHandshake.ProtocolVersion)
+                                handshakeTcs.TrySetResult(port);
+                            else
+                                _logger.LogWarning("RPC protocol mismatch: RPC={Rpc} backend={Backend}.", proto, RpcHandshake.ProtocolVersion);
+                            break;
+                        }
                     }
-
-                    outPipe.Emit(line);
+                    await Task.Delay(150, token).ConfigureAwait(false);
                 }
             }
-            catch { /* stream closed */ }
-        }, token);
-
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                while (true)
-                {
-                    string? line = await proc.StandardError.ReadLineAsync(token).ConfigureAwait(false);
-                    if (line == null)
-                        break;
-                    errPipe.Emit(line);
-                }
-            }
-            catch { /* stream closed */ }
+            catch { /* cancelled / IO */ }
         }, token);
 
         Task completed = await Task.WhenAny(handshakeTcs.Task, Task.Delay(_handshakeTimeout, token), proc.WaitForExitAsync(token))
@@ -370,19 +361,14 @@ public sealed class RpcProcessSupervisor : BackgroundService, IRpcReadinessGate,
     public string? TempFolder { get; set; }
 
     /// <summary>
-    /// Finds the RPC executable published next to the backend, covering the
-    /// ".exe" suffix and the framework-dependent apphost layout.
+    /// Finds the RPC executable published next to the backend. There is a single child host
+    /// (<c>Rensaio.RPC</c>) shared by every deployment (Docker and the desktop tray); the
+    /// Avalonia-hosted <c>Rensaio.DesktopRPC</c> variant was removed with JCEF.
     ///
-    /// Two hosts exist:
-    ///  - <c>Rensaio.DesktopRPC</c> — Avalonia-hosted (Windows desktop). Its UI thread is
-    ///    what keeps CEF's reverse-JNI callbacks from crashing, so it is preferred on
-    ///    Windows when present.
-    ///  - <c>Rensaio.RPC</c> — headless (Docker/Linux and fallback). Plain ASP.NET, no pump.
-    ///
-    /// An explicit override wins so the choice is testable:
+    /// An explicit override wins so the executable location is testable:
     ///   RENSAIO_RPC_EXE=desktop|headless  (or a full/relative executable path).
     /// </summary>
-    private static string? LocateRpcExecutable()
+    private string? LocateRpcExecutable()
     {
         string baseDir = AppContext.BaseDirectory;
 
@@ -390,24 +376,25 @@ public sealed class RpcProcessSupervisor : BackgroundService, IRpcReadinessGate,
         string? overrideValue = Environment.GetEnvironmentVariable("RENSAIO_RPC_EXE");
         if (!string.IsNullOrWhiteSpace(overrideValue))
         {
-            var forced = ResolveCandidate(baseDir, overrideValue);
+            string exeOverride = OperatingSystem.IsWindows() && !overrideValue.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+                ? overrideValue + ".exe"
+                : overrideValue;
+            var forced = ResolveCandidate(baseDir, exeOverride);
             if (forced != null)
                 return forced;
         }
 
-        // Preference order per OS.
-        string[] names = OperatingSystem.IsWindows()
-            ? new[] { "Rensaio.DesktopRPC.exe", "Rensaio.RPC.exe" }
-            : new[] { "Rensaio.RPC" };
+        // Single child host: Rensaio.RPC. No OS branching.
+        string name = OperatingSystem.IsWindows() ? "Rensaio.RPC.exe" : "Rensaio.RPC";
 
-        foreach (string name in names)
+        string? found = ResolveCandidate(baseDir, name);
+        if (found == null)
         {
-            string? found = ResolveCandidate(baseDir, name);
-            if (found != null)
-                return found;
+            _logger.LogError(
+                "RPC executable '{Name}' not found beside the backend ({Base}) or in ./rpc; " +
+                "the child will not start.", name, baseDir);
         }
-
-        return null;
+        return found;
     }
 
     /// <summary>
@@ -435,6 +422,7 @@ public sealed class RpcProcessSupervisor : BackgroundService, IRpcReadinessGate,
 
         return null;
     }
+
 }
 
 /// <summary>

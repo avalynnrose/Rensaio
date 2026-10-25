@@ -41,6 +41,7 @@ namespace RensaioBackend.Data
         public DbSet<UserScrobblerConfigEntity> UserScrobblerConfigs { get; set; }
         public DbSet<UserExternalLoginEntity> UserExternalLogins { get; set; }
         public DbSet<SeriesMappingEntity> SeriesMappings { get; set; }
+        public DbSet<ImageHashCacheEntity> ImageHashes { get; set; }
 
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
@@ -189,6 +190,15 @@ namespace RensaioBackend.Data
                 entity.Property(i => i.ContentType).UseCollation("BINARY").IsRequired();
                 entity.Property(i => i.Extension).UseCollation("BINARY").IsRequired();
                 entity.Property(e => e.NextUpdateUTC).IsRequired();
+            });
+
+            modelBuilder.Entity<ImageHashCacheEntity>(entity =>
+            {
+                entity.HasKey(e => e.Url);
+                entity.Property(e => e.Url).UseCollation("BINARY").IsRequired();
+                entity.Property(e => e.Hash).UseCollation("BINARY").IsRequired();
+                entity.Property(e => e.Quality).IsRequired();
+                entity.Property(e => e.UpdatedUTC).IsRequired();
             });
 
             modelBuilder.Entity<SettingEntity>(entity =>

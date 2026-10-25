@@ -42,6 +42,10 @@ public abstract class ProxyScrobblerProvider : IScrobblerProvider
     public string? LinkDescription => null;
     public virtual string? SeriesUrlTemplate => null;
     public virtual string? ImageTemplateUrl => null;
+
+    public virtual string[] SupportedTypes => new[] { "Manga", "Manhwa", "Manhua" };
+
+
     public bool RequiresOAuth => true;
     public bool SupportsDirectAuth => false;
 
@@ -166,7 +170,7 @@ public abstract class ProxyScrobblerProvider : IScrobblerProvider
         };
     }
 
-    public virtual async Task<ScrobblerTokenResult> RefreshTokenAsync(string refreshToken)
+    public virtual async Task<ScrobblerTokenResult> RefreshTokenAsync(string refreshToken, CancellationToken token = default)
     {
         // Implicit-grant providers (no refresh token) override this to return a
         // graceful failure instead of calling the proxy's /refresh endpoint.
@@ -176,7 +180,7 @@ public abstract class ProxyScrobblerProvider : IScrobblerProvider
         _proxyHttpClient.DefaultRequestHeaders.Add("X-Instance-Key", _instanceKey);
 
         var response = await _proxyHttpClient.PostAsJsonAsync(
-            $"{_proxyBaseUrl}/api/oauth/{_providerName}/refresh", request);
+            $"{_proxyBaseUrl}/api/oauth/{_providerName}/refresh", request, token);
 
         if (!response.IsSuccessStatusCode)
         {
@@ -243,7 +247,7 @@ public abstract class ProxyScrobblerProvider : IScrobblerProvider
         {
             if (string.IsNullOrEmpty(refreshToken)) return;
 
-            var refreshResult = await RefreshTokenAsync(refreshToken);
+            var refreshResult = await RefreshTokenAsync(refreshToken, token);
             if (refreshResult.Success && refreshResult.AccessToken != null)
             {
                 var encryptedAccess = _tokenProtector.Encrypt(refreshResult.AccessToken);

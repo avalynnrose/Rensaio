@@ -132,7 +132,10 @@ public sealed class RpcBridgeClient : IBridgeManager, IExtensionManager, IReposi
                     if (_gate.Port != port)
                         return; // process was replaced; a new poll owns this
 
-                    var channel = await GetChannelAsync(CancellationToken.None).ConfigureAwait(false);
+                    // RAW channel: the readiness poll must NOT go through the
+                    // bridge-ready gate (that would deadlock — it would wait for the very
+                    // readiness it is meant to establish).
+                    var channel = await GetChannelRawAsync(CancellationToken.None).ConfigureAwait(false);
                     var client = new ControlService.ControlServiceClient(channel);
                     PingReply reply = await client.PingAsync(
                         new PingRequest { Token = _gate.Token }, _gate.BuildAuthMetadata())
@@ -165,18 +168,40 @@ public sealed class RpcBridgeClient : IBridgeManager, IExtensionManager, IReposi
     {
     }
 
+    /// <summary>
+    /// Reads the bridge-global preferences the RPC host currently holds. The backend is the
+    /// source of truth for settings (its SettingsService owns them), so this is mainly a
+    /// diagnostic/reconciliation read; callers that just want the effective settings should use
+    /// their own persisted copy.
+    /// </summary>
     public async Task<Preferences> GetPreferencesAsync(CancellationToken cancellationToken)
     {
-        // Preferences persist on the RPC side with the extension working folder;
-        // the backend keeps its own copy so this is read locally via RPC status.
-        await _gate.Ready.WaitAsync(cancellationToken).ConfigureAwait(false);
-        return new Preferences();
+        var (channel, headers) = await GetCallContextAsync(cancellationToken).ConfigureAwait(false);
+        var client = new ControlService.ControlServiceClient(channel);
+        JsonResult result = await client.GetPreferencesAsync(
+            new BridgePreferencesRequest { Token = _gate.Token }, headers, null, cancellationToken)
+            .ConfigureAwait(false);
+        return RpcJson.Deserialize<Preferences>(result.Json) ?? new Preferences();
     }
 
+    /// <summary>
+    /// Pushes the backend's bridge-global preferences (FlareSolverr, SocksProxy, Browser,
+    /// interceptors) into the RUNNING RPC host, replacing the old in-process live push that the
+    /// RPC split removed. Without this the host only ever saw whatever <c>preferences.json</c> it
+    /// loaded at startup, so a FlareSolverr toggle (or a missing file) left Cloudflare challenges
+    /// unsolvable.
+    /// </summary>
     public async Task SetPreferencesAsync(Preferences prefs, CancellationToken cancellationToken)
     {
-        // Applied by RPC from its own persisted preferences on startup.
-        await _gate.Ready.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var (channel, headers) = await GetCallContextAsync(cancellationToken).ConfigureAwait(false);
+        var client = new ControlService.ControlServiceClient(channel);
+        await client.SetPreferencesAsync(
+            new SetBridgePreferencesRequest { Token = _gate.Token, PreferencesJson = RpcJson.Serialize(prefs) },
+            headers, null, cancellationToken).ConfigureAwait(false);
+
+        _logger.LogDebug(
+            "Pushed bridge preferences to RPC (FlareSolverr enabled={Enabled}, url={Url}).",
+            prefs.FlareSolverr?.Enabled, prefs.FlareSolverr?.Url);
     }
 
     // ---------------------------------------------------------------------
@@ -184,31 +209,44 @@ public sealed class RpcBridgeClient : IBridgeManager, IExtensionManager, IReposi
     // ---------------------------------------------------------------------
 
     public Task<List<RepositoryGroup>> ListExtensionsAsync(CancellationToken token = default)
+        => ListExtensionsAsync(includeTemporary: false, token);
+
+    public Task<List<RepositoryGroup>> ListExtensionsAsync(bool includeTemporary, CancellationToken token = default)
         => CallAsync(async (client, headers) =>
         {
-            JsonResult result = await client.ListInstalledExtensionsAsync(new Correlation(), headers, null, token)
+            JsonResult result = await client.ListInstalledExtensionsAsync(
+                new ListInstalledRequest { IncludeTemporary = includeTemporary }, headers, null, token)
                 .ConfigureAwait(false);
             return RpcJson.Deserialize<List<RepositoryGroup>>(result.Json) ?? [];
         });
 
     public List<RepositoryGroup> ListExtensions()
-        => ListExtensionsAsync().GetAwaiter().GetResult();
+        => ListExtensions(includeTemporary: false);
 
-    public RepositoryGroup? FindExtension(string name)
-        => ListExtensions().FirstOrDefault(g => string.Equals(g.Name, name, StringComparison.OrdinalIgnoreCase));
+    public List<RepositoryGroup> ListExtensions(bool includeTemporary)
+        => ListExtensionsAsync(includeTemporary).GetAwaiter().GetResult();
+
+    public RepositoryGroup? FindExtension(string name, bool includeTemporary = false)
+        => ListExtensions(includeTemporary).FirstOrDefault(g => string.Equals(g.Name, name, StringComparison.OrdinalIgnoreCase));
 
     public async Task<IExtensionInterop> GetInteropAsync(RepositoryGroup entry, CancellationToken token = default)
     {
         await _gate.Ready.WaitAsync(token).ConfigureAwait(false);
-        string? package = entry.Entries.ElementAtOrDefault(entry.ActiveEntry)?.Extension?.Package
-                          ?? entry.Entries.FirstOrDefault()?.Extension?.Package;
+        RepositoryEntry? activeEntry = entry.Entries.ElementAtOrDefault(entry.ActiveEntry)
+                                      ?? entry.Entries.FirstOrDefault();
+        string? package = activeEntry?.Extension?.Package;
         if (string.IsNullOrWhiteSpace(package))
             throw new InvalidOperationException($"Extension group '{entry.Name}' has no resolvable package.");
 
         // Sources are resolved lazily by the RPC side per call; expose descriptors
         // immediately so callers can enumerate sources without an extra round trip.
         List<ISourceInterop> sources = await ListSourcesAsync(package, token).ConfigureAwait(false);
-        return new RpcExtensionInterop(entry.Name, package, sources);
+
+        // Carry the active version so the backend's stale-guard can tell a pinned
+        // interop apart from a genuinely version-changed one. Without it the proxy
+        // reports an empty version and the guard evicts on every access.
+        string version = activeEntry?.Extension?.Version ?? string.Empty;
+        return new RpcExtensionInterop(entry.Name, package, sources, version);
     }
 
     /// <summary>
@@ -222,6 +260,53 @@ public sealed class RpcBridgeClient : IBridgeManager, IExtensionManager, IReposi
                 new PackageRequest { PackageId = package }, headers, null, token).ConfigureAwait(false);
             return RpcJson.Deserialize<List<SourceDescriptor>>(result.Json) ?? [];
         });
+
+    /// <summary>
+    /// Prepares an online extension for a sweep (download/compile + register as temporary) and
+    /// returns its descriptor, or null when the package is not available online.
+    /// </summary>
+    public Task<OnlineExtensionDescriptor?> PrepareOnlineExtensionAsync(string package, CancellationToken token = default)
+        => CallAsync(async (client, headers) =>
+        {
+            JsonResult result = await client.PrepareOnlineExtensionAsync(
+                new PackageRequest { PackageId = package }, headers, null, token).ConfigureAwait(false);
+            return RpcJson.Deserialize<OnlineExtensionDescriptor>(result.Json);
+        });
+
+    /// <summary>Releases a temporary extension previously prepared for a sweep.</summary>
+    public Task<bool> ReleaseOnlineExtensionAsync(string package, CancellationToken token = default)
+        => CallAsync(async (client, headers) =>
+        {
+            BoolValue ok = await client.ReleaseOnlineExtensionAsync(
+                new PackageRequest { PackageId = package }, headers, null, token).ConfigureAwait(false);
+            return ok.Value;
+        });
+
+    /// <summary>Releases every temporary extension prepared for a sweep.</summary>
+    public async Task<int> ReleaseAllTemporaryExtensionsAsync(CancellationToken token = default)
+    {
+        // The RPC host owns the temporary registry; enumerate what it currently holds and release
+        // each prepared package. Best-effort: a failure on one package must not abort the rest.
+        List<RepositoryGroup> groups = await ListExtensionsAsync(includeTemporary: true, token).ConfigureAwait(false);
+        int released = 0;
+        foreach (RepositoryGroup group in groups.Where(g => g.Temporary))
+        {
+            string? package = (group.Entries.ElementAtOrDefault(group.ActiveEntry) ?? group.Entries.FirstOrDefault())
+                ?.Extension?.Package;
+            if (string.IsNullOrWhiteSpace(package))
+                continue;
+            try
+            {
+                if (await ReleaseOnlineExtensionAsync(package, token).ConfigureAwait(false))
+                    released++;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to release temporary extension {Package}.", package);
+            }
+        }
+        return released;
+    }
 
     public async Task<ISourceInterop> GetSourceInteropAsync(string package, long sourceId, CancellationToken token = default)
     {
@@ -366,8 +451,41 @@ public sealed class RpcBridgeClient : IBridgeManager, IExtensionManager, IReposi
     // Channel/dispatch plumbing
     // ---------------------------------------------------------------------
 
-    /// <summary>Creates or reuses a channel for the supervisor's current port.</summary>
+    /// <summary>
+    /// Gated channel getter used by every real operation: blocks until the process is
+    /// LISTENING *and* the bridge inside it is READY (IKVM/Mihon initialized), so calls
+    /// issued during a restart or the init window wait instead of failing.
+    /// </summary>
     private async Task<GrpcChannel> GetChannelAsync(CancellationToken token)
+    {
+        if (!_bridgeReady.Task.IsCompleted)
+        {
+            _logger.LogDebug("Operation waiting for RPC bridge readiness (listening={Port})...", _gate.Port);
+            // Diagnostic: if this takes long, the backend is blocked on readiness — not the child —
+            // (distinguishes "backend stuck" from "child dead").
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(20), token).ConfigureAwait(false);
+                    if (!_bridgeReady.Task.IsCompleted)
+                        _logger.LogWarning(
+                            "RPC bridge readiness still not confirmed after 20s (listening={Port}). Backend calls are blocked.",
+                            _gate.Port);
+                }
+                catch { /* ignore */ }
+            });
+        }
+
+        await BridgeReadyAsync(token).ConfigureAwait(false);
+        return await GetChannelRawAsync(token).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Raw channel getter (listening-only). Used by the readiness poll and internally; it
+    /// deliberately does NOT await the bridge-ready gate to avoid a self-deadlock.
+    /// </summary>
+    private async Task<GrpcChannel> GetChannelRawAsync(CancellationToken token)
     {
         await _gate.Ready.WaitAsync(token).ConfigureAwait(false);
 
@@ -382,7 +500,14 @@ public sealed class RpcBridgeClient : IBridgeManager, IExtensionManager, IReposi
                 return _channel;
 
             _channel?.Dispose();
-            _channel = GrpcChannel.ForAddress($"http://127.0.0.1:{port}");
+            _channel = GrpcChannel.ForAddress($"http://127.0.0.1:{port}", new GrpcChannelOptions
+            {
+                // Large JSON catalogs/chapter lists exceed gRPC's 4 MiB default; raise both
+                // the receive and send ceilings so neither the backend nor the host rejects
+                // a payload the other can legitimately produce (ResourceExhausted fixes).
+                MaxReceiveMessageSize = RpcGrpcSizes.MaxMessageSize,
+                MaxSendMessageSize = RpcGrpcSizes.MaxMessageSize,
+            });
             _channelPort = port;
             _logger.LogInformation("RPC channel bound to 127.0.0.1:{Port}.", port);
             return _channel;

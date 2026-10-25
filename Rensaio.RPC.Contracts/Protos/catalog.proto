@@ -24,6 +24,7 @@ service CatalogService {
   rpc GetPopular (SourcePageRequest) returns (JsonResult);
   rpc GetLatest (SourcePageRequest) returns (JsonResult);
   rpc GetPages (SourceChapterRequest) returns (JsonResult);
+  rpc GetMangaUrl (SourceMangaRequest) returns (JsonResult);
   rpc GetPreferences (SourceRef) returns (JsonResult);
   rpc SetPreferenceByIndex (SetPreferenceIndexRequest) returns (BoolValue);
   rpc SetPreference (SetPreferenceRequest) returns (BoolValue);

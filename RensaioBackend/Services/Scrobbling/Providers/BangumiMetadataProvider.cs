@@ -24,7 +24,7 @@ public class BangumiMetadataProvider : IExternalSeriesProvider
     private readonly HttpClient _httpClient;
     private readonly ILogger<BangumiMetadataProvider> _logger;
     private readonly SeriesMetadataResolver _resolver;
-
+    public string[] SupportedTypes => new[] { "Manga", "Manhwa", "Manhua", "Comics" };
     private const string ApiBase = "https://api.bgm.tv/v0";
 
     public BangumiMetadataProvider(
@@ -54,7 +54,7 @@ public class BangumiMetadataProvider : IExternalSeriesProvider
     public Task<ScrobblerTokenResult> ExchangeCodeAsync(string code, string redirectUri)
         => throw new NotSupportedException("Bangumi does not support OAuth via this flow.");
 
-    public Task<ScrobblerTokenResult> RefreshTokenAsync(string refreshToken)
+    public Task<ScrobblerTokenResult> RefreshTokenAsync(string refreshToken, CancellationToken token = default)
         => throw new NotSupportedException("Bangumi does not support OAuth via this flow.");
 
     public Task<ScrobblerTokenResult> AuthenticateDirectAsync(DirectAuthRequest request)
@@ -70,7 +70,7 @@ public class BangumiMetadataProvider : IExternalSeriesProvider
 
     public async Task<List<ScrobblerSearchResult>> SearchSeriesAsync(string query, CancellationToken token = default)
     {
-        _logger.LogInformation("Bangumi: searching for '{Query}'", query);
+        _logger.LogInformation("{provider}: searching for '{Query}'", ExternalSeriesProvider.Bangumi, query);
         var results = new List<ScrobblerSearchResult>();
         if (string.IsNullOrWhiteSpace(query))
             return results;
@@ -91,10 +91,11 @@ public class BangumiMetadataProvider : IExternalSeriesProvider
             {
                 Content = JsonContent.Create(requestBody)
             };
+            await ProviderRateLimits.EnforceBangumiAsync();
             var response = await _httpClient.SendAsync(request, token);
             if (!response.IsSuccessStatusCode)
             {
-                _logger.LogWarning("Bangumi search failed for '{Query}': HTTP {Status}", query, (int)response.StatusCode);
+                _logger.LogWarning("{provider} search failed for '{Query}': HTTP {Status}", ExternalSeriesProvider.Bangumi, query, (int)response.StatusCode);
                 return results;
             }
 
@@ -122,7 +123,7 @@ public class BangumiMetadataProvider : IExternalSeriesProvider
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
         {
-            _logger.LogWarning(ex, "Bangumi search failed for '{Query}'", query);
+            _logger.LogWarning(ex, "{provider} search failed for '{Query}'", ExternalSeriesProvider.Bangumi, query);
         }
 
         return results;
@@ -130,17 +131,18 @@ public class BangumiMetadataProvider : IExternalSeriesProvider
 
     public async Task<SeriesMetadataResult?> FetchSeriesMetadataAsync(string externalSeriesId, CancellationToken token = default)
     {
-        _logger.LogInformation("Bangumi: fetching metadata for id '{Id}'", externalSeriesId);
+        _logger.LogInformation("{provider}: fetching metadata for id '{Id}'", ExternalSeriesProvider.Bangumi, externalSeriesId);
         if (string.IsNullOrWhiteSpace(externalSeriesId))
             return null;
 
         try
         {
             var url = $"{ApiBase}/subjects/{Uri.EscapeDataString(externalSeriesId)}";
+            await ProviderRateLimits.EnforceBangumiAsync();
             var response = await _httpClient.GetAsync(url, token);
             if (!response.IsSuccessStatusCode)
             {
-                _logger.LogWarning("Bangumi detail failed for id '{Id}': HTTP {Status}", externalSeriesId, (int)response.StatusCode);
+                _logger.LogWarning("{provider} detail failed for id '{Id}': HTTP {Status}", ExternalSeriesProvider.Bangumi, externalSeriesId, (int)response.StatusCode);
                 return null;
             }
 
@@ -183,7 +185,7 @@ public class BangumiMetadataProvider : IExternalSeriesProvider
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
         {
-            _logger.LogWarning(ex, "Bangumi detail failed for id '{Id}'", externalSeriesId);
+            _logger.LogWarning(ex, "{provider} detail failed for id '{Id}'", ExternalSeriesProvider.Bangumi, externalSeriesId);
             return null;
         }
     }

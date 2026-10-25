@@ -81,17 +81,16 @@ public class SeriesMappingEntity
     /// <summary>
     /// App-wide link/decision state. Defaults to <see cref="SeriesMappingStatus.AutoMatched"/>
     /// when the row represents an active link (has an <see cref="ExternalSeriesId"/>). Use
-    /// <see cref="SeriesMappingStatus.Blocked"/> / <see cref="SeriesMappingStatus.TemporaryIgnored"/> /
+    /// <see cref="SeriesMappingStatus.Blocked"/> / <see cref="SeriesMappingStatus.ManualIgnore"/> /
     /// <see cref="SeriesMappingStatus.ForeverIgnored"/> for refusals. The background scan reads
     /// this global value (never the per-user status).
     /// </summary>
     public SeriesMappingStatus MappingStatus { get; set; } = SeriesMappingStatus.AutoMatched;
 
     /// <summary>
-    /// UTC timestamp when this global link/decision was made or confirmed. Also the scheduling
-    /// basis: a <see cref="SeriesMappingStatus.TemporaryIgnored"/> mapping becomes eligible for
-    /// re-evaluation when <c>LinkedDate + 1 month <= now</c>. There is deliberately no separate
-    /// "ReviewAfter" column — it is always derived from <see cref="LinkedDate"/>.
+    /// UTC timestamp when this global link/decision was made or confirmed. For a
+    /// <see cref="SeriesMappingStatus.ManualIgnore"/> row it records when the manual ignore was
+    /// triggered (informational — a manual ignore has no expiration and is never auto re-evaluated).
     ///
     /// Sentinel overload: when <see cref="MappingStatus"/> is <see cref="SeriesMappingStatus.Blocked"/>
     /// for a repair-created (auto-sealed) block, <see cref="LinkedDate"/> carries
@@ -104,9 +103,7 @@ public class SeriesMappingEntity
 
     /// <summary>
     /// Sentinel value stamped on <see cref="LinkedDate"/> for repair-created (auto-sealed) Blocked
-    /// rows. Chosen far in the past (year 2000) so real UTC dates never collide; also naturally
-    /// sorts as "older than" any TemporaryIgnored expiry threshold (so a sealed block is never
-    /// mistaken for an expired TemporaryIgnored).
+    /// rows. Chosen far in the past (year 2000) so real UTC dates never collide.
     /// </summary>
     public static readonly DateTime AutoSealedSentinel =
         new DateTime(2000, 1, 1, 0, 0, 0, DateTimeKind.Utc);

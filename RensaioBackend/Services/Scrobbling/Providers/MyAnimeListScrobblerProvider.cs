@@ -40,9 +40,10 @@ public class MyAnimeListScrobblerProvider : ProxyScrobblerProvider
 
     public override async Task<List<ScrobblerSearchResult>> SearchSeriesAsync(string query, CancellationToken token = default)
     {
-        _logger.LogInformation("MyAnimeList: searching for '{Query}'", query);
+        _logger.LogInformation("{provider}: searching for '{Query}'", ExternalSeriesProvider.MyAnimeList, query);
         _apiHttpClient.ApplyBearerToken(_accessToken);
         var nsfwParam = _settingsService.DirectSettings?.NsfwVisibility == NsfwVisibility.Show ? "&nsfw=true" : "";
+        await ProviderRateLimits.EnforceMyAnimeListAsync();
         var response = await _apiHttpClient.GetAsync(
             $"{ApiBase}/manga?q={Uri.EscapeDataString(query)}&limit=25&fields=id,title,alternative_titles,main_picture,media_type,status,num_chapters,synopsis,mean,start_date{nsfwParam}",
             token);
@@ -98,11 +99,15 @@ public class MyAnimeListScrobblerProvider : ProxyScrobblerProvider
     /// </summary>
     public override async Task<SeriesMetadataResult?> FetchSeriesMetadataAsync(string externalSeriesId, CancellationToken token = default)
     {
-        base._logger.LogInformation("MyAnimeList: fetching metadata for id '{Id}'", externalSeriesId);
+        base._logger.LogInformation("{provider}: fetching metadata for id '{Id}'", ExternalSeriesProvider.MyAnimeList, externalSeriesId);
         if (string.IsNullOrWhiteSpace(externalSeriesId)) return null;
+        // MAL's "unknown"/placeholder id is 0; fetching it is a wasted request and would
+        // otherwise mint a bogus myanimelist:0 edge.
+        if (long.TryParse(externalSeriesId.Trim(), out long malId) && malId <= 0) return null;
         try
         {
             _apiHttpClient.ApplyBearerToken(_accessToken);
+            await ProviderRateLimits.EnforceMyAnimeListAsync();
             var response = await _apiHttpClient.GetAsync(
                 $"{ApiBase}/manga/{externalSeriesId}?fields=id,title,alternative_titles,main_picture,synopsis,media_type,status,num_chapters,mean,start_date",
                 token);
@@ -128,7 +133,7 @@ public class MyAnimeListScrobblerProvider : ProxyScrobblerProvider
         }
         catch (Exception ex)
         {
-            base._logger.LogWarning(ex, "MAL detail failed for id '{Id}'", externalSeriesId);
+            base._logger.LogWarning(ex, "{provider} detail failed for id '{Id}'", ExternalSeriesProvider.MyAnimeList, externalSeriesId);
             return null;
         }
     }
@@ -138,6 +143,7 @@ public class MyAnimeListScrobblerProvider : ProxyScrobblerProvider
         try
         {
             _apiHttpClient.ApplyBearerToken(_accessToken);
+            await ProviderRateLimits.EnforceMyAnimeListAsync();
             var response = await _apiHttpClient.GetAsync(
                 $"{ApiBase}/manga/{externalSeriesId}?fields=my_list_status",
                 token);
@@ -188,6 +194,7 @@ public class MyAnimeListScrobblerProvider : ProxyScrobblerProvider
             };
 
             _apiHttpClient.ApplyBearerToken(_accessToken);
+            await ProviderRateLimits.EnforceMyAnimeListAsync();
             var response = await _apiHttpClient.PatchAsync(
                 $"{ApiBase}/manga/{externalSeriesId}/my_list_status",
                 new FormUrlEncodedContent(formData),

@@ -411,7 +411,7 @@ public sealed class MappingConflictRepairService
             return true;
         }
 
-        // row is AutoMatched / Unmatched / TemporaryIgnored → convert the LIVE row to a
+        // row is AutoMatched / Unmatched / ManualIgnore → convert the LIVE row to a
         // Blocked id-scoped row and clear the seeded columns so it stops propagating.
         row.ExternalSeriesId = externalId;
         row.MappingStatus = SeriesMappingStatus.Blocked;
@@ -583,6 +583,9 @@ public sealed class MappingConflictRepairService
         if (idx <= 0 || idx == linked.Length - 1) return (null, null);
         var slug = linked[..idx];
         var id = linked[(idx + 1)..];
+        // Placeholder ids (e.g. AniList idMal=0 -> "myanimelist:0") are not real links and
+        // must not create a claim, otherwise unrelated series get grouped into one conflict.
+        if (long.TryParse(id.Trim(), out long numeric) && numeric <= 0) return (null, null);
         if (!Enum.TryParse<ExternalSeriesProvider>(slug, true, out var parsed))
         {
             parsed = slug.ToLowerInvariant() switch

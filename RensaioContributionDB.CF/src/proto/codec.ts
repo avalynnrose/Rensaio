@@ -8,10 +8,11 @@
 import { ProtoWriter } from './writer';
 import type {
   ContributionMetadataEntityPayload,
-  ContributionRecordV1Payload,
+  ContributionRecordV2Payload,
   ContributionSeriesEntityPayload,
   ContributionSourceEntityPayload,
   MappingTitleEntityPayload,
+  SourceSeriesEntityPayload,
   TitleEntityPayload,
 } from '../models/requests';
 
@@ -24,6 +25,7 @@ export const SNAPSHOT_FIELD_MAPPING_TITLES = 5;
 export const SNAPSHOT_FIELD_SOURCES = 6;
 export const SNAPSHOT_FIELD_SERIES = 7;
 export const SNAPSHOT_FIELD_METADATA = 8;
+export const SNAPSHOT_FIELD_SOURCE_SERIES = 9;
 
 // Shared scratch writer for nested per-row messages. Each encodeX is fully
 // synchronous and consumes the scratch via finish() into the parent BEFORE the
@@ -64,12 +66,24 @@ export function encodeSource(w: ProtoWriter, row: ContributionSourceEntityPayloa
   scratch.string(4, row.n);
   scratch.string(5, row.l);
   scratch.string(6, row.b);
+  scratch.repeatedString(8, row.li);
   scratch.int32(7, row.v);
+  // field 9 — optional PackageId (omitted when absent so pre-normalization rows decode as null).
+  scratch.string(9, row.pi);
   w.message(SNAPSHOT_FIELD_SOURCES, scratch.finish());
 }
 
-/** Encode a ContributionRecordV1 (field numbers per proto message). */
-export function encodeContributionRecord(w: ProtoWriter, row: ContributionRecordV1Payload): void {
+/** Encode a SourceSeriesEntity row (many-to-many source ↔ series association). */
+export function encodeSourceSeries(w: ProtoWriter, row: SourceSeriesEntityPayload): void {
+  scrub();
+  scratch.string(1, row.s);
+  scratch.string(2, row.e);
+  scratch.int32(3, row.v);
+  w.message(SNAPSHOT_FIELD_SOURCE_SERIES, scratch.finish());
+}
+
+/** Encode a ContributionRecordV2 (field numbers per proto message). */
+export function encodeContributionRecord(w: ProtoWriter, row: ContributionRecordV2Payload): void {
   w.uint32(1, row.v);
   w.string(2, row.i);
   w.string(3, row.t);
@@ -78,6 +92,8 @@ export function encodeContributionRecord(w: ProtoWriter, row: ContributionRecord
   w.bool(6, row.e);
   w.double(7, row.l);
   w.string(8, row.u);
+  w.string(9, row.r);
+  w.string(10, row.m);
 }
 
 /** Encode a ContributionSeriesEntity row (embeds the record). */
@@ -90,6 +106,13 @@ export function encodeSeries(w: ProtoWriter, row: ContributionSeriesEntityPayloa
   encodeContributionRecord(rec, row.d);
   scratch.message(4, rec.finish());
   scratch.int32(5, row.v);
+  // field 6 — optional VerifiedDateUTC (omitted when null, so the cloud keeps its stored value).
+  scratch.string(6, row.z);
+  // field 7 — derived Metadata flag (true = a live metadata row exists). Always emitted so the
+  // decoder sees an explicit false rather than an absent field.
+  scratch.bool(7, row.q === true);
+  // field 8 — optional PackageId (omitted when absent so pre-normalization rows decode as null).
+  scratch.string(8, row.pi);
   w.message(SNAPSHOT_FIELD_SERIES, scratch.finish());
 }
 

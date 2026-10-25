@@ -1032,7 +1032,7 @@ namespace Mihon.ExtensionsBridge.Core.Services
             }
 
             if (jvmLeftovers.Count == 0)
-                return (retargeted, 0);
+                return (retargeted + FixAssignmentTypes(cn, mn, frames, insns, byName, initOf, ctorNeeded), 0);
 
             // Sites are processed in construction order (<init> position); a site without a traceable
             // <init> cannot be validated, so it stays untouched.
@@ -1093,8 +1093,155 @@ namespace Mihon.ExtensionsBridge.Core.Services
                 }
             }
 
-            return (n + retargeted, 0);
+            return (n + retargeted + FixAssignmentTypes(cn, mn, frames, insns, byName, initOf, ctorNeeded), 0);
         }
+
+        /// <summary>
+        /// Repairs dex2jar's NEW <em>site rotation</em> across sibling types — the shape the multiset
+        /// anchoring above cannot see. When dex2jar permutes the emission order of several <c>NEW</c>s whose
+        /// types form a subtype family (e.g. a protobuf serializer allocating <c>r1</c> and its subclasses
+        /// <c>h1</c>/<c>u1</c> in one method), the multiset of NEW types still equals the DEX's, so every
+        /// NEW is anchored to an exact-type counterpart and nothing is retyped — yet a consumer enforces a
+        /// <em>more derived</em> type (<c>putfield h1.n</c>, an invoke whose receiver/parameter is
+        /// <c>h1</c>, or an <c>areturn</c> of <c>h1</c>). The verifier then rejects the method with
+        /// "Unexpected type r1 where h1 was expected".
+        /// <para>
+        /// This pass is oracle-independent: the consuming instruction's own declared owner/parameter/return
+        /// type is proof that the NEW must have been that subtype. It retypes the NEW and retargets (or
+        /// synthesises) its constructor chain exactly like the multiset path, so the emitted bytecode is
+        /// self-consistent. Runs <em>after</em> the multiset loop so it can never be reverted by it.
+        /// </para>
+        /// </summary>
+        /// <returns>The number of NEW sites retyped.</returns>
+        private int FixAssignmentTypes(ClassNode cn, MethodNode mn, Frame[] frames, AbstractInsnNode[] insns,
+            Dictionary<string, ClassNode> byName,
+            Dictionary<TypeInsnNode, (MethodInsnNode min, int index)> initOf,
+            HashSet<(string cls, string desc, string? superToCall)> ctorNeeded)
+        {
+            // NEW -> required (strictly more derived) internal types proven by its consumers.
+            var required = new Dictionary<TypeInsnNode, HashSet<string>>(ReferenceEqualityComparer.Instance);
+
+            void Require(SourceValue? sv, string? expected)
+            {
+                if (sv == null || expected == null || expected.Length == 0 || expected == "java/lang/Object")
+                    return;
+                if (!byName.ContainsKey(expected))
+                    return; // required type is not part of this JAR: cannot retype nor synthesise here
+                var news = new List<TypeInsnNode>();
+                foreach (var src in IterateInsns(sv.insns))
+                {
+                    if (src is TypeInsnNode t && t.getOpcode() == Opcodes.NEW)
+                        news.Add(t);
+                    else
+                        return; // any non-NEW contributor makes the site ambiguous
+                }
+                foreach (var t in news)
+                {
+                    if (t.desc == expected)
+                        continue;
+                    // The required type must be a strict descendant of the emitted one; otherwise the
+                    // mismatch is not this shape and the site stays untouched.
+                    if (!IsAncestor(byName, expected, t.desc))
+                        continue;
+                    if (!required.TryGetValue(t, out var set))
+                        required[t] = set = new HashSet<string>(System.StringComparer.Ordinal);
+                    set.Add(expected);
+                }
+            }
+
+            for (int i = 0; i < insns.Length; i++)
+            {
+                var fr = frames[i];
+                if (fr == null)
+                    continue;
+                int stack = fr.getStackSize();
+                int op = insns[i].getOpcode();
+
+                if (op == Opcodes.PUTFIELD || op == Opcodes.GETFIELD)
+                {
+                    var f = (FieldInsnNode)insns[i];
+                    if (op == Opcodes.PUTFIELD)
+                    {
+                        int valueSize = org.objectweb.asm.Type.getType(f.desc).getSize();
+                        if (stack - 1 - valueSize < 0)
+                            continue;
+                        // objectref must be assignable to the field's declaring class
+                        Require((SourceValue)fr.getStack(stack - 1), f.owner);
+                        // the stored value must be assignable to the field's descriptor
+                        Require((SourceValue)fr.getStack(stack - 1 - valueSize),
+                            InternalNameOf(org.objectweb.asm.Type.getType(f.desc)));
+                    }
+                    else
+                    {
+                        Require((SourceValue)fr.getStack(stack - 1), f.owner);
+                    }
+                }
+                else if (op == Opcodes.INVOKEVIRTUAL || op == Opcodes.INVOKEINTERFACE ||
+                         op == Opcodes.INVOKESPECIAL || op == Opcodes.INVOKESTATIC)
+                {
+                    var m = (MethodInsnNode)insns[i];
+                    var args = org.objectweb.asm.Type.getArgumentTypes(m.desc);
+                    int argBase = stack - args.Length;
+                    if (op != Opcodes.INVOKESTATIC)
+                    {
+                        if (argBase - 1 < 0)
+                            continue;
+                        Require((SourceValue)fr.getStack(argBase - 1), m.owner);
+                    }
+                    // NEW objects passed as arguments to a more derived parameter type.
+                    int slot = argBase;
+                    for (int k = 0; k < args.Length && slot < stack; k++)
+                    {
+                        Require((SourceValue)fr.getStack(slot), InternalNameOf(args[k]));
+                        slot += args[k].getSize();
+                    }
+                }
+                else if (op == Opcodes.ARETURN)
+                {
+                    if (stack < 1)
+                        continue;
+                    Require((SourceValue)fr.getStack(stack - 1),
+                        InternalNameOf(org.objectweb.asm.Type.getReturnType(mn.desc)));
+                }
+            }
+
+            int n = 0;
+            foreach (var kv in required)
+            {
+                if (kv.Value.Count != 1)
+                    continue; // consumers demand different subtypes: leave the site untouched
+                var tin = kv.Key;
+                string expected = System.Linq.Enumerable.First(kv.Value);
+                if (!initOf.TryGetValue(tin, out var init))
+                    continue; // no traceable <init>: cannot validate the ctor shape
+                var min = init.min;
+                if (min.owner != tin.desc)
+                    continue; // the invoked ctor is not this NEW's own type: different shape
+
+                var chain = PlanConstructorChain(byName, expected, min.desc, tin.desc);
+                if (chain == null)
+                {
+                    _logger.LogTrace(
+                        "DexNewInstanceCorrector: cannot synthesise ctor chain {Type}->{CtorDesc} for rotated NEW in {Class}.{Method}{Desc}",
+                        expected, min.desc, cn.name, mn.name, mn.desc);
+                    continue;
+                }
+                string from = tin.desc;
+                min.owner = expected;
+                foreach (var link in chain)
+                    ctorNeeded.Add(link);
+                tin.desc = expected;
+                n++;
+                _logger.LogTrace(
+                    "DexNewInstanceCorrector: retyped rotated NEW {From} -> {To} in {Class}.{Method}{Desc}",
+                    from, expected, cn.name, mn.name, mn.desc);
+            }
+            return n;
+        }
+
+        /// <summary>Internal name of an object type, or <c>null</c> for non-object types.</summary>
+        private static string? InternalNameOf(org.objectweb.asm.Type t)
+            => (t != null && t.getSort() == org.objectweb.asm.Type.OBJECT) ? t.getInternalName() : null;
 
         /// <summary>
         /// True if <paramref name="ancestor"/> is <c>java/lang/Object</c> or appears on

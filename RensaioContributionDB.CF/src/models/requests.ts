@@ -24,12 +24,14 @@ export interface MappingTitleEntityPayload {
   v: number;           // 0 | -1
 }
 
-/** ContributionRecordV1 — embedded in ContributionSeriesEntity.data. */
-export interface ContributionRecordV1Payload {
-  v: number;           // schema version (1)
+/** ContributionRecordV2 — embedded in ContributionSeriesEntity.data (current schema). */
+export interface ContributionRecordV2Payload {
+  v: number;           // schema version (2)
+  r: string;           // Url
   i: string;           // TitleId Guid
-  t: string | null;    // ThumbnailUrl
   s: number;           // Status
+  t: string | null;    // ThumbnailUrl
+  m: string | null;    // Memo
   p: boolean;          // SeenInPopular
   e: boolean;          // SeenInLatest
   l: number | null;    // LastChapter (decimal)
@@ -40,19 +42,31 @@ export interface ContributionRecordV1Payload {
 export interface ContributionSourceEntityPayload {
   i: string;           // SourceId Guid (MD5("package:sourceId"))
   p: string;           // Package
+  pi?: string | null;  // PackageId Guid (MD5("package"))
   s: number;           // SourceId (long)
   n: string;           // SourceName
   l: string;           // SourceLanguage
   b: string | null;    // LastBatchExecutionUTC
+  li?: string[] | null; // LatestIds (ordered series-entry ids of the last GetLatest run)
   v: number;           // 0 | -1
 }
 
-/** ContributionSeriesEntity — per-series source entry. */
+/** SourceSeriesEntity — many-to-many association (source ↔ series entry). */
+export interface SourceSeriesEntityPayload {
+  s: string;           // SourceId Guid (FK → sources.id)
+  e: string;           // SeriesEntityId Guid (FK → series.id)
+  v: number;           // 0 | -1
+}
+
+/** ContributionSeriesEntity — per-series source entry (identity = package:url). */
 export interface ContributionSeriesEntityPayload {
-  i: string;                       // SeriesId Guid
+  i: string;                       // SeriesId Guid (MD5("package:url"))
   m: string;                       // MappingId Guid
-  s: string;                       // SourceId Guid
-  d: ContributionRecordV1Payload;  // embedded record
+  s: string;                       // representative SourceId Guid (legacy; canonical set in source_series)
+  pi?: string | null;              // PackageId Guid (MD5("package"))
+  d: ContributionRecordV2Payload;  // embedded record
+  z?: string | null;               // VerifiedDateUTC — null/absent = unverified
+  q?: boolean;                     // Metadata — DERIVED: a live metadata row exists (true ≠ matched)
   v: number;                       // 0 | -1
 }
 
@@ -78,6 +92,7 @@ export interface UploadRequest {
   t?: TitleEntityPayload[];                     // titles
   m?: MappingTitleEntityPayload[];              // mapping_titles
   s?: ContributionSourceEntityPayload[];        // sources (canonical)
+  x?: SourceSeriesEntityPayload[];              // source ↔ series associations
   i?: ContributionSeriesEntityPayload[];        // series (per-series entries)
   d?: ContributionMetadataEntityPayload[];      // metadata
 }

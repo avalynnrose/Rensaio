@@ -18,6 +18,7 @@ import {
   encodeMetadata,
   encodeSeries,
   encodeSource,
+  encodeSourceSeries,
   encodeTitle,
   SNAPSHOT_FIELD_GENERATED_UTC,
   SNAPSHOT_FIELD_SCHEMA_VERSION,
@@ -28,6 +29,7 @@ import type {
   ContributionSeriesEntityPayload,
   ContributionSourceEntityPayload,
   MappingTitleEntityPayload,
+  SourceSeriesEntityPayload,
   TitleEntityPayload,
 } from '../models/requests';
 import { compressSnapshot, resolveCompression } from '../utils/compression';
@@ -38,6 +40,7 @@ export interface ExportRowSets {
   titles: TitleEntityPayload[];
   mappingTitles: MappingTitleEntityPayload[];
   sources: ContributionSourceEntityPayload[];
+  sourceSeries: SourceSeriesEntityPayload[];
   series: ContributionSeriesEntityPayload[];
   metadata: ContributionMetadataEntityPayload[];
 }
@@ -70,6 +73,7 @@ export async function buildMetadataBin(
   for (const title of rows.titles) encodeTitle(w, title);
   for (const mt of rows.mappingTitles) encodeMappingTitle(w, mt);
   for (const source of rows.sources) encodeSource(w, source);
+  for (const ss of rows.sourceSeries) encodeSourceSeries(w, ss);
   for (const series of rows.series) encodeSeries(w, series);
   for (const meta of rows.metadata) encodeMetadata(w, meta);
 

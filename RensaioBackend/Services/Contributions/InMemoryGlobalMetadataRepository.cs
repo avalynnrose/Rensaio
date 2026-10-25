@@ -148,6 +148,9 @@ public sealed class InMemoryGlobalMetadataRepository : IGlobalMetadataRepository
             return (null, null);
         var slug = linked[..idx];
         var id = linked[(idx + 1)..];
+        // Ignore placeholder ids (e.g. myanimelist:0) — they are not real provider associations.
+        if (long.TryParse(id.Trim(), out long numeric) && numeric <= 0)
+            return (null, null);
         var slugToProvider = new Dictionary<string, ExternalSeriesProvider>(StringComparer.OrdinalIgnoreCase)
         {
             ["myanimelist"] = ExternalSeriesProvider.MyAnimeList,

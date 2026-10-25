@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <!--
+    This project isolates the browser engine dependency from Mihon.ExtensionsBridge.Core, so
+    headless/non-browser deployments do not pull a browser stack. It ships the Patchright engine
+    (a drop-in Microsoft.Playwright replacement). Swapping to vanilla Microsoft.Playwright only
+    requires changing this PackageReference; the provider code is unchanged.
+  -->
+  <ItemGroup>
+    <PackageReference Include="Patchright" Version="1.63.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.8" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.8" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Mihon.ExtensionsBridge.Models\Mihon.ExtensionsBridge.Models.csproj" />
+  </ItemGroup>
+
+</Project>

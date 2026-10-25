@@ -24,6 +24,7 @@ import okhttp3.OkHttpClient
 import okhttp3.brotli.BrotliInterceptor
 import okhttp3.logging.HttpLoggingInterceptor
 import extension.bridge.logging.androidCompatLogger
+import extension.bridge.security.ProxyTrustInstaller
 import java.net.CookieHandler
 import java.net.CookieManager
 import java.net.CookiePolicy
@@ -70,6 +71,16 @@ class NetworkHelper(
             val builder =
                 OkHttpClient
                     .Builder()
+                    // A TLS-terminating proxy (trawl) re-signs every connection, so OkHttp MUST be
+                    // handed the proxy-aware trust manager explicitly: OkHttp builds its socket
+                    // factory from the platform trust store and does NOT honour
+                    // SSLContext.setDefault(), which is exactly why a configured proxy previously
+                    // failed with "PKIX path building failed". The manager reads the live proxy CA
+                    // configuration, so wiring it once here survives later reconfiguration.
+                    .sslSocketFactory(
+                        ProxyTrustInstaller.sslSocketFactory(),
+                        ProxyTrustInstaller.trustManager(),
+                    )
                     .cookieJar(PersistentCookieJar(cookieStore))
                     .connectTimeout(30, TimeUnit.SECONDS)
                     .readTimeout(30, TimeUnit.SECONDS)

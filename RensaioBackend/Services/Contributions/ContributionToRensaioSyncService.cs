@@ -59,7 +59,7 @@ namespace RensaioBackend.Services.Contributions
                 // cloud is also cleared in rensaio.db on every client. Id-level blocks (real key)
                 // only — hard blocks (empty key) are refusals for providers we don't track here.
                 var matches = await _contributorDb.Metadata
-                    .Include(m => m.Mapping)
+                    .Include(m => m.Series)
                     .Where(m => m.Version == VersionUploaded
                         && (m.MappingStatus == SeriesMappingStatus.AutoMatched
                             || m.MappingStatus == SeriesMappingStatus.UserConfirmed
@@ -80,7 +80,7 @@ namespace RensaioBackend.Services.Contributions
                     // treats it as settled but an explicit user confirm of the same id always wins
                     // (see ConfirmMatchAsync's IsAutoSealedBlock override).
                     var linkedDate = isBlocked ? SeriesMappingEntity.AutoSealedSentinel : DateTime.UtcNow;
-                    await _cascade.CascadeAsync(match.MappingId, provider,
+                    await _cascade.CascadeAsync(match.SeriesId, provider,
                         apply: m =>
                         {
                             // Never downgrade a stronger Rensaio decision.

@@ -132,10 +132,9 @@ public partial class App : Application
         try
         {
             // Build and start the ASP.NET Core host (this can run on background thread).
-            // Desktop hosts IKVM/CEF IN-PROCESS (Startup chooses AddExtensionsBridge when
-            // not Docker), so the tray injects the Avalonia UI-thread CEF pump. This is the
-            // known-good configuration; a separate child process crashes in JavaVM.GetEnv.
-            _host = RensaioBackend.Program.CreateHostBuilder(Array.Empty<string>()).AddCefTimer().Build();
+            // The tray is fully decoupled from IKVM/CEF: the backend supervises the
+            // extension runtime process (Rensaio.RPC). The tray just hosts the backend + UI.
+            _host = RensaioBackend.Program.CreateHostBuilder(Array.Empty<string>()).Build();
             // Start the ASP.NET Core host (this can run on background thread).
             // Wrap in a tracked task so host crashes are logged even though we
             // deliberately don't await here (to keep the UI thread responsive).
@@ -151,7 +150,7 @@ public partial class App : Application
                 }
                 catch (Exception ex)
                 {
-                    FallbackCrashLogger.WriteException(ex, "TRAY HOST STARTAsync FAILED");
+                    //FallbackCrashLogger.WriteException(ex, "TRAY HOST STARTAsync FAILED");
                     Console.WriteLine($"Backend host failed to start: {ex.Message}");
                 }
             });
@@ -163,12 +162,10 @@ public partial class App : Application
         }
         catch (Exception ex)
         {
-            FallbackCrashLogger.WriteException(ex, "TRAY StartApplication FAILED");
+            //FallbackCrashLogger.WriteException(ex, "TRAY StartApplication FAILED");
             Console.WriteLine($"Failed to start application: {ex.Message}");
         }
     }
-
-
     
 
     private async Task GracefulShutdownAsync()

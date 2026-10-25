@@ -23,6 +23,9 @@
   <ItemGroup>
     <ProjectReference Include="..\Rensaio.RPC.Contracts\Rensaio.RPC.Contracts.csproj" />
     <ProjectReference Include="..\Mihon.ExtensionsBridge.Net\Mihon.ExtensionsBridge.Core\Mihon.ExtensionsBridge.Core.csproj" />
+    <!-- Browser engine providers (Patchright/Playwright). Kept out of Core so a non-browser
+         deployment does not pull a browser stack; only the RPC hosts reference it. -->
+    <ProjectReference Include="..\Mihon.ExtensionsBridge.Net\Mihon.ExtensionsBridge.Browser\Mihon.ExtensionsBridge.Browser.csproj" />
   </ItemGroup>
 
 </Project>

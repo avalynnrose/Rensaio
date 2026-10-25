@@ -71,9 +71,9 @@ public class ExternalMappingsController : ControllerBase
     /// <summary>
     /// GET /api/external-mappings?filter=all|unmatched|blocked&page=&pageSize=&provider=&status=
     /// Series-scope only. `unmatched` (default) returns only local series that have at least one
-    /// Unmatched provider row, or a TemporaryIgnored row whose LinkedDate + 1 month has passed
-    /// (the ignore has expired — the row is treated as Unmatched again). `blocked` returns only
-    /// series that have at least one Blocked provider row.
+    /// Unmatched provider row. `blocked` returns only series that have at least one Blocked
+    /// provider row. A <c>ManualIgnore</c> row is a settled refusal with no expiration, so it is
+    /// never treated as Unmatched again.
     /// </summary>
     [HttpGet]
     public async Task<ActionResult<ExternalMappingsPageDto>> List(
@@ -95,9 +95,6 @@ public class ExternalMappingsController : ControllerBase
         var isUnmatchedFilter = string.Equals(filter, "unmatched", StringComparison.OrdinalIgnoreCase)
             || string.IsNullOrWhiteSpace(filter);
         var isBlockedFilter = string.Equals(filter, "blocked", StringComparison.OrdinalIgnoreCase);
-
-        // Cutoff for "TemporaryIgnored has expired": LinkedDate + 1 month <= now.
-        var nowMinusOneMonth = DateTime.UtcNow.AddMonths(-1);
 
         // Series scope: grouped by series — one group per local series, each holding one entry per
         // enabled metadata provider. Pagination is over series (total = number of groups, never
@@ -128,7 +125,7 @@ public class ExternalMappingsController : ControllerBase
             SeriesMappingStatus.AutoMatched,
             SeriesMappingStatus.UserConfirmed,
             SeriesMappingStatus.Blocked,
-            SeriesMappingStatus.TemporaryIgnored,
+            SeriesMappingStatus.ManualIgnore,
             SeriesMappingStatus.ForeverIgnored
         };
 
@@ -162,15 +159,6 @@ public class ExternalMappingsController : ControllerBase
                         AlternativeTitles = [] // Unmatched rows carry no provider alt titles yet
                     };
 
-                // Expired TemporaryIgnored → treat as Unmatched again (re-evaluation due).
-                // LinkedDate + 1 month <= now  <=>  LinkedDate <= now - 1 month.
-                if (row.MappingStatus == SeriesMappingStatus.TemporaryIgnored &&
-                    row.LinkedDate != null &&
-                    row.LinkedDate <= nowMinusOneMonth)
-                {
-                    row.MappingStatus = SeriesMappingStatus.Unmatched;
-                }
-
                 if (status != null)
                 {
                     if (row.MappingStatus != status) continue;
@@ -191,7 +179,7 @@ public class ExternalMappingsController : ControllerBase
             if (group.Providers.Count == 0) continue;
 
             // filter=unmatched (default): keep only series that have at least one provider row
-            // needing attention (Unmatched, including freshly-expired TemporaryIgnored).
+            // needing attention (Unmatched). A ManualIgnore is a settled refusal, not Unmatched.
             if (isUnmatchedFilter && !groupHasUnmatched) continue;
             // filter=blocked: keep only series that have at least one Blocked provider row.
             if (isBlockedFilter && !groupHasBlocked) continue;
@@ -275,9 +263,9 @@ public class ExternalMappingsController : ControllerBase
     [HttpPost("series/{seriesId:guid}/scan")]
     public async Task<ActionResult> ScanSeries(Guid seriesId, CancellationToken token)
     {
-        // Explicit per-series scan: re-evaluate ONLY the pending providers (unmatched / expired
-        // TemporaryIgnored / id-blocked / stale active rows / enabled providers with no row).
-        // Matched and other settled providers are never re-searched.
+        // Explicit per-series scan: re-evaluate ONLY the pending providers (unmatched /
+        // id-blocked / stale active rows / enabled providers with no row).
+        // Matched and other settled providers (including ManualIgnore) are never re-searched.
         var enabledProviders = await _linkEngine.GetEnabledProviderSetAsync(token).ConfigureAwait(false);
         var result = await _linkEngine.LinkSeriesAsync(seriesId, token, enabledProviders).ConfigureAwait(false);
         return Ok(new
@@ -391,7 +379,7 @@ public class ExternalMappingsController : ControllerBase
             .FirstOrDefaultAsync(m => m.SeriesId == seriesId && m.Provider == providerResolved, token);
         var status = dto?.Forever ?? false
             ? SeriesMappingStatus.ForeverIgnored
-            : SeriesMappingStatus.TemporaryIgnored;
+            : SeriesMappingStatus.ManualIgnore;
         if (mapping == null)
         {
             mapping = new SeriesMappingEntity
@@ -420,7 +408,7 @@ public class ExternalMappingsController : ControllerBase
     /// <summary>
     /// POST /api/external-mappings/series/{seriesId}/ignore-all — mark every Not Matched
     /// (Unmatched) provider for one series as ForeverIgnored ("Ignore always"). Providers that
-    /// already carry a decision (auto/user matched, blocked, active TemporaryIgnored, or already
+    /// already carry a decision (auto/user matched, blocked, ManualIgnore, or already
     /// ForeverIgnored) are left untouched. Providers without a persisted mapping row are
     /// synthesized as Unmatched on the page, so a ForeverIgnored row is created for them — the
     /// same semantics as the per-provider ignore action.
@@ -435,7 +423,6 @@ public class ExternalMappingsController : ControllerBase
         var providers = await _support.GetEnabledProvidersAsync(user, token);
 
         var now = DateTime.UtcNow;
-        var expiryThreshold = now.AddMonths(-1); // expired TemporaryIgnored re-opens as Unmatched
         var existing = await _db.SeriesMappings
             .Where(m => m.SeriesId == seriesId)
             .ToListAsync(token);
@@ -462,12 +449,9 @@ public class ExternalMappingsController : ControllerBase
                 continue;
             }
 
-            // Only Not Matched rows are ignored: Unmatched, or a TemporaryIgnored whose month
-            // has elapsed (the page treats it as Unmatched again — re-evaluation due).
-            var isUnmatched = mapping.MappingStatus == SeriesMappingStatus.Unmatched
-                || (mapping.MappingStatus == SeriesMappingStatus.TemporaryIgnored
-                    && mapping.LinkedDate != null
-                    && mapping.LinkedDate <= expiryThreshold);
+            // Only Not Matched rows are ignored: a real Unmatched row. ManualIgnore is a settled
+            // decision and is left untouched.
+            var isUnmatched = mapping.MappingStatus == SeriesMappingStatus.Unmatched;
             if (!isUnmatched) continue;
 
             mapping.MappingStatus = SeriesMappingStatus.ForeverIgnored;

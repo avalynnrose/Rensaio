@@ -20,6 +20,7 @@ public class ComicVineMetadataProvider : IExternalSeriesProvider
     private readonly HttpClient _httpClient;
     private readonly ILogger<ComicVineMetadataProvider> _logger;
     private readonly IServiceScopeFactory _scopeFactory;
+    public string[] SupportedTypes => new[] { "Comics" };
 
     private const string ApiBase = "https://comicvine.gamespot.com/api";
 
@@ -64,7 +65,7 @@ public class ComicVineMetadataProvider : IExternalSeriesProvider
     public Task<ScrobblerTokenResult> ExchangeCodeAsync(string code, string redirectUri)
         => throw new NotSupportedException("ComicVine does not support OAuth.");
 
-    public Task<ScrobblerTokenResult> RefreshTokenAsync(string refreshToken)
+    public Task<ScrobblerTokenResult> RefreshTokenAsync(string refreshToken, CancellationToken token = default)
         => throw new NotSupportedException("ComicVine does not support OAuth.");
 
     public Task<bool> ValidateApiKeyAsync(string apiKey)
@@ -75,12 +76,13 @@ public class ComicVineMetadataProvider : IExternalSeriesProvider
 
     public async Task<List<ScrobblerSearchResult>> SearchSeriesAsync(string query, CancellationToken token = default)
     {
-        _logger.LogInformation("ComicVine: searching for '{Query}'", query);
+        _logger.LogInformation("{provider}: searching for '{Query}'", ExternalSeriesProvider.ComicVine, query);
         var apiKey = await GetApiKeyAsync();
         if (string.IsNullOrEmpty(apiKey))
             return [];
         HttpRequestMessage msg = new HttpRequestMessage(HttpMethod.Get, $"{ApiBase}/search/?query={Uri.EscapeDataString(query)}&format=json&api_key={apiKey}&resources=volume");
         msg.Headers.UserAgent.ParseAdd("Rensaio 1.0");
+        await ProviderRateLimits.EnforceComicVineAsync("volume");
         var response = await _httpClient.SendAsync(msg, token);
 
         response.EnsureSuccessStatusCode();
@@ -114,7 +116,7 @@ public class ComicVineMetadataProvider : IExternalSeriesProvider
 
     public async Task<SeriesMetadataResult?> FetchSeriesMetadataAsync(string externalSeriesId, CancellationToken token = default)
     {
-        _logger.LogInformation("ComicVine: fetching metadata for id '{Id}'", externalSeriesId);
+        _logger.LogInformation("{provider}: fetching metadata for id '{Id}'", ExternalSeriesProvider.ComicVine, externalSeriesId);
         if (string.IsNullOrWhiteSpace(externalSeriesId)) return null;
         var apiKey = await GetApiKeyAsync();
         if (string.IsNullOrEmpty(apiKey)) return null;
@@ -123,11 +125,12 @@ public class ComicVineMetadataProvider : IExternalSeriesProvider
         {
             HttpRequestMessage msg = new HttpRequestMessage(HttpMethod.Get, $"{ApiBase}/volume/4050-{Uri.EscapeDataString(externalSeriesId)}/?format=json&api_key={apiKey}&field_list=id,name,aliases,image,count_of_issues,description,start_year");
             msg.Headers.UserAgent.ParseAdd("Rensaio 1.0");
+            await ProviderRateLimits.EnforceComicVineAsync("volume");
             var response = await _httpClient.SendAsync(msg, token);
 
             if (!response.IsSuccessStatusCode)
             {
-                _logger.LogWarning("ComicVine detail failed for id '{Id}': HTTP {Status}", externalSeriesId, (int)response.StatusCode);
+                _logger.LogWarning("{provider} detail failed for id '{Id}': HTTP {Status}", ExternalSeriesProvider.ComicVine, externalSeriesId, (int)response.StatusCode);
                 return null;
             }
             
@@ -155,7 +158,7 @@ public class ComicVineMetadataProvider : IExternalSeriesProvider
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "ComicVine detail failed for id '{Id}'", externalSeriesId);
+            _logger.LogWarning(ex, "{provider} detail failed for id '{Id}'", ExternalSeriesProvider.ComicVine, externalSeriesId);
             return null;
         }
     }
@@ -173,6 +176,7 @@ public class ComicVineMetadataProvider : IExternalSeriesProvider
     private static string[] NoCategories = ["manhwa", "manga", "manhua"];
     public bool CanSearchSeries(List<string> genres, string? category = null)
     {
+
         if (category != null && NoCategories.Contains(category.ToLowerInvariant())) return false;
         if (genres != null && genres.Any(g => NoCategories.Contains(g.ToLowerInvariant()))) return false;
         return true;

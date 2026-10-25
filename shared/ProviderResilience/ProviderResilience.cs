@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Net;
+using System.Net.Sockets;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
@@ -26,6 +27,51 @@ public sealed class ProviderResilienceOptions
     public int CircuitBreakThreshold { get; init; } = 5;
 
     public static ProviderResilienceOptions Default { get; } = new();
+}
+
+/// <summary>
+/// Classifies outbound HTTP transport failures shared by every provider client.
+///
+/// A PERMANENT DNS failure — the host no longer resolves (<c>SocketError.HostNotFound</c>,
+/// "No such host is known") — must never be retried: the host is gone, so retrying only delays
+/// the caller's own recovery (for example the image provider rotating a stale cover domain onto
+/// the extension's new <c>homeUrl</c>/mirror) and floods the log with identical failures. A
+/// transient network/DNS blip is NOT permanent: a routing error or a timeout is recovered by the
+/// normal retry policy.
+///
+/// This file is compiled into both RensaioBackend and RensaioOAuthProxy (linked source), so the
+/// classification stays identical in both services.
+/// </summary>
+public static class ProviderHttpFailures
+{
+    /// <summary>
+    /// True when the failure (or one of its inner exceptions) is a permanent DNS resolution
+    /// failure, i.e. the host itself does not resolve. Matched on the <see cref="SocketError"/>
+    /// code first, then on the OS message so it is recognized regardless of how the exception was
+    /// wrapped (a bare <see cref="SocketException"/>, or an <see cref="HttpRequestException"/>
+    /// with the socket error as its inner exception).
+    /// </summary>
+    public static bool IsPermanentDnsFailure(Exception? ex)
+    {
+        for (Exception? current = ex; current is not null; current = current.InnerException)
+        {
+            if (current is SocketException socket &&
+                (socket.SocketErrorCode == SocketError.HostNotFound
+                 || socket.SocketErrorCode == SocketError.NoData))
+            {
+                return true;
+            }
+
+            if (current.Message.Contains("No such host is known", StringComparison.OrdinalIgnoreCase)
+                || current.Message.Contains("nodename nor servname", StringComparison.OrdinalIgnoreCase)
+                || current.Message.Contains("Name or service not known", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 }
 
 /// <summary>
@@ -116,12 +162,30 @@ public sealed class ResilientProviderHttpHandler : DelegatingHandler
             }
             catch (HttpRequestException ex)
             {
+                // A permanent DNS failure (the host no longer resolves) is NOT retried and does NOT
+                // trip the host circuit: the host is gone, so retrying only delays the caller's own
+                // recovery (e.g. the image provider rotating a stale cover domain onto the source's
+                // new homeUrl/mirror). Rethrow immediately — the caller classifies and acts on it.
+                if (ProviderHttpFailures.IsPermanentDnsFailure(ex))
+                {
+                    throw;
+                }
+
                 lastException = ex;
                 response = null;
             }
-            catch (TaskCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+            catch (TimeoutException ex)
             {
-                // HttpClient timeout (caller token was not cancelled) — transient.
+                // A socket/connect timeout that surfaced unwrapped — transient.
+                lastException = ex;
+                response = null;
+            }
+            catch (OperationCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                // A timeout (HttpClient.Timeout / SocketsHttpHandler) surfaces as TaskCanceledException
+                // — an OperationCanceledException — while the caller token is NOT cancelled; it is a
+                // transient timeout worth retrying rather than a deliberate cancellation. Catching the
+                // base type also covers the less common timeout shapes that are not TaskCanceledException.
                 lastException = ex;
                 response = null;
             }

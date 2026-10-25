@@ -40,6 +40,10 @@ public static class RpcServiceCollectionExtensions
         // image providers and the seed sweep.
         services.TryAddSingleton<IExtensionRpcBridge>(sp => sp.GetRequiredService<RpcBridgeClient>());
 
+        // Telemetry link: streams the child's logs back over gRPC and holds the
+        // WatchParent liveness stream so the child dies with the backend.
+        services.AddHostedService<RpcTelemetryLink>();
+
         // Supervisor runs as a hosted service so it starts with the app and stops
         // (gracefully) with it. It is NOT dependent on anything the tray injects.
         services.AddHostedService(sp =>
@@ -49,6 +53,7 @@ public static class RpcServiceCollectionExtensions
             // same extension/temp layout the backend expects.
             supervisor.BridgeFolder = EnvironmentSetup.Configuration?["BridgeFolder"] ?? "extensions";
             supervisor.TempFolder = EnvironmentSetup.Configuration?["TempFolder"];
+            // A single child host (Rensaio.RPC) serves every deployment (Docker + desktop tray).
             return supervisor;
         });
 

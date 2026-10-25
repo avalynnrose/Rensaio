@@ -17,6 +17,7 @@ import type {
   ContributionSeriesEntityPayload,
   ContributionSourceEntityPayload,
   MappingTitleEntityPayload,
+  SourceSeriesEntityPayload,
   TitleEntityPayload,
 } from '../models/requests';
 import { buildMetadataBin, type ExportRowSets } from './export-engine';
@@ -188,36 +189,52 @@ export async function loadAllRows(db: D1Database): Promise<ExportRowSets> {
     .all<{ mapping_id: string; title_id: string }>();
   const sources = await db
     .prepare(
-      `SELECT id, package, source_id, source_name, source_language, last_batch_utc, replication_version
+      `SELECT id, package, package_id, source_id, source_name, source_language, last_batch_utc, latest_ids, replication_version
        FROM sources WHERE archived_at IS NULL`
     )
     .all<{
       id: string;
       package: string;
+      package_id: string | null;
       source_id: number;
       source_name: string;
       source_language: string;
-      last_batch_utc: string | null;
+      last_batch_utc: string | null; latest_ids: string | null;
+      replication_version: number | null;
+    }>();
+  const sourceSeries = await db
+    .prepare(
+      `SELECT source_id, series_entity_id, replication_version
+       FROM source_series WHERE archived_at IS NULL`
+    )
+    .all<{
+      source_id: string;
+      series_entity_id: string;
       replication_version: number | null;
     }>();
   const series = await db
     .prepare(
-      `SELECT id, mapping_id, source_id, title_id, thumbnail_url, status,
-              seen_in_popular, seen_in_latest, last_chapter, last_update_utc,
-              replication_version
+      `SELECT id, mapping_id, source_id, package_id, title_id, url, thumbnail_url, status, memo,
+              seen_in_popular, seen_in_latest, last_chapter, last_update_utc, verified_date_utc,
+              metadata_flag, replication_version
        FROM series WHERE archived_at IS NULL`
     )
     .all<{
       id: string;
       mapping_id: string;
       source_id: string;
+      package_id: string | null;
       title_id: string;
+      url: string;
       thumbnail_url: string | null;
       status: number;
+      memo: string | null;
       seen_in_popular: number;
       seen_in_latest: number;
       last_chapter: number | null;
       last_update_utc: string | null;
+      verified_date_utc: string | null;
+      metadata_flag: number;
       replication_version: number | null;
     }>();
   const metadata = await db
@@ -249,26 +266,38 @@ export async function loadAllRows(db: D1Database): Promise<ExportRowSets> {
     sources: (sources.results ?? []).map<ContributionSourceEntityPayload>((r) => ({
       i: r.id,
       p: r.package,
+      pi: r.package_id,
       s: r.source_id,
       n: r.source_name,
       l: r.source_language,
       b: r.last_batch_utc,
+      li: r.latest_ids ? JSON.parse(r.latest_ids) : null,
+      v: r.replication_version ?? 0,
+    })),
+    sourceSeries: (sourceSeries.results ?? []).map<SourceSeriesEntityPayload>((r) => ({
+      s: r.source_id,
+      e: r.series_entity_id,
       v: r.replication_version ?? 0,
     })),
     series: (series.results ?? []).map<ContributionSeriesEntityPayload>((r) => ({
       i: r.id,
       m: r.mapping_id,
       s: r.source_id,
+      pi: r.package_id,
       d: {
-        v: 1, // ContributionRecordV1 schema version
+        v: 2, // ContributionRecordV2 schema version
+        r: r.url,
         i: r.title_id,
-        t: r.thumbnail_url,
         s: r.status,
+        t: r.thumbnail_url,
+        m: r.memo,
         p: r.seen_in_popular === 1,
         e: r.seen_in_latest === 1,
         l: r.last_chapter,
         u: r.last_update_utc,
       },
+      z: r.verified_date_utc,
+      q: r.metadata_flag === 1,
       v: r.replication_version ?? 0,
     })),
     metadata: (metadata.results ?? []).map<ContributionMetadataEntityPayload>((r) => ({
@@ -320,6 +349,12 @@ export async function stampExportedRows(db: D1Database, exportedVersion: number)
       .bind(exportedVersion, exportedVersion),
     db
       .prepare(
+        `UPDATE source_series SET replication_version = ? WHERE archived_at IS NULL
+           AND (replication_version IS NULL OR (replication_version >= 0 AND replication_version < ?))`
+      )
+      .bind(exportedVersion, exportedVersion),
+    db
+      .prepare(
         `UPDATE metadata SET replication_version = ? WHERE archived_at IS NULL
            AND (replication_version IS NULL OR (replication_version >= 0 AND replication_version < ?))`
       )
@@ -366,6 +401,16 @@ export async function scrubArchived(db: D1Database): Promise<{
   metadata: number;
   titles: number;
 }> {
+  // Associations first (child of both sources and series).
+  await db
+    .prepare(
+      `DELETE FROM source_series
+       WHERE archived_at IS NOT NULL
+         AND archived_at < datetime('now', ?)`
+    )
+    .bind(`-${ARCHIVE_RETENTION_DAYS} days`)
+    .run();
+
   await db
     .prepare(
       `DELETE FROM series

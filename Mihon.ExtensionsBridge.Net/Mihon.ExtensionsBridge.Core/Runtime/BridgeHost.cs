@@ -6,6 +6,7 @@ using System.Reflection;
 using Mihon.ExtensionsBridge.Core.Extensions;
 using Mihon.ExtensionsBridge.Core.Utilities;
 using Mihon.ExtensionsBridge.Models.Abstractions;
+using Mihon.ExtensionsBridge.Models.Abstractions.Browser;
 using System.Runtime.Loader;
 
 namespace Mihon.ExtensionsBridge.Core.Runtime
@@ -18,7 +19,7 @@ namespace Mihon.ExtensionsBridge.Core.Runtime
         private readonly IBridgeManager _manager;
         private readonly ILoggerFactory _loggerFactory;
 
-        private readonly IStartCefTimer? _cefStartTimer;
+        private readonly IBrowserAutomationService? _browserService;
         private ILogger? _androidLogger;
         //private IkvmAssemblyLoadContext alc;
 
@@ -49,13 +50,13 @@ namespace Mihon.ExtensionsBridge.Core.Runtime
         }
 
 
-        public BridgeHost(ILogger<BridgeHost> logger, IWorkingFolderStructure folder, IBridgeManager manager, ILoggerFactory loggerFactory, IStartCefTimer cefStartTimer = null)
+        public BridgeHost(ILogger<BridgeHost> logger, IWorkingFolderStructure folder, IBridgeManager manager, ILoggerFactory loggerFactory, IBrowserAutomationService browserService = null)
         {
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _folder = folder ?? throw new ArgumentNullException(nameof(folder));
             _manager = manager ?? throw new ArgumentNullException(nameof(manager));
             _loggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
-            _cefStartTimer = cefStartTimer;
+            _browserService = browserService;
         }
         public 
         static void Preload(IkvmAssemblyLoadContext alc, string simpleName)
@@ -73,13 +74,39 @@ namespace Mihon.ExtensionsBridge.Core.Runtime
             var baseDir = Path.GetFullPath(AppContext.BaseDirectory);
             Startup.addBootClassPathAssembly(Assembly.LoadFrom(Path.Combine(baseDir, "Android.Compat.dll")));
 
+            // Install the .NET browser host BEFORE applicationSetup.
+            //
+            // applicationSetup -> androidCompat.startApp -> AndroidCompatInitializer registers the
+            // WebView provider factory, and extensions begin creating WebViews shortly after. The
+            // provider factory picks the hosted provider only when BrowserHostGateway.isAvailable(),
+            // so installing afterwards (as this used to) meant early WebViews fell back to JCEF --
+            // and JCEF's own AWT/Class.forName init then failed. Paths are safe to use here: the
+            // Android/temp folders come from IWorkingFolderStructure, not from Kotlin settings.
+            if (_browserService != null)
+            {
+                try
+                {
+                    await _browserService.WarmUpAsync(cancellationToken).ConfigureAwait(false);
+                    if (_browserService.IsAvailable)
+                    {
+                        Browser.BrowserHostBridge.TryInstall(_browserService, _logger);
+                        _logger.LogInformation(
+                            "Browser host installed before AndroidCompat startup (provider gateway is live).");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Browser automation warm-up failed; WebView sources will degrade.");
+                }
+            }
+
             // IMPORTANT: applicationSetup MUST be called before any code path that could access
             // SettingsConfig (called via ConfigKt.getSettings()). It registers the SettingsConfig
             // module in GlobalConfigManager. If we await before this call, other hosted services
             // may run concurrently and trigger a lazy access to settingsModule (Config.kt:103)
             // before it is registered, causing a NullPointerException:
             //   "null cannot be cast to non-null type extension.bridge.SettingsConfig"
-            StartupKt.applicationSetup(folder.AndroidFolder, folder.TempFolder, new AndroidCompatLogManager.LoggerSink(logger), _cefStartTimer!=null);
+            StartupKt.applicationSetup(folder.AndroidFolder, folder.TempFolder, new AndroidCompatLogManager.LoggerSink(logger));
             AndroidCompatLogManager.SetLoglevel(logger);
 
             // Load preferences AFTER applicationSetup — this involves an I/O await that
@@ -92,8 +119,10 @@ namespace Mihon.ExtensionsBridge.Core.Runtime
 
             await _manager.SetPreferencesAsync(prefs, cancellationToken);
 
-            // At this point CEF should have been initialized. This will wire Desktop Apps only.
-            _cefStartTimer?.StartCefPumpTimer();
+            // NOTE: the browser host was already warmed up and installed BEFORE applicationSetup
+            // (see above), so a WebView created during AndroidCompat startup picks the hosted
+            // provider rather than falling back to JCEF.
+
             _logger.LogInformation("Android App initialized.");
 
 
@@ -200,33 +229,19 @@ namespace Mihon.ExtensionsBridge.Core.Runtime
             await _manager.InitializeAsync(stoppingToken).ConfigureAwait(false);
             _logger.LogInformation("Bridge Host initialized.");
 
-            // Periodic idle sweep for cached extension interops: releases native IKVM
-            // classloaders + JVM heaps for extensions that have been idle >30min (and
-            // enforces the interop cache max count). Runs every 5 minutes, best-effort.
-            var lastSweep = DateTime.UtcNow;
-            while (!stoppingToken.IsCancellationRequested)
+            // Idle/max-count eviction of cached extension interops is owned solely by
+            // the RPC-hosted ExtensionLruService, which applies the configured
+            // MaxLoadedExtensions/IdleUnloadMinutes policy. A second sweep here would
+            // race it with the hard-coded defaults (32 loaded / 30 min) and could
+            // unload interops ahead of the configured cap. So this host no longer
+            // sweeps — it just parks until shutdown is requested.
+            try
             {
-                try
-                {
-                    await Task.Delay(100, stoppingToken).ConfigureAwait(false);
-                }
-                catch (TaskCanceledException)
-                {
-                    // Ignore
-                }
-
-                if (DateTime.UtcNow - lastSweep >= TimeSpan.FromMinutes(5))
-                {
-                    lastSweep = DateTime.UtcNow;
-                    try
-                    {
-                        if (_manager is BridgeManager bridgeManager)
-                        {
-                            await bridgeManager.SweepIdleInteropsAsync().ConfigureAwait(false);
-                        }
-                    }
-                    catch (Exception ex) { _logger.LogWarning(ex, "Interop idle sweep failed (best-effort)."); }
-                }
+                await Task.Delay(Timeout.Infinite, stoppingToken).ConfigureAwait(false);
+            }
+            catch (TaskCanceledException)
+            {
+                // Shutdown requested.
             }
             _logger.LogInformation("Bridge Host shutting down...");
             _manager.Shutdown();

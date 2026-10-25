@@ -81,13 +81,22 @@ namespace RensaioBackend.Services
             services.AddScoped<IImageProvider, UrlImageProvider>();
             services.AddScoped<IImageProvider, ExtensionsImageProvider>();
             services.AddScoped<IImageProvider, StorageImageProvider>();
+            // Corrects cover URLs whose host was abandoned by an extension (e.g. a contribution-DB
+            // cover still on the old domain) onto the source's current homeUrl/mirror domains, and
+            // remembers the correction in memory so later covers skip the dead host. Scoped: it uses
+            // the scoped MihonBridgeService for the (cached) extension-metadata lookup.
+            services.TryAddScoped<CoverUrlDomainResolver>();
             // Scoped: the bounded URL/ETag caches are static, so they are already shared
             // across all scoped consumers regardless of lifetime. A singleton must NOT
             // capture the scoped AppDbContext (and scoped IImageProviders) in its
             // constructor — that shares one DbContext across concurrent requests and
             // throws "A second operation was started on this context instance.
             services.TryAddScoped<ThumbCacheService>();
-            services.AddHttpClient(nameof(ThumbCacheService), SetHttpClientHeaders);
+            // Image/ETag cache client: the shared resilience handler retries transient transport /
+            // 5xx / 429 failures (and circuit-breaks per image host). Mid-stream body failures that
+            // surface while copying the response are additionally retried inside UrlImageProvider
+            // (see UpdateCacheWithRemoteAsync), because they occur after SendAsync returns.
+            services.AddHttpClient(nameof(ThumbCacheService), SetHttpClientHeaders).AddProviderResilience();
             services.TryAddScoped<IImageFactory, NetVipsImageFactory>();
             services.TryAddScoped<ArchiveHelperService>();
             services.TryAddScoped<DailyService>();
@@ -105,9 +114,25 @@ namespace RensaioBackend.Services
             services.TryAddScoped<Contributions.ContributionPropagationService>();
             services.TryAddScoped<Contributions.ContributionMappingService>();
             services.TryAddScoped<Contributions.RensaioMappingCascadeService>();
+            // Reconciles a contribution series' title associations against Auto/User links,
+            // tombstoning association rows that exist only because of a Blocked provider.
+            services.TryAddScoped<Contributions.ContributionTitleHeuristicsService>();
+            // Repairs the contribution graph structure (orphaned Series + their SeriesTitles).
+            services.TryAddScoped<Contributions.ContributionGraphRepairService>();
+            // One-shot: reclaims historical local-only tombstone bloat (deletes -1/-3 rows, orphans
+            // and VACUUM), guarded by PRAGMA user_version so it runs at most once.
+            services.TryAddScoped<Contributions.ContributionTombstoneCleanupService>();
             // Low-level contributor.db graph writer shared by propagation and the seed sweep.
             services.TryAddScoped<Contributions.ContributionGraphWriter>();
-            // One-shot seeding sweep worker (started only when --seed is supplied).
+            // Resolves a contribution source entry's relative url to the absolute page url via the
+            // owning extension's getMangaUrl. Singleton so its bounded LRU (Original Url → Full Url)
+            // persists across requests.
+            services.TryAddSingleton<Contributions.MangaUrlResolver>();
+            // Re-usable extension scanning / matching / writing unit (records series into
+            // contributor.db incrementally). Drivable from any entry point, not just --seed.
+            services.TryAddScoped<Background.ExtensionSweepService>();
+            // One-shot seeding sweep worker (started only when --seed is supplied): sweeps
+            // via ExtensionSweepService then exports the contribution database once.
             services.TryAddScoped<Background.SeedService>();
 
             return AddScrobblingServicesCore(services, configuration);
@@ -128,6 +153,13 @@ namespace RensaioBackend.Services
             // Contribution Mappings flows (registered before the engine which depends on them).
             services.TryAddScoped<Metadata.MetadataMatchCore>();
             services.TryAddScoped<Metadata.ExternalMappingSupport>();
+            // Image (PDQ) matching: URL-keyed hash cache + orchestration + matcher.
+            services.TryAddScoped<Metadata.ImageHashCacheService>();
+            services.TryAddScoped<Metadata.ImageMatchCore>();
+            services.TryAddScoped<Metadata.ImageMatcher>();
+            // Content-type gate: metadata providers only run when they support at least one of the
+            // content types derived from the root "TypeMappings" list for the source package.
+            services.AddSingleton<Metadata.MetadataTypeGate>();
             services.TryAddScoped<Metadata.MetadataLinkEngine>();
             // Wrong-linkage detection + auto-block repair (depends on the engine; registered after).
             services.TryAddScoped<Metadata.MappingConflictRepairService>();
@@ -188,6 +220,10 @@ namespace RensaioBackend.Services
             services.TryAddSingleton<MetadataBackgroundScanService>();
             services.TryAddSingleton<ContributionUploadBackgroundService>();
             services.TryAddSingleton<ContributionImportBackgroundService>();
+            // Single startup orchestrator for the contribution/mapping repair pipeline
+            // (conflict repair → title reconciliation → cover backfill). Must be registered
+            // or StartupHostedService.StartWorker cannot resolve it and the whole pass is skipped.
+            services.TryAddSingleton<ContributionRepairBackgroundService>();
             return services;
         }
 

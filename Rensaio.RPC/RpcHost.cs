@@ -2,10 +2,12 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Mihon.ExtensionsBridge.Browser;
 using Mihon.ExtensionsBridge.Core.Extensions;
 using Mihon.ExtensionsBridge.Models.Abstractions;
 using Mihon.ExtensionsBridge.Models.Configuration;
 using Rensaio.RPC.Configuration;
+using Rensaio.RPC.Contracts;
 using Rensaio.RPC.Logging;
 using Rensaio.RPC.Runtime;
 
@@ -14,16 +16,12 @@ namespace Rensaio.RPC;
 /// <summary>
 /// Reusable host for the isolated Mihon/IKVM/CEF runtime.
 ///
-/// Two hosts share this:
-///  - <c>Rensaio.RPC</c> (headless): plain ASP.NET hosting, no UI, no CEF pump host.
-///    This is the Docker/Linux behavior.
-///  - <c>Rensaio.DesktopRPC</c> (desktop): an Avalonia app that hosts this same ASP.NET
-///    app but injects an Avalonia-UI-thread CEF pump (<see cref="IStartCefTimer"/>) via the
-///    <c>configure</c> hook. This reproduces the historically-working tray topology where
-///    IKVM/CEF ran on the Avalonia UI thread.
+/// The single host <c>Rensaio.RPC</c> (plain ASP.NET, no UI) serves every deployment:
+/// Docker and the desktop tray. The Avalonia-hosted <c>Rensaio.DesktopRPC</c> variant was
+/// removed with JCEF.
 ///
-/// The pump is deliberately overridable: the headless default is registered first and the
-/// caller's <c>configure</c> runs last, so the last <c>IStartCefTimer</c> registration wins.
+/// NOTE: the Avalonia-UI-thread CEF message pump (IStartCefTimer) was removed with JCEF; the
+/// .NET-hosted browser drives itself and needs no external pump.
 /// </summary>
 public static class RpcHost
 {
@@ -34,10 +32,7 @@ public static class RpcHost
     public static void PrepareEnvironment()
     {
         // Diagnostic parity with the tray (RensaioTray/Program.cs sets this too).
-        // IKVM_VERBOSE makes IKVM emit its classloader/JNI-attach diagnostics.
-        Environment.SetEnvironmentVariable("IKVM_VERBOSE", "1");
 
-        // Debug hook: when RENSAIO_RPC_DEBUGGER=1, block at startup until a debugger is
         // attached. Never set in normal runs.
         if (Environment.GetEnvironmentVariable("RENSAIO_RPC_DEBUGGER") == "1")
         {
@@ -51,50 +46,28 @@ public static class RpcHost
         // Force AWT headless mode BEFORE any IKVM/JCEF code runs.
         java.lang.System.setProperty("java.awt.headless", "true");
 
-        // Verify the headless property actually took effect before AWT/JCEF initialize.
-        try
-        {
-            string? prop = java.lang.System.getProperty("java.awt.headless");
-            bool isHeadless = java.awt.GraphicsEnvironment.isHeadless();
-            string toolkit = java.awt.Toolkit.getDefaultToolkit().getClass().getName();
-            Console.WriteLine($"[RPC] headless probe: property={prop} isHeadless={isHeadless} toolkit={toolkit}");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[RPC] headless probe failed: {ex.GetType().Name}: {ex.Message}");
-        }
-
-        // TLS trust diagnostic (backs TrustManagerBridge).
-        try
-        {
-            string javaHome = java.lang.System.getProperty("java.home") ?? "(null)";
-            var tmf = javax.net.ssl.TrustManagerFactory.getInstance(
-                javax.net.ssl.TrustManagerFactory.getDefaultAlgorithm());
-            tmf.init((java.security.KeyStore?)null);
-            int accepted = 0;
-            var managers = tmf.getTrustManagers()!;
-            foreach (var tm in managers)
-            {
-                if (tm is javax.net.ssl.X509TrustManager x509)
-                    accepted += x509.getAcceptedIssuers()?.Length ?? 0;
-            }
-            Console.WriteLine($"[RPC] trust probe: java.home={javaHome} acceptedIssuers={accepted}");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[RPC] trust probe failed: {ex.GetType().Name}: {ex.Message}");
-        }
-
-        InstallFirstChanceLogger();
+      
     }
 
     /// <summary>
     /// Builds the RPC <see cref="WebApplication"/>. The optional <paramref name="configure"/>
     /// hook runs last so a host can override registrations (notably <see cref="IStartCefTimer"/>).
     /// </summary>
+    /// <summary>Readiness handshake target file (from --handshake-file), or null for stdout.</summary>
+    internal static string? HandshakeFilePath;
+
+    /// <summary>
+    /// EXPERIMENT: the loopback port the host bound to, published for in-process self-tests
+    /// (the standalone gRPC soak drives the real Kestrel HTTP/2 endpoint from inside the
+    /// same process, so it needs the negotiated port without a supervisor handshake).
+    /// 0 until the application has started.
+    /// </summary>
+    public static int BoundPort;
+
     public static WebApplication Build(string[] args, Action<IServiceCollection>? configure = null)
     {
         RpcAppSettings settings = RpcAppSettings.Parse(args);
+        HandshakeFilePath = settings.HandshakeFile;
 
         var builder = WebApplication.CreateBuilder(new WebApplicationOptions
         {
@@ -110,8 +83,27 @@ public static class RpcHost
         });
 
         // Route every log event to stdout in the RENS-RPC format.
-        builder.Logging.ClearProviders();
-        builder.Logging.AddProvider(new StdoutLoggerProvider(Console.Out));
+//        builder.Logging.ClearProviders();
+//        builder.Logging.AddProvider(new StdoutLoggerProvider(Console.Out));
+
+        // ── DIAGNOSTIC OPT-IN (RENSAIO_RPC_VERBOSE=1) ───────────────────────────────────────
+        // LOWERS the minimum level to Debug for the whole RPC process tree. This is what makes the
+        // webview/browser diagnostics (all of which are now Debug) actually visible, since the
+        // JVM-side floor also has to be lowered (see AndroidCompatLogManager).
+        //
+        // OFF by default: the per-call browser telemetry is heavy, and normal operation should be
+        // quiet. Turn it on only when diagnosing a webview-specific problem.
+        bool verbose = string.Equals(
+            Environment.GetEnvironmentVariable("RENSAIO_RPC_VERBOSE"),
+            "1",
+            StringComparison.OrdinalIgnoreCase);
+        if (verbose)
+        {
+            builder.Logging.SetMinimumLevel(LogLevel.Debug);
+            // Also lift the per-provider filters, otherwise the default configuration filters
+            // debug out again for the "Microsoft" / "System" categories.
+            builder.Logging.AddFilter((_, _, level) => level >= LogLevel.Debug);
+        }
 
         // Fold command-line path switches into the bridge Paths options.
         builder.Services.Configure<Paths>(p =>
@@ -128,17 +120,13 @@ public static class RpcHost
                 o.Cef.Enabled = settings.CefEnabled.Value;
         });
 
+       
         // Bridge registration — the RPC is the only place that touches IKVM/CEF.
         builder.Services.AddExtensionsBridge();
 
-        // Default (headless) CEF pump. A desktop host overrides this via `configure`.
-        builder.Services.AddSingleton<IStartCefTimer>(sp =>
-        {
-            var options = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<RpcOptions>>().Value;
-            if (!options.Cef.Enabled)
-                return new DisabledCefTimer(sp.GetRequiredService<ILogger<DisabledCefTimer>>());
-            return ActivatorUtilities.CreateInstance<RpcCefTimer>(sp);
-        });
+        // Pluggable browser automation providers (Patchright primary, Playwright fallback).
+        // Registered here so Core never takes an assembly reference on a browser engine.
+        builder.Services.AddBrowserProviders();
 
         // Per-start token + LRU policy.
         builder.Services.AddSingleton(new RpcStartupToken(settings.Token ?? string.Empty));
@@ -147,7 +135,14 @@ public static class RpcHost
         builder.Services.AddSingleton(new ParentProcessId(settings.ParentProcessId));
         builder.Services.AddSingleton(new ParentWatchOptions(settings.WatchParent));
         builder.Services.AddHostedService<ParentProcessWatcher>();
-        builder.Services.AddSingleton<SourceCallGate>(_ => new SourceCallGate(8));
+        // EXPERIMENT (RENSAIO_RPC_GATE): make the global extension-call concurrency budget
+        // tunable so we can test whether bounding concurrent extension/WebView execution
+        // removes the WToolkit.eventLoop -> JavaVM.GetEnv FailFast. Default 8 (unchanged).
+        // Set RENSAIO_RPC_GATE=1 to fully serialize extension calls.
+        int gateCapacity = int.TryParse(Environment.GetEnvironmentVariable("RENSAIO_RPC_GATE"), out int gc) && gc > 0
+            ? gc
+            : 8;
+        builder.Services.AddSingleton<SourceCallGate>(_ => new SourceCallGate(gateCapacity));
         builder.Services.AddSingleton<KeyedAsyncLock>();
         builder.Services.AddSingleton<SourceCallRunner>();
         builder.Services.AddSingleton<Services.SourceResolver>();
@@ -155,8 +150,30 @@ public static class RpcHost
         builder.Services.AddHostedService(sp => sp.GetRequiredService<ExtensionLruService>());
         builder.Services.AddSingleton<RpcReadiness>();
 
+        // gRPC log stream: every structured log line is ALSO published to the hub and
+        // streamed to the backend (the child is launched detached, so stdout is not captured).
+        var logHub = new RpcLogHub();
+        builder.Services.AddSingleton(logHub);
+        builder.Logging.ClearProviders();
+        builder.Logging.AddProvider(new RpcLogStreamProvider(logHub));
+
+        // ── EXPERIMENT (dimension B): allow disabling gRPC + Kestrel HTTP2 entirely. ──
+        // Set RENSAIO_RPC_NO_GRPC=1 to skip AddGrpc and the HTTP/2 listeners, so the
+        // DesktopRPC standalone soak runs IKVM/CEF with NO gRPC/Kestrel surface at all.
+        // If the WToolkit.eventLoop -> JavaVM.GetEnv FailFast disappears, dimension B
         // gRPC, loopback only (explicit addresses — ListenLocalhost(0) is illegal in Kestrel).
-        builder.Services.AddGrpc();
+        // EXPERIMENT: when RENSAIO_RPC_DIAG=1, install the call-tracing interceptor globally.
+        bool diagGrpc = Environment.GetEnvironmentVariable("RENSAIO_RPC_DIAG") == "1";
+        builder.Services.AddGrpc(options =>
+        {
+            // Match the backend client's raised ceilings (RpcGrpcSizes): catalog/chapter
+            // JSON payloads routinely exceed gRPC's 4 MiB default, which otherwise surfaces
+            // as ResourceExhausted on either side of the call.
+            options.MaxReceiveMessageSize = RpcGrpcSizes.MaxMessageSize;
+            options.MaxSendMessageSize = RpcGrpcSizes.MaxMessageSize;
+            if (diagGrpc)
+                options.Interceptors.Add<Runtime.RpcCallInterceptor>();
+        });
         builder.WebHost.ConfigureKestrel(kestrel =>
         {
             kestrel.Listen(System.Net.IPAddress.Loopback, 0, listen =>
@@ -181,10 +198,12 @@ public static class RpcHost
     /// <summary>Maps services, wires the readiness handshake, and runs the host.</summary>
     public static async Task RunAsync(WebApplication app, CancellationToken cancellationToken)
     {
+
         app.MapGrpcService<Services.ControlGrpcService>();
         app.MapGrpcService<Services.ExtensionsGrpcService>();
         app.MapGrpcService<Services.CatalogGrpcService>();
         app.MapGrpcService<Services.ContentGrpcService>();
+
 
         var readiness = app.Services.GetRequiredService<RpcReadiness>();
 
@@ -192,6 +211,7 @@ public static class RpcHost
         lifetime.ApplicationStarted.Register(() =>
         {
             int port = ResolveBoundPort(app);
+            BoundPort = port; // EXPERIMENT: expose for in-process gRPC soak
             RpcHandshakeWriter.WriteReady(port, Program.RpcVersion);
 
             var bridge = app.Services.GetRequiredService<IBridgeManager>();
@@ -224,53 +244,8 @@ public static class RpcHost
         return 0;
     }
 
-    /// <summary>
-    /// Diagnostic: writes every IKVM/CEF/Java-origin first-chance exception to
-    /// <c>rpc-crash-YYYYMMDD.log</c> so a reverse-JNI failure has recoverable context.
-    /// </summary>
-    private static void InstallFirstChanceLogger()
-    {
-        AppDomain.CurrentDomain.FirstChanceException += (_, e) =>
-        {
-            var ex = e.Exception;
-            if (ex == null)
-                return;
-
-            string source = ex.Source ?? string.Empty;
-            string typeName = ex.GetType().FullName ?? string.Empty;
-            bool interesting =
-                source.Contains("IKVM", StringComparison.OrdinalIgnoreCase) ||
-                source.Contains("Android", StringComparison.OrdinalIgnoreCase) ||
-                typeName.Contains("cef", StringComparison.OrdinalIgnoreCase) ||
-                typeName.Contains("jni", StringComparison.OrdinalIgnoreCase) ||
-                typeName.StartsWith("java.", StringComparison.Ordinal) ||
-                typeName.StartsWith("javax.", StringComparison.Ordinal);
-            if (!interesting)
-                return;
-
-            try
-            {
-                string path = Path.Combine(AppContext.BaseDirectory, $"rpc-crash-{DateTime.UtcNow:yyyyMMdd}.log");
-                string entry =
-                    $"[{DateTime.UtcNow:O}] thread={Environment.CurrentManagedThreadId} " +
-                    $"type={typeName} source={source}\n{ex}\n---\n";
-                File.AppendAllText(path, entry);
-            }
-            catch
-            {
-                // Logging must never throw.
-            }
-        };
-    }
 }
 
-/// <summary>No-op pump used when CEF is disabled by configuration.</summary>
-public sealed class DisabledCefTimer : IStartCefTimer
-{
-    private readonly ILogger _logger;
-    public DisabledCefTimer(ILogger logger) => _logger = logger;
-    public void StartCefPumpTimer() => _logger.LogInformation("CEF pump not started (disabled).");
-}
 
 /// <summary>Writes the single readiness handshake line the backend parses.</summary>
 public static class RpcHandshakeWriter
@@ -279,9 +254,19 @@ public static class RpcHandshakeWriter
 
     public static void WriteReady(int port, string version)
     {
+        string line = Contracts.RpcHandshake.BuildReadyLine(port, version);
+
+        // Preferred: a handshake FILE the supervisor polls (no stdio redirection needed).
+        string? file = RpcHost.HandshakeFilePath;
+        if (!string.IsNullOrWhiteSpace(file))
+        {
+            try { File.WriteAllText(file, line); } catch { /* best effort */ }
+            return;
+        }
+
         lock (Sync)
         {
-            Console.Out.WriteLine(Contracts.RpcHandshake.BuildReadyLine(port, version));
+            Console.Out.WriteLine(line);
             Console.Out.Flush();
         }
     }

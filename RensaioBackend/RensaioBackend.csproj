@@ -115,15 +115,12 @@
 
 	<ItemGroup>
 		<!--
-		  On DESKTOP the backend hosts the extension runtime IN-PROCESS (IKVM/CEF
-		  need a real desktop UI thread; a separate child process fails with a
-		  reverse-JNI crash in JavaVM.GetEnv). On Docker/headless the isolated
-		  Rensaio.RPC child is used instead. Hence the Core reference is present:
-		  the tray links it in-process, the Docker backend simply does not activate
-		  it (Startup picks AddRpcBridge when EnvironmentSetup.IsDocker).
+		  RensaioBackend is fully DECOUPLED from Mihon/IKVM/CEF. The extension
+		  runtime always runs in a separate process (Rensaio.RPC) and is reached
+		  over gRPC, on every deployment (Docker and desktop).
+		  Only the IKVM-free models/interfaces and the gRPC contracts are referenced.
 		-->
 		<ProjectReference Include="..\Mihon.ExtensionsBridge.Net\Mihon.ExtensionsBridge.Models\Mihon.ExtensionsBridge.Models.csproj" />
-		<ProjectReference Include="..\Mihon.ExtensionsBridge.Net\Mihon.ExtensionsBridge.Core\Mihon.ExtensionsBridge.Core.csproj" />
 		<ProjectReference Include="..\Rensaio.RPC.Contracts\Rensaio.RPC.Contracts.csproj" />
 	</ItemGroup>
 
@@ -155,5 +152,13 @@
 
   </Target>
 -->
+
+  <ItemGroup>
+    <!-- Exposes internal sweep helpers (e.g. ExtensionSweepService.CountBaselineMatches) to the
+         focused unit-test project without widening their visibility in production code. -->
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+      <_Parameter1>RensaioBackend.Tests</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
 
 </Project>

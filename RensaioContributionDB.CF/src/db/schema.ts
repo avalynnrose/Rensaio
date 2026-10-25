@@ -49,31 +49,50 @@ export interface MappingTitle {
 export interface Source {
   id: string;              // MD5("package:sourceId") as text Guid
   package: string;
+  package_id: string | null; // MD5("package") as text Guid — package-scoped identity
   source_id: number;
   source_name: string;
   source_language: string;
   last_batch_utc: string | null;
+  latest_ids: string | null;            // JSON array of series-entry ids from the last GetLatest
   contributor_id: string | null;       // last contributor that touched the row
   replication_version: number | null;  // current replication version; -1 delete
   archived_at: string | null;
 }
 
 /**
+ * Represents a row in the `source_series` D1 table (ContributionSourceSeriesEntity) — the
+ * many-to-many association between a source and the series entries it contributes.
+ * Composite PK is (source_id, series_entity_id).
+ */
+export interface SourceSeries {
+  source_id: string;        // FK → sources.id
+  series_entity_id: string; // FK → series.id
+  replication_version: number | null;  // current replication version; -1 delete
+  archived_at: string | null;
+}
+
+/**
  * Represents a row in the `series` D1 table (ContributionSeriesEntity).
- * ContributionRecordV1 is flattened into columns.
+ * ContributionRecordV2 is flattened into columns.
  * `id` is MD5("package:sourceId:url") as text Guid.
  */
 export interface Series {
-  id: string;              // MD5("package:sourceId:url") as text Guid
+  id: string;              // MD5("package:url") as text Guid
   mapping_id: string;      // FK → mappings.id
-  source_id: string;       // FK → sources.id
-  title_id: string;        // FK → titles.id (ContributionRecordV1.TitleId)
+  source_id: string;       // representative FK → sources.id (legacy; canonical set in source_series)
+  package_id: string | null; // MD5("package") as text Guid — package-scoped identity
+  title_id: string;        // FK → titles.id (ContributionRecordV2.TitleId)
+  url: string;             // ContributionRecordV2.Url (canonical source url)
   thumbnail_url: string | null;
   status: number;
+  memo: string | null;     // ContributionRecordV2.Memo
   seen_in_popular: number; // 0/1
   seen_in_latest: number;  // 0/1
   last_chapter: number | null;
   last_update_utc: string | null;
+  verified_date_utc: string | null;    // manual verification timestamp (NULL = unverified)
+  metadata_flag: number;               // 0/1 — derived: a live metadata row exists (transfer only)
   contributor_id: string | null;       // stamped server-side from uploader
   replication_version: number | null;  // current replication version; -1 delete
   archived_at: string | null;

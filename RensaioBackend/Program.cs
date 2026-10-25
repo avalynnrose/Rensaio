@@ -15,9 +15,10 @@ namespace RensaioBackend
             // global handlers.  EnvironmentSetup.Path is resolved in the static
             // constructor so it's safe to use here.  This ensures crash-(date).log
             // is available from the very first millisecond of the process.
+            /*
             var crashLogDir = System.IO.Path.Combine(EnvironmentSetup.Path, "logs");
             FallbackCrashLogger.Initialize(crashLogDir);
-
+            */
             // Install the Windows Vectored Exception Handler (VEH) to catch native
             // crashes (AccessViolation, StackOverflow, etc.) that managed handlers
             // can never see.  This is CRITICAL because IKVM runs native JVM code
@@ -30,6 +31,8 @@ namespace RensaioBackend
             // NOTE: the previous IKVM/Android/Mihon/Java source filters are gone: no JVM
             // runs in this process any more (it lives in Rensaio.RPC), so only Rensaio
             // code is of interest here.
+            
+            /*
             AppDomain.CurrentDomain.FirstChanceException += (sender, e) =>
             {
                 var source = e.Exception?.Source ?? "";
@@ -39,11 +42,13 @@ namespace RensaioBackend
                         "FIRSTCHANCE: " + e.Exception?.GetType().Name + " from " + source);
                 }
             };
-
+            */
             // Register global exception traps BEFORE any initialization code runs.
             // These handlers capture crashes that bypass AspNetCore's error pipeline
             // (e.g. native crashes, StackOverflowException, finalizer thread crashes,
             // unobserved task exceptions, and silent process kills).
+
+            /*
             AppDomain.CurrentDomain.UnhandledException += (sender, e) =>
             {
                 var ex = e.ExceptionObject as Exception;
@@ -68,11 +73,11 @@ namespace RensaioBackend
                 FallbackCrashLogger.Write("ProcessExit fired (HasShutdownStarted=" + state + ")");
                 try { Log.Information("ProcessExit fired (HasShutdownStarted={State})", state); } catch { }
                 // Uninstall VEH to avoid native handler running after we've started cleanup
-               /* try { NativeCrashHandler.Uninstall(); } catch { }*/
+                 try { NativeCrashHandler.Uninstall(); } catch { }
                 // Flush Serilog synchronously so buffered entries are written before the process dies.
                 try { Log.CloseAndFlush(); } catch { }
             };
-
+            */
             await EnvironmentSetup.InitializeAsync(null);
 
             var host = CreateHostBuilder(args).Build();
@@ -83,7 +88,7 @@ namespace RensaioBackend
             }
             catch (Exception ex)
             {
-                FallbackCrashLogger.WriteException(ex, "HOST RUN THREW UNEXPECTED EXCEPTION");
+                //FallbackCrashLogger.WriteException(ex, "HOST RUN THREW UNEXPECTED EXCEPTION");
                 try { Log.Fatal(ex, "Host terminated unexpectedly"); } catch { }
                 throw;
             }

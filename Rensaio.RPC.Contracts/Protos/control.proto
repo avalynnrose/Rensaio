@@ -24,6 +24,26 @@ service ControlService {
 
   // Graceful unload of all interops, then process exit.
   rpc PrepareShutdown (ShutdownRequest) returns (Empty);
+
+  // Server-streaming structured log lines (RpcLogLine.ToLine format). Replaces
+  // stdout/stderr capture now that the child is launched detached (no pipes).
+  rpc StreamLogs (LogStreamRequest) returns (stream LogLineMessage);
+
+  // Server-streaming liveness. Completes (stream end) when the backend/parent
+  // process dies, so the child can shut itself down. The backend holds this open.
+  rpc WatchParent (WatchParentRequest) returns (stream Empty);
+
+  // Reads the bridge-global preferences the RPC host has loaded (FlareSolverr,
+  // SocksProxy, Browser, interceptors). Returned as JSON in JsonResult (the shared
+  // model layer serializes it; see RpcJson).
+  rpc GetPreferences (BridgePreferencesRequest) returns (JsonResult);
+
+  // Pushes bridge-global preferences into the RUNNING RPC host. The backend is the
+  // source of truth (its SettingsService owns the FlareSolverr/browser settings);
+  // without this the RPC host would only ever see whatever preferences.json it
+  // happened to load at startup, so a settings change (or a missing file) left
+  // FlareSolverr silently disabled and Cloudflare challenges unsolvable.
+  rpc SetPreferences (SetBridgePreferencesRequest) returns (Empty);
 }
 
 message PingRequest {
@@ -55,4 +75,35 @@ message StatusReply {
 message ShutdownRequest {
   string token = 1;
   string reason = 2;
+}
+
+message LogStreamRequest {
+  string token = 1;
+  // How many recent buffered lines to replay on subscribe (late-join window).
+  int32 backlog = 2;
+}
+
+message LogLineMessage {
+  // One RpcLogLine.ToLine() line, exactly as the old stdout pipe carried it.
+  string line = 1;
+}
+
+message WatchParentRequest {
+  string token = 1;
+  // Parent (backend) process id to watch.
+  int32 parent_pid = 2;
+  // Parent start time (UTC ticks) so a recycled PID is not mistaken for the parent.
+  int64 parent_start_utc_ticks = 3;
+}
+
+// NOTE: names are prefixed "Bridge" because this package (rensaio.rpc.v1) is shared with
+// catalog.proto, which already defines `SetPreferencesRequest` (per-source prefs).
+message BridgePreferencesRequest {
+  string token = 1;
+}
+
+message SetBridgePreferencesRequest {
+  string token = 1;
+  // JSON-encoded Mihon.ExtensionsBridge.Models.Preferences (RpcJson options).
+  string preferences_json = 2;
 }

@@ -75,7 +75,7 @@ public class AniListScrobblerProvider : ProxyScrobblerProvider
     ///   - Implicit flow: fail gracefully — the proxy has no refresh token for
     ///     this session and would reject the request.
     /// </summary>
-    public override async Task<ScrobblerTokenResult> RefreshTokenAsync(string refreshToken)
+    public override async Task<ScrobblerTokenResult> RefreshTokenAsync(string refreshToken, CancellationToken token = default)
     {
         if (UseImplicitFlow)
         {
@@ -86,12 +86,12 @@ public class AniListScrobblerProvider : ProxyScrobblerProvider
             };
         }
 
-        return await base.RefreshTokenAsync(refreshToken);
+        return await base.RefreshTokenAsync(refreshToken, token);
     }
 
     public override async Task<List<ScrobblerSearchResult>> SearchSeriesAsync(string query, CancellationToken token = default)
     {
-        _logger.LogInformation("AniList: searching for '{Query}'", query);
+        _logger.LogInformation("{provider}: searching for '{Query}'", ExternalSeriesProvider.AniList, query);
         var graphQlQuery = @"
             query ($search: String) {
                 Page(page: 1, perPage: 25) {
@@ -114,6 +114,7 @@ public class AniListScrobblerProvider : ProxyScrobblerProvider
 
         var requestBody = new { query = graphQlQuery, variables = new { search = query } };
         _apiHttpClient.ApplyBearerToken(_accessToken);
+        await ProviderRateLimits.EnforceAniListAsync();
         var response = await _apiHttpClient.PostAsJsonAsync(GraphQlEndpoint, requestBody, token);
         response.EnsureSuccessStatusCode();
 
@@ -130,8 +131,10 @@ public class AniListScrobblerProvider : ProxyScrobblerProvider
                 titleCandidates.AddRange(media.Synonyms);
 
             var linkedSites = new List<string> { $"anilist:{media.Id}" };
-            if (media.IdMal.HasValue)
-                linkedSites.Add($"myanimelist:{media.IdMal.Value}");
+            // AniList reports idMal=0 for manga with no MyAnimeList entry; that is a
+            // placeholder, not a real id, so it must not become a declared edge.
+            if (media.IdMal is int malId && malId > 0)
+                linkedSites.Add($"myanimelist:{malId}");
 
             results.Add(new ScrobblerSearchResult
             {
@@ -158,7 +161,7 @@ public class AniListScrobblerProvider : ProxyScrobblerProvider
     /// </summary>
     public override async Task<SeriesMetadataResult?> FetchSeriesMetadataAsync(string externalSeriesId, CancellationToken token = default)
     {
-        base._logger.LogInformation("AniList: fetching metadata for id '{Id}'", externalSeriesId);
+        base._logger.LogInformation("{provider}: fetching metadata for id '{Id}'", ExternalSeriesProvider.AniList, externalSeriesId);
         if (string.IsNullOrWhiteSpace(externalSeriesId)) return null;
         try
         {
@@ -191,6 +194,7 @@ public class AniListScrobblerProvider : ProxyScrobblerProvider
             };
 
             _apiHttpClient.ApplyBearerToken(_accessToken);
+            await ProviderRateLimits.EnforceAniListAsync();
             var response = await _apiHttpClient.PostAsJsonAsync(GraphQlEndpoint, requestBody, token);
             if (!response.IsSuccessStatusCode) return null;
 
@@ -203,7 +207,9 @@ public class AniListScrobblerProvider : ProxyScrobblerProvider
             if (media.Synonyms != null) titleCandidates.AddRange(media.Synonyms);
 
             var linkedSites = new List<string> { $"anilist:{media.Id}" };
-            if (media.IdMal.HasValue) linkedSites.Add($"myanimelist:{media.IdMal.Value}");
+            // idMal=0 is AniList's "no MyAnimeList entry" placeholder — never a real edge.
+            if (media.IdMal is int malId && malId > 0)
+                linkedSites.Add($"myanimelist:{malId}");
 
             return new SeriesMetadataResult
             {
@@ -241,6 +247,7 @@ public class AniListScrobblerProvider : ProxyScrobblerProvider
         };
 
         _apiHttpClient.ApplyBearerToken(_accessToken);
+        await ProviderRateLimits.EnforceAniListAsync();
         var response = await _apiHttpClient.PostAsJsonAsync(GraphQlEndpoint, requestBody, token);
         response.EnsureSuccessStatusCode();
 
@@ -290,6 +297,7 @@ public class AniListScrobblerProvider : ProxyScrobblerProvider
             variables = new { id = int.Parse(externalSeriesId), progress = (int)chapterNumber }
         };
         _apiHttpClient.ApplyBearerToken(_accessToken);
+        await ProviderRateLimits.EnforceAniListAsync();
         var response = await _apiHttpClient.PostAsJsonAsync(GraphQlEndpoint, requestBody, token);
         if (response.IsSuccessStatusCode)
         {
@@ -307,6 +315,7 @@ public class AniListScrobblerProvider : ProxyScrobblerProvider
         {
             _apiHttpClient.ApplyBearerToken(_accessToken);
             var query = @"{ Viewer { id } }";
+            await ProviderRateLimits.EnforceAniListAsync();
             var response = await _apiHttpClient.PostAsJsonAsync(GraphQlEndpoint, new { query }, token);
             response.EnsureSuccessStatusCode();
             var result = await response.Content.ReadFromJsonAsync<AniListViewerResponse>(cancellationToken: token);
@@ -338,6 +347,7 @@ public class AniListScrobblerProvider : ProxyScrobblerProvider
                 }";
 
             var requestBody = new { query, variables = new { id = int.Parse(externalSeriesId) } };
+            await ProviderRateLimits.EnforceAniListAsync();
             var response = await _apiHttpClient.PostAsJsonAsync(GraphQlEndpoint, requestBody, token);
             response.EnsureSuccessStatusCode();
 

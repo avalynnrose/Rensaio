@@ -12,11 +12,12 @@ public sealed class RpcExtensionInterop : IExtensionInterop
 {
     private readonly List<ISourceInterop> _sources;
 
-    public RpcExtensionInterop(string name, string packageId, List<ISourceInterop> sources)
+    public RpcExtensionInterop(string name, string packageId, List<ISourceInterop> sources, string version = "")
     {
         Name = name;
         Id = packageId;
         _sources = sources;
+        Version = version ?? string.Empty;
     }
 
     public string Id { get; }
@@ -24,8 +25,9 @@ public sealed class RpcExtensionInterop : IExtensionInterop
     public string Name { get; }
 
     /// <summary>
-    /// Version is resolved lazily from the RPC descriptor set; the backend keeps
-    /// it informational only. Empty means "not resolved yet".
+    /// Active extension version, populated from the repository group at resolve
+    /// time. The backend uses it to detect a stale pinned interop; empty means
+    /// "not resolved" (e.g. groups with no entries).
     /// </summary>
     public string Version { get; set; } = string.Empty;
 

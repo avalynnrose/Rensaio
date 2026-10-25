@@ -22,18 +22,23 @@ class SettingsConfig(
         var socksProxyPort: String = "",
         var socksProxyUsername: String = "",
         var socksProxyPassword: String = "",
+        var proxyScheme: String = "socks5",
+        var caCertPath: String = "",
+        var ignoreTlsErrors: Boolean = false,
         var flareSolverrEnabled: Boolean = false,
         var flareSolverrUrl: String = "http://localhost:8191",
         var flareSolverrTimeout: Int = 60,
         var flareSolverrSessionName: String = "extension.bridge",
         var flareSolverrSessionTtl: Int = 15,
         var flareSolverrAsResponseFallback: Boolean = false,
-        var cefMaxRenderers: Int = 4,
-        var cefIdleTimeoutMs: Long = 300_000L,
-        var cefWebViewPoolEnabled: Boolean = true,
-        var cefEnabled: Boolean = true,
-        var cefPumpActiveIntervalMs: Long = 10L,
-        var cefPumpIdleIntervalMs: Long = 500L,
+        var browserEnabled: Boolean = true,
+        var browserProvider: String = "patchright",
+        var browserHeadless: Boolean = true,
+        var browserStealth: Boolean = true,
+        var browserChannel: String = "",
+        var browserMaxConcurrentPages: Int = 4,
+        var browserIdleTimeoutMs: Long = 300_000L,
+        var browserPoolEnabled: Boolean = true,
         var interceptorOverrides: MutableMap<String, MutableMap<String, Boolean>> = mutableMapOf(),
     )
 
@@ -53,6 +58,9 @@ class SettingsConfig(
         updateIfChanged("socksProxyPort", current.socksProxyPort, settings.socksProxyPort)
         updateIfChanged("socksProxyUsername", current.socksProxyUsername, settings.socksProxyUsername)
         updateIfChanged("socksProxyPassword", current.socksProxyPassword, settings.socksProxyPassword)
+        updateIfChanged("proxyScheme", current.proxyScheme, settings.proxyScheme)
+        updateIfChanged("caCertPath", current.caCertPath, settings.caCertPath)
+        updateIfChanged("ignoreTlsErrors", current.ignoreTlsErrors, settings.ignoreTlsErrors)
 
         updateIfChanged("flareSolverrEnabled", current.flareSolverrEnabled, settings.flareSolverrEnabled)
         updateIfChanged("flareSolverrUrl", current.flareSolverrUrl, settings.flareSolverrUrl)
@@ -60,12 +68,14 @@ class SettingsConfig(
         updateIfChanged("flareSolverrSessionName", current.flareSolverrSessionName, settings.flareSolverrSessionName)
         updateIfChanged("flareSolverrSessionTtl", current.flareSolverrSessionTtl, settings.flareSolverrSessionTtl)
         updateIfChanged("flareSolverrAsResponseFallback", current.flareSolverrAsResponseFallback, settings.flareSolverrAsResponseFallback)
-        updateIfChanged("cefMaxRenderers", current.cefMaxRenderers, settings.cefMaxRenderers)
-        updateIfChanged("cefIdleTimeoutMs", current.cefIdleTimeoutMs, settings.cefIdleTimeoutMs)
-        updateIfChanged("cefWebViewPoolEnabled", current.cefWebViewPoolEnabled, settings.cefWebViewPoolEnabled)
-        updateIfChanged("cefEnabled", current.cefEnabled, settings.cefEnabled)
-        updateIfChanged("cefPumpActiveIntervalMs", current.cefPumpActiveIntervalMs, settings.cefPumpActiveIntervalMs)
-        updateIfChanged("cefPumpIdleIntervalMs", current.cefPumpIdleIntervalMs, settings.cefPumpIdleIntervalMs)
+        updateIfChanged("browserEnabled", current.browserEnabled, settings.browserEnabled)
+        updateIfChanged("browserProvider", current.browserProvider, settings.browserProvider)
+        updateIfChanged("browserHeadless", current.browserHeadless, settings.browserHeadless)
+        updateIfChanged("browserStealth", current.browserStealth, settings.browserStealth)
+        updateIfChanged("browserChannel", current.browserChannel, settings.browserChannel)
+        updateIfChanged("browserMaxConcurrentPages", current.browserMaxConcurrentPages, settings.browserMaxConcurrentPages)
+        updateIfChanged("browserIdleTimeoutMs", current.browserIdleTimeoutMs, settings.browserIdleTimeoutMs)
+        updateIfChanged("browserPoolEnabled", current.browserPoolEnabled, settings.browserPoolEnabled)
         updateIfChanged("interceptorOverrides", current.interceptorOverrides, settings.interceptorOverrides)
 
         return settings
@@ -86,6 +96,9 @@ class SettingsConfig(
             socksProxyPort = stringOrDefault("socksProxyPort", defaults.socksProxyPort),
             socksProxyUsername = stringOrDefault("socksProxyUsername", defaults.socksProxyUsername),
             socksProxyPassword = stringOrDefault("socksProxyPassword", defaults.socksProxyPassword),
+            proxyScheme = stringOrDefault("proxyScheme", defaults.proxyScheme),
+            caCertPath = stringOrDefault("caCertPath", defaults.caCertPath),
+            ignoreTlsErrors = booleanOrDefault("ignoreTlsErrors", defaults.ignoreTlsErrors),
             flareSolverrEnabled = booleanOrDefault("flareSolverrEnabled", defaults.flareSolverrEnabled),
             flareSolverrUrl = stringOrDefault("flareSolverrUrl", defaults.flareSolverrUrl),
             flareSolverrTimeout = intOrDefault("flareSolverrTimeout", defaults.flareSolverrTimeout),
@@ -95,12 +108,14 @@ class SettingsConfig(
                 "flareSolverrAsResponseFallback",
                 defaults.flareSolverrAsResponseFallback,
             ),
-            cefMaxRenderers = intOrDefault("cefMaxRenderers", defaults.cefMaxRenderers),
-            cefIdleTimeoutMs = longOrDefault("cefIdleTimeoutMs", defaults.cefIdleTimeoutMs),
-            cefWebViewPoolEnabled = booleanOrDefault("cefWebViewPoolEnabled", defaults.cefWebViewPoolEnabled),
-            cefEnabled = booleanOrDefault("cefEnabled", defaults.cefEnabled),
-            cefPumpActiveIntervalMs = longOrDefault("cefPumpActiveIntervalMs", defaults.cefPumpActiveIntervalMs),
-            cefPumpIdleIntervalMs = longOrDefault("cefPumpIdleIntervalMs", defaults.cefPumpIdleIntervalMs),
+            browserEnabled = booleanOrDefault("browserEnabled", defaults.browserEnabled),
+            browserProvider = stringOrDefault("browserProvider", defaults.browserProvider),
+            browserHeadless = booleanOrDefault("browserHeadless", defaults.browserHeadless),
+            browserStealth = booleanOrDefault("browserStealth", defaults.browserStealth),
+            browserChannel = stringOrDefault("browserChannel", defaults.browserChannel),
+            browserMaxConcurrentPages = intOrDefault("browserMaxConcurrentPages", defaults.browserMaxConcurrentPages),
+            browserIdleTimeoutMs = longOrDefault("browserIdleTimeoutMs", defaults.browserIdleTimeoutMs),
+            browserPoolEnabled = booleanOrDefault("browserPoolEnabled", defaults.browserPoolEnabled),
             interceptorOverrides = nestedBooleanMapOrDefault("interceptorOverrides", defaults.interceptorOverrides),
         )
 
@@ -176,6 +191,36 @@ object Settings {
             state().socksProxyPassword = value
         }
 
+    /**
+     * "socks5" (default) or "http". trawl's transparent proxy is HTTP-only, so selecting trawl
+     * requires "http"; the same host/port cannot serve both schemes.
+     */
+    var proxyScheme: String
+        get() = state().proxyScheme
+        set(value) {
+            state().proxyScheme = value
+        }
+
+    /**
+     * The proxy's root CA for a TLS-terminating proxy. Either an absolute http(s) URL (trawl
+     * serves it at http://<trawl-host>:8191/proxy-ca.crt) or a PEM file path.
+     */
+    var caCertPath: String
+        get() = state().caCertPath
+        set(value) {
+            state().caCertPath = value
+        }
+
+    /**
+     * Emergency override: trust the proxy's interception without installing its CA. Real
+     * security downgrade; off by default.
+     */
+    var ignoreTlsErrors: Boolean
+        get() = state().ignoreTlsErrors
+        set(value) {
+            state().ignoreTlsErrors = value
+        }
+
     var flareSolverrEnabled: Boolean
         get() = state().flareSolverrEnabled
         set(value) {
@@ -212,40 +257,52 @@ object Settings {
             state().flareSolverrAsResponseFallback = value
         }
 
-    var cefMaxRenderers: Int
-        get() = state().cefMaxRenderers
+    var browserEnabled: Boolean
+        get() = state().browserEnabled
         set(value) {
-            state().cefMaxRenderers = value
+            state().browserEnabled = value
         }
 
-    var cefIdleTimeoutMs: Long
-        get() = state().cefIdleTimeoutMs
+    var browserProvider: String
+        get() = state().browserProvider
         set(value) {
-            state().cefIdleTimeoutMs = value
+            state().browserProvider = value
         }
 
-    var cefWebViewPoolEnabled: Boolean
-        get() = state().cefWebViewPoolEnabled
+    var browserHeadless: Boolean
+        get() = state().browserHeadless
         set(value) {
-            state().cefWebViewPoolEnabled = value
+            state().browserHeadless = value
         }
 
-    var cefEnabled: Boolean
-        get() = state().cefEnabled
+    var browserStealth: Boolean
+        get() = state().browserStealth
         set(value) {
-            state().cefEnabled = value
+            state().browserStealth = value
         }
 
-    var cefPumpActiveIntervalMs: Long
-        get() = state().cefPumpActiveIntervalMs
+    var browserChannel: String
+        get() = state().browserChannel
         set(value) {
-            state().cefPumpActiveIntervalMs = value
+            state().browserChannel = value
         }
 
-    var cefPumpIdleIntervalMs: Long
-        get() = state().cefPumpIdleIntervalMs
+    var browserMaxConcurrentPages: Int
+        get() = state().browserMaxConcurrentPages
         set(value) {
-            state().cefPumpIdleIntervalMs = value
+            state().browserMaxConcurrentPages = value
+        }
+
+    var browserIdleTimeoutMs: Long
+        get() = state().browserIdleTimeoutMs
+        set(value) {
+            state().browserIdleTimeoutMs = value
+        }
+
+    var browserPoolEnabled: Boolean
+        get() = state().browserPoolEnabled
+        set(value) {
+            state().browserPoolEnabled = value
         }
 
     var interceptorOverrides: MutableMap<String, MutableMap<String, Boolean>>
@@ -271,6 +328,9 @@ object Settings {
             proxyPort = socksProxyPort,
             proxyUsername = socksProxyUsername,
             proxyPassword = socksProxyPassword,
+            proxyScheme = proxyScheme,
+            caCertPath = caCertPath,
+            ignoreTlsErrors = ignoreTlsErrors,
         )
 }
 
@@ -344,18 +404,23 @@ private fun SettingsConfig.Settings.updateFrom(other: SettingsConfig.Settings) {
     socksProxyPort = other.socksProxyPort
     socksProxyUsername = other.socksProxyUsername
     socksProxyPassword = other.socksProxyPassword
+    proxyScheme = other.proxyScheme
+    caCertPath = other.caCertPath
+    ignoreTlsErrors = other.ignoreTlsErrors
     flareSolverrEnabled = other.flareSolverrEnabled
     flareSolverrUrl = other.flareSolverrUrl
     flareSolverrTimeout = other.flareSolverrTimeout
     flareSolverrSessionName = other.flareSolverrSessionName
     flareSolverrSessionTtl = other.flareSolverrSessionTtl
     flareSolverrAsResponseFallback = other.flareSolverrAsResponseFallback
-    cefMaxRenderers = other.cefMaxRenderers
-    cefIdleTimeoutMs = other.cefIdleTimeoutMs
-    cefWebViewPoolEnabled = other.cefWebViewPoolEnabled
-    cefEnabled = other.cefEnabled
-    cefPumpActiveIntervalMs = other.cefPumpActiveIntervalMs
-    cefPumpIdleIntervalMs = other.cefPumpIdleIntervalMs
+    browserEnabled = other.browserEnabled
+    browserProvider = other.browserProvider
+    browserHeadless = other.browserHeadless
+    browserStealth = other.browserStealth
+    browserChannel = other.browserChannel
+    browserMaxConcurrentPages = other.browserMaxConcurrentPages
+    browserIdleTimeoutMs = other.browserIdleTimeoutMs
+    browserPoolEnabled = other.browserPoolEnabled
     interceptorOverrides = other.interceptorOverrides.deepCopy()
 }
 

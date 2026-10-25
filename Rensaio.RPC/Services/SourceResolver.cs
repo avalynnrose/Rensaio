@@ -29,7 +29,9 @@ public sealed class SourceResolver
         if (string.IsNullOrWhiteSpace(packageId))
             throw new SourceNotFoundException("Package id is required.");
 
-        RepositoryGroup? group = _extensions.ListExtensions()
+        // Local-first with temporary fallback: a package prepared from an online repository for a
+        // sweep is resolvable here too, without being part of the installed set.
+        RepositoryGroup? group = _extensions.ListExtensions(includeTemporary: true)
             .FirstOrDefault(g => g.Entries.Any(e =>
                 string.Equals(e.Extension?.Package, packageId, StringComparison.OrdinalIgnoreCase)));
 

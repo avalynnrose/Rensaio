@@ -141,5 +141,5 @@ public sealed class ExternalMappingsPageDto
 public sealed class ExternalMappingIgnoreDto
 {
     [JsonPropertyName("forever")]
-    public bool Forever { get; set; } // false => TemporaryIgnored
+    public bool Forever { get; set; } // false => ManualIgnore
 }

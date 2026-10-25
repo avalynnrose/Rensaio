@@ -4,11 +4,15 @@ using System.Text.Json.Serialization;
 namespace RensaioBackend.Models.ContributionDatabase
 {
     /// <summary>
-    /// Schema v1 record serialized as the <c>Data</c> column of a contribution source row.
-    /// Mirrors the wire format consumed by the (future) cloud contribution service.
-    /// Source identity/display metadata (Package, SourceId, SourceName, SourceLanguage,
-    /// LastBatchExecutionUTC) live on <see cref="ContributionSourceEntity"/> and are not
-    /// part of this per-series payload.
+    /// LEGACY schema v1 record. Superseded by <see cref="ContributionRecordV2"/>.
+    ///
+    /// This type is kept only so legacy (v1) payloads can still be deserialized. From now on
+    /// the contributor database manages <see cref="ContributionRecordV2"/> exclusively: any
+    /// <see cref="ContributionSeriesEntity"/> whose <c>Data</c> deserializes to a v1 payload is
+    /// automatically marked as a tombstone (Version = PendingDelete) by
+    /// <c>ContributionDbContext</c>, so it is removed everywhere and regenerated as v2.
+    ///
+    /// Do not build new records with this type.
     /// </summary>
     public class ContributionRecordV1
     {

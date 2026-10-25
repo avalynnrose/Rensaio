@@ -2,6 +2,7 @@
 using Mihon.ExtensionsBridge.Models.Helpers;
 using Mihon.ExtensionsBridge.Models.Abstractions;
 using Microsoft.Extensions.Logging;
+using RensaioBackend.Extensions;
 using RensaioBackend.Services.Rpc;
 using RensaioBackend.Services.Search;
 using RensaioBackend.Utils;
@@ -121,7 +122,14 @@ namespace RensaioBackend.Services.Bridge
 
                         if (ex is HttpRequestException httpEx)
                         {
-                            HttpStatusCode status = httpEx.StatusCode ?? HttpStatusCode.InternalServerError;
+                            // A NULL status is how SourceInterop.WrapHttpException surfaces a
+                            // non-HTTP IOException (e.g. the Cloudflare interceptor's
+                            // "Cloudflare bypass currently disabled"). Defaulting it to
+                            // 500 and logging ONLY the status hid the real cause behind a
+                            // bare "Http Error: InternalServerError". When there is no
+                            // status, include the exception message so the log is actionable.
+                            HttpStatusCode? reported = httpEx.StatusCode;
+                            HttpStatusCode status = reported ?? HttpStatusCode.InternalServerError;
 
                             // Retry with exponential backoff on the two transient responses we care about:
                             //  - TooManyRequests (429): the server explicitly asked us to back off.
@@ -138,13 +146,41 @@ namespace RensaioBackend.Services.Bridge
                             object[] pars2 = pars.ToArray();
                             Array.Resize(ref pars2, pars2.Length + 1);
                             pars2[^1] = status;
-                            _logger.LogError(errorMessage + " Http Error: {httperror}", pars2);
+                            if (reported is null)
+                            {
+                                // No HTTP status: the underlying failure message is the
+                                // only signal that distinguishes (e.g.) a disabled
+                                // Cloudflare bypass from a transient transport error.
+                                _logger.LogError(ex, errorMessage + " Http Error: {httperror} ({detail})", pars2.Append(httpEx.Message).ToArray());
+                            }
+                            else
+                            {
+                                _logger.LogError(errorMessage + " Http Error: {httperror}", pars2);
+                            }
                             if (failureBreakdown != null)
                             {
-                                string reason = status.ToString();
+                                string reason = reported is null ? $"NoStatus: {httpEx.Message}" : status.ToString();
                                 int current = failureBreakdown.GetOrAdd(reason, 0);
                                 failureBreakdown[reason] = current + 1;
                             }
+                            return null;
+                        }
+
+                        // Android-compat WebView wait timeout: TRANSIENT. The challenge page is
+                        // often still initialising (or a navigation is still settling) and the
+                        // same call usually succeeds on a retry, so back off and retry instead of
+                        // abandoning the source for the whole run.
+                        if (SourceTransientErrors.IsWebViewTimeout(ex))
+                        {
+                            if (attempt < DefaultMaxRetries)
+                            {
+                                _logger.LogDebug("Retrying {ErrorMessage} (attempt {Attempt}/{Max}) after WebView timeout in {Delay}s",
+                                    errorMessage, attempt + 1, DefaultMaxRetries, ComputeBackoff(attempt).TotalSeconds);
+                                await Task.Delay(ComputeBackoff(attempt)).ConfigureAwait(false);
+                                continue;
+                            }
+
+                            _logger.LogError(ex, errorMessage + " (WebView timeout, giving up after {Max} attempts)", pars.Append(DefaultMaxRetries).ToArray());
                             return null;
                         }
 
@@ -191,9 +227,14 @@ namespace RensaioBackend.Services.Bridge
         /// against a previously cached interop. Returns null when no group matches, so callers
         /// can decide to evict the stale cache entry and re-resolve.
         /// </summary>
+        /// <remarks>
+        /// Includes temporary (online-prepared) groups: a package prepared for a sweep is not part
+        /// of the installed set, but it must still be resolvable here or every source/image call
+        /// targeting it would fail with "not found" while the group is live.
+        /// </remarks>
         private RepositoryGroup? ResolveActiveGroup(string keyName)
         {
-            var allLocal = _bridgeManager.LocalExtensionManager.ListExtensions();
+            var allLocal = _bridgeManager.LocalExtensionManager.ListExtensions(includeTemporary: true);
             return allLocal.FirstOrDefault(a => a.Name.Equals(keyName, StringComparison.OrdinalIgnoreCase));
         }
 
@@ -209,18 +250,27 @@ namespace RensaioBackend.Services.Bridge
                 EvictExtOp(name);
 
             string cacheKey = repo?.Name ?? name;
-            Lazy<Task<IExtensionInterop>>? cached = null;
             if (extOps.TryGetValue(cacheKey, out var candidate))
             {
                 var interop = await candidate.Value.ConfigureAwait(false);
-                // Stale-guard: if the active version changed, drop the pin and re-resolve.
-                if (repo != null && interop.Version != repo.GetActiveEntry().Extension.Version)
+                // Stale-guard: only when we can positively confirm the pinned interop
+                // belongs to a *different*, known version. The version may legitimately
+                // be empty (unresolved proxy or a group with no entries), and an empty
+                // value must never be treated as a mismatch — otherwise every access
+                // evicts and re-resolves the interop, thrashing the cache and emitting
+                // a bogus "Evicted cached interop" line on each call.
+                string? pinnedVersion = interop?.Version;
+                string? activeVersion = repo?.GetActiveEntry().Extension.Version;
+                bool confirmedStale = !string.IsNullOrEmpty(pinnedVersion)
+                                      && !string.IsNullOrEmpty(activeVersion)
+                                      && !string.Equals(pinnedVersion, activeVersion, StringComparison.OrdinalIgnoreCase);
+                if (confirmedStale)
                 {
                     EvictExtOp(cacheKey);
                 }
                 else
                 {
-                    return interop;
+                    return interop!;
                 }
             }
 
@@ -238,7 +288,11 @@ namespace RensaioBackend.Services.Bridge
         }
         private async Task<IExtensionInterop> GetFromPackageAsync(string package, CancellationToken token = default)
         {
-            var allLocal = _bridgeManager.LocalExtensionManager.ListExtensions();
+            // Temporary-inclusive: a package prepared from an online repository for a sweep is not
+            // installed but is live in the host registry, so it must resolve here too. Without the
+            // includeTemporary flag, "package|sourceId" lookups (e.g. cover-image downloads) fail
+            // with "Package not found" for every temporary extension.
+            var allLocal = _bridgeManager.LocalExtensionManager.ListExtensions(includeTemporary: true);
             var repo = allLocal.FirstOrDefault(a => a.GetActiveEntry().Extension.Package.Equals(package, StringComparison.OrdinalIgnoreCase));
             if (repo==null)
             {
@@ -287,6 +341,61 @@ namespace RensaioBackend.Services.Bridge
             return GetFromMihonProviderIdAsync(mihonProviderName, token);
         }
 
+        /// <summary>
+        /// Resolves the ordered HOST candidates for a provider id (<c>package|sourceId</c>): the
+        /// extension source's <c>homeUrl</c> host first, then each <c>mirrorUrls</c> host, in the
+        /// order the extension declares them. The source metadata comes straight from the
+        /// extension's <c>TachiyomiSourceV2</c> (<c>homeUrl</c>/<c>mirrorUrls</c>), so it reflects
+        /// the domains a package uses TODAY — even when a stale cover URL still points at a domain
+        /// the extension has since abandoned (e.g. <c>kagane.to</c> → <c>kagane.si</c>).
+        ///
+        /// Returns <c>null</c> when the provider id is empty, malformed, or the source cannot be
+        /// resolved (the extension is neither installed nor temporarily prepared). Never throws —
+        /// a metadata lookup failure must not break an image fetch.
+        /// </summary>
+        public async Task<IReadOnlyList<string>?> TryGetSourceHostsAsync(string? mihonProviderId, CancellationToken token = default)
+        {
+            if (string.IsNullOrWhiteSpace(mihonProviderId))
+                return null;
+
+            try
+            {
+                // Temporary-inclusive, matching SourceFromProviderIdAsync: an online-prepared
+                // package is resolvable here too. Prefer the async RPC listing when available.
+                List<RepositoryGroup> groups;
+                if (_bridgeManager.LocalExtensionManager is IExtensionRpcBridge rpc)
+                    groups = await rpc.ListExtensionsAsync(includeTemporary: true, token).ConfigureAwait(false);
+                else
+                    groups = _bridgeManager.LocalExtensionManager.ListExtensions(includeTemporary: true);
+
+                TachiyomiSource? source = groups.FindSource(mihonProviderId).Source;
+                if (source is null)
+                    return null;
+
+                var hosts = new List<string>();
+                void AddHost(string? url)
+                {
+                    if (Uri.TryCreate(url, UriKind.Absolute, out Uri? uri)
+                        && !string.IsNullOrEmpty(uri.Host)
+                        && !hosts.Contains(uri.Host, StringComparer.OrdinalIgnoreCase))
+                    {
+                        hosts.Add(uri.Host);
+                    }
+                }
+
+                AddHost(source.BaseUrl);
+                foreach (string mirror in source.MirrorUrls ?? [])
+                    AddHost(mirror);
+
+                return hosts.Count == 0 ? null : hosts;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Unable to resolve source hosts for provider {Provider}", mihonProviderId);
+                return null;
+            }
+        }
+
         public Task<RepositoryGroup?> AddExtensionAsync(TachiyomiExtension extension, bool force = false, CancellationToken token = default)
         {
             return _bridgeManager.LocalExtensionManager.AddExtensionAsync(extension, force, token);
@@ -307,14 +416,14 @@ namespace RensaioBackend.Services.Bridge
             return GetFromNameAsync(entry.Name, token);
         }
 
-        public List<RepositoryGroup> ListExtensions()
+        public List<RepositoryGroup> ListExtensions(bool includeTemporary = false)
         {
-            return _bridgeManager.LocalExtensionManager.ListExtensions();
+            return _bridgeManager.LocalExtensionManager.ListExtensions(includeTemporary);
         }
 
-        public RepositoryGroup? FindExtension(string name)
+        public RepositoryGroup? FindExtension(string name, bool includeTemporary = false)
         {
-            return _bridgeManager.LocalExtensionManager.FindExtension(name);
+            return _bridgeManager.LocalExtensionManager.FindExtension(name, includeTemporary);
         }
 
         /// <summary>

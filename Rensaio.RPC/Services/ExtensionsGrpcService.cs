@@ -42,13 +42,14 @@ public sealed class ExtensionsGrpcService : ExtensionsService.ExtensionsServiceB
         _logger = logger;
     }
 
-    public override Task<JsonResult> ListInstalledExtensions(Correlation request, ServerCallContext context)
+    public override Task<JsonResult> ListInstalledExtensions(ListInstalledRequest request, ServerCallContext context)
     {
         GrpcGuard.EnsureAuthorized(_token, context);
         try
         {
-            // The public proxy returns defensive clones of the local groups.
-            List<RepositoryGroup> groups = _extensions.ListExtensions();
+            // Temporary groups (online extensions prepared for a sweep) are excluded unless
+            // the caller explicitly asks for them.
+            List<RepositoryGroup> groups = _extensions.ListExtensions(request.IncludeTemporary);
             return Task.FromResult(new JsonResult { Json = RpcJson.Serialize(groups) });
         }
         catch (Exception ex)
@@ -104,7 +105,8 @@ public sealed class ExtensionsGrpcService : ExtensionsService.ExtensionsServiceB
         GrpcGuard.EnsureAuthorized(_token, context);
         try
         {
-            RepositoryGroup? group = _extensions.ListExtensions()
+            // Temporary-inclusive: a prepared online package must expose its sources.
+            RepositoryGroup? group = _extensions.ListExtensions(includeTemporary: true)
                 .FirstOrDefault(g => g.Entries.Any(e =>
                     string.Equals(e.Extension?.Package, request.PackageId, StringComparison.OrdinalIgnoreCase)));
 
@@ -229,6 +231,68 @@ public sealed class ExtensionsGrpcService : ExtensionsService.ExtensionsServiceB
         }
     }
 
+    public override async Task<JsonResult> PrepareOnlineExtension(PackageRequest request, ServerCallContext context)
+    {
+        GrpcGuard.EnsureAuthorized(_token, context);
+        try
+        {
+            RepositoryGroup? group = await _extensions
+                .PrepareExtensionAsync(request.PackageId, false, context.CancellationToken)
+                .ConfigureAwait(false);
+
+            if (group == null)
+                throw new SourceNotFoundException($"Extension '{request.PackageId}' was not found online.");
+
+            IExtensionInterop interop = await _extensions
+                .GetInteropAsync(group, context.CancellationToken).ConfigureAwait(false);
+
+            var descriptor = new OnlineExtensionDescriptor
+            {
+                PackageId = request.PackageId,
+                Name = group.Name,
+                Version = interop.Version,
+                Temporary = group.Temporary,
+                Sources = interop.Sources.Select(s => new SourceDescriptor
+                {
+                    PackageId = request.PackageId,
+                    SourceId = s.Id,
+                    Name = s.Name,
+                    Language = s.Language,
+                    SupportsLatest = s.SupportsLatest,
+                    IsConfigurable = s.IsConfigurableSource,
+                    IsHttpSource = s.IsHttpSource,
+                    IsParsedHttpSource = s.IsParsedHttpSource,
+                    IsCatalogueSource = s.IsCatalogueSource,
+                }).ToList(),
+            };
+
+            _logger.LogInformation("Prepared online extension {Package} v{Version} ({Count} source(s), temporary={Temporary}).",
+                descriptor.PackageId, descriptor.Version, descriptor.Sources.Count, descriptor.Temporary);
+            return new JsonResult { Json = RpcJson.Serialize(descriptor) };
+        }
+        catch (Exception ex)
+        {
+            throw GrpcGuard.Map(ex);
+        }
+    }
+
+    public override async Task<BoolValue> ReleaseOnlineExtension(PackageRequest request, ServerCallContext context)
+    {
+        GrpcGuard.EnsureAuthorized(_token, context);
+        try
+        {
+            bool released = await _extensions
+                .ReleaseExtensionAsync(request.PackageId, context.CancellationToken)
+                .ConfigureAwait(false);
+            _logger.LogInformation("ReleaseOnlineExtension({Package}) => {Released}.", request.PackageId, released);
+            return new BoolValue { Value = released };
+        }
+        catch (Exception ex)
+        {
+            throw GrpcGuard.Map(ex);
+        }
+    }
+
     public override async Task GetExtensionIcon(
         PackageRequest request,
         IServerStreamWriter<Chunk> responseStream,
@@ -237,7 +301,7 @@ public sealed class ExtensionsGrpcService : ExtensionsService.ExtensionsServiceB
         GrpcGuard.EnsureAuthorized(_token, context);
         try
         {
-            RepositoryEntry? active = _extensions.ListExtensions()
+            RepositoryEntry? active = _extensions.ListExtensions(includeTemporary: true)
                 .FirstOrDefault(g => g.Entries.Any(e =>
                     string.Equals(e.Extension?.Package, request.PackageId, StringComparison.OrdinalIgnoreCase)))
                 ?.Entries.FirstOrDefault(e =>

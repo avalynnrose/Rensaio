@@ -921,7 +921,7 @@ public static class SeriesExtensions
     /// <summary>
     /// Well-known series types matched against consolidated genres (case-invariant).
     /// </summary>
-    private static readonly string[] KnownSeriesTypes = { "Manhwa", "Manga", "Manhua" };
+    private static readonly string[] KnownSeriesTypes = { "Manhwa", "Manga", "Manhua", "Doujinshi", "Comics" };
 
     /// <summary>
     /// Derives the series Type from its consolidated genres and storage path.

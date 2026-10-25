@@ -42,6 +42,8 @@ namespace Mihon.ExtensionsBridge.Core.Runtime.Gatekeeper
         { await _gate.EnterAsync(token); try { return await EnsureActive().GetChaptersAsync(manga, token).ConfigureAwait(false); } finally { _gate.Exit(); } }
         public async Task<ParsedManga> GetDetailsAsync(Manga manga, CancellationToken token = default)
         { await _gate.EnterAsync(token); try { return await EnsureActive().GetDetailsAsync(manga, token).ConfigureAwait(false); } finally { _gate.Exit(); } }
+        public async Task<string> GetMangaUrlAsync(Manga manga, CancellationToken token = default)
+        { await _gate.EnterAsync(token); try { return await EnsureActive().GetMangaUrlAsync(manga, token).ConfigureAwait(false); } finally { _gate.Exit(); } }
         public async Task<ContentTypeStream> DownloadUrlAsync(string url, CancellationToken token = default)
         { await _gate.EnterAsync(token); try { return await EnsureActive().DownloadUrlAsync(url, token).ConfigureAwait(false); } finally { _gate.Exit(); } }
         public async Task<ContentTypeStream> GetPageImageAsync(Page page, CancellationToken token = default)

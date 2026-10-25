@@ -1,62 +1,42 @@
 using RensaioBackend.Models;
-using RensaioBackend.Models.ContributionDatabase;
 using RensaioBackend.Models.Dto;
 using RensaioBackend.Services.Contributions;
-using RensaioBackend.Services.Metadata;
 using RensaioBackend.Services.Rpc;
-using RensaioBackend.Services.Scrobbling.Abstractions;
 using RensaioBackend.Services.Settings;
-using Mihon.ExtensionsBridge.Models;
-using Mihon.ExtensionsBridge.Models.Abstractions;
-using Mihon.ExtensionsBridge.Models.Extensions;
-using Rensaio.RPC.Contracts;
 
 namespace RensaioBackend.Services.Background;
 
 /// <summary>
 /// One-shot seeding sweep, started only when <c>--seed [<extensionPackage>]</c> is present.
 ///
-/// It enumerates every series each installed extension's sources expose and records them
-/// **only into the local contribution database** (<c>contributor.db</c>). It never writes
-/// to rensaio.db, and never pulls details or chapters — the catalogue listing plus the
-/// thumbnail is all that is needed. After a source is swept and matched, the contribution
-/// database is exported.
-///
-/// Per source:
-///   1. GetPopular over every page until HasNextPage is false  → SeenInPopular records
-///   2. provider metadata match for the swept series (scoped)
-///   3. if the source SupportsLatest, a GetLatest tail marks newly-seen series SeenInLatest
-///   4. write title / mapping / source / series rows into contributor.db
-///   5. export via ContributionUploadService (skipped when contributions are disabled)
+/// Orchestration only: it delegates the extension scanning / matching / writing to
+/// <see cref="ExtensionSweepService"/> (which records series into the local
+/// contribution database incrementally, page by page) and performs a single
+/// contribution export at the very end. Scrobbling/export concerns stay here so
+/// the scan itself can be driven from other entry points later.
 /// </summary>
 public sealed class SeedService : IWorkerService
 {
     private readonly SeedOptions _options;
-    private readonly IExtensionRpcBridge _rpc;
-    private readonly ContributionGraphWriter _writer;
-    private readonly ContributionMappingService _mapping;
+    private readonly ExtensionSweepService _sweep;
     private readonly ContributionUploadService _upload;
-    private readonly ExternalMappingSupport _providerSupport;
     private readonly SettingsService _settings;
+    private readonly IExtensionRpcBridge _rpc;
     private readonly ILogger<SeedService> _logger;
 
     public SeedService(
         SeedOptions options,
-        IExtensionRpcBridge rpc,
-        ContributionGraphWriter writer,
-        ContributionMappingService mapping,
+        ExtensionSweepService sweep,
         ContributionUploadService upload,
-        ExternalMappingSupport providerSupport,
         SettingsService settings,
+        IExtensionRpcBridge rpc,
         ILogger<SeedService> logger)
     {
         _options = options;
-        _rpc = rpc;
-        _writer = writer;
-        _mapping = mapping;
+        _sweep = sweep;
         _upload = upload;
-        _providerSupport = providerSupport;
         _settings = settings;
+        _rpc = rpc;
         _logger = logger;
     }
 
@@ -68,239 +48,58 @@ public sealed class SeedService : IWorkerService
             return;
         }
 
-        _logger.LogInformation("SeedService: starting sweep{Scope}.",
-            _options.StartPackage == null ? " over all extensions" : $" from package '{_options.StartPackage}'");
+        // --seed optionally consumes the next token as its package, so a trailing
+        // `--seed ... --force` is ambiguous to read; the parser handles it either way, but
+        // nudge the operator toward the unambiguous `--force --seed [pkg]` order.
+        if (_options.ForceAfterSeed)
+        {
+            _logger.LogWarning(
+                "SeedService: --force was supplied AFTER --seed. Prefer '--force --seed [pkg]' — --seed optionally takes a package parameter, so the trailing form is ambiguous.");
+        }
 
-        // Ordered list of installed extensions from RPC.
-        List<RepositoryGroup> groups;
+        string scope = _options.AllOnline
+            ? _options.StartPackage == null
+                ? " over every online extension"
+                : $" over every online extension from package '{_options.StartPackage}'"
+            : _options.Packages.Count > 0
+                ? $" over package(s) {string.Join(", ", _options.Packages)}"
+                : _options.StartPackage == null
+                    ? " over all installed extensions"
+                    : $" from package '{_options.StartPackage}'";
+
+        _logger.LogInformation("SeedService: starting sweep{Scope}{Mode}.",
+            scope,
+            _options.Force ? " (forced: metadata-matching every series)" : " (gated: only new series / series with a missing provider mapping)");
+
+        SweepResult result;
         try
         {
-            groups = await _rpc.ListExtensionsAsync(stoppingToken).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "SeedService: unable to list extensions from RPC; aborting.");
-            return;
-        }
-
-        int startIndex = 0;
-        if (!string.IsNullOrWhiteSpace(_options.StartPackage))
-        {
-            startIndex = groups.FindIndex(g => g.Entries.Any(e =>
-                string.Equals(e.Extension?.Package, _options.StartPackage, StringComparison.OrdinalIgnoreCase)));
-
-            if (startIndex < 0)
+            if (_options.AllOnline)
             {
-                _logger.LogError(
-                    "SeedService: start package '{Package}' was not found among installed extensions; aborting.",
-                    _options.StartPackage);
-                return;
+                result = await _sweep.SweepAllOnlineAsync(_options.StartPackage, _options.Force, stoppingToken).ConfigureAwait(false);
+            }
+            else if (_options.Packages.Count > 0)
+            {
+                result = await _sweep.SweepPackagesAsync(_options.Packages, _options.Force, stoppingToken).ConfigureAwait(false);
+            }
+            else
+            {
+                result = await _sweep.SweepAllAsync(_options.StartPackage, _options.Force, stoppingToken).ConfigureAwait(false);
             }
         }
-
-        int extensionsSwept = 0, sourcesSwept = 0, seriesTotal = 0;
-
-        for (int i = startIndex; i < groups.Count && !stoppingToken.IsCancellationRequested; i++)
+        finally
         {
-            RepositoryGroup group = groups[i];
-            RepositoryEntry? active = group.Entries.ElementAtOrDefault(group.ActiveEntry)
-                                      ?? group.Entries.FirstOrDefault();
-            string? package = active?.Extension?.Package;
-            if (string.IsNullOrWhiteSpace(package))
-                continue;
-
-            _logger.LogInformation("SeedService: Started with extension {Name} ({Package}).",
-                active?.Extension?.Name ?? group.Name, package);
-
-            IReadOnlyList<SourceDescriptor> sources;
-            try
-            {
-                sources = await _rpc.ListSourceDescriptorsAsync(package, stoppingToken).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "SeedService: unable to list sources for {Package}; skipping extension.", package);
-                continue;
-            }
-
-            extensionsSwept++;
-            foreach (SourceDescriptor source in sources)
-            {
-                if (stoppingToken.IsCancellationRequested) break;
-                sourcesSwept++;
-
-                int swept = await SweepSourceAsync(package, source, stoppingToken).ConfigureAwait(false);
-                seriesTotal += swept;
-            }
+            // Safety net: release any temporary extension left prepared (best-effort).
+            try { await _rpc.ReleaseAllTemporaryExtensionsAsync(stoppingToken).ConfigureAwait(false); }
+            catch (Exception ex) { _logger.LogWarning(ex, "SeedService: releasing temporary extensions failed; continuing."); }
         }
 
         _logger.LogInformation(
-            "SeedService: sweep complete. Extensions: {Extensions}, sources: {Sources}, series: {Series}.",
-            extensionsSwept, sourcesSwept, seriesTotal);
-    }
+            "SeedService: sweep complete. Extensions: {Extensions}, sources: {Sources}, new series entries inserted: {Series}.",
+            result.ExtensionsSwept, result.SourcesSwept, result.SeriesInserted);
 
-    /// <summary>Sweeps one source and returns the number of series recorded.</summary>
-    private async Task<int> SweepSourceAsync(string package, SourceDescriptor source, CancellationToken token)
-    {
-        string label = $"{source.Name} ({source.Language})";
-        try
-        {
-            ISourceInterop interop = await ResolveSourceAsync(package, source.SourceId, token).ConfigureAwait(false);
-
-            // ── 1. GetPopular over all pages ──
-            var collected = new Dictionary<string, Manga>(StringComparer.Ordinal);
-            int page = 1;
-            while (true)
-            {
-                MangaList list = await interop.GetPopularAsync(page, token).ConfigureAwait(false);
-                if (list?.Mangas == null)
-                    break;
-
-                foreach (Manga m in list.Mangas)
-                {
-                    string key = string.IsNullOrEmpty(m.Url) ? m.Title ?? string.Empty : m.Url;
-                    if (!string.IsNullOrEmpty(key))
-                        collected[key] = m;
-                }
-
-                if (!list.HasNextPage)
-                    break;
-                page++;
-            }
-
-            _logger.LogInformation("SeedService: [{Source}] Obtained {Count} Series.", label, collected.Count);
-
-            // ── 2. metadata match (scoped to the swept titles) ──
-            _logger.LogInformation("SeedService: [{Source}] Matching metadata...", label);
-            await MatchAsync(collected.Values, token).ConfigureAwait(false);
-
-            // ── 3. GetLatest tail (only when supported) ──
-            var latestKeys = new HashSet<string>(StringComparer.Ordinal);
-            if (source.SupportsLatest)
-            {
-                _logger.LogInformation("SeedService: [{Source}] Source supports GetLatest — continuing.", label);
-                int latestPage = 1;
-                while (true)
-                {
-                    MangaList list = await interop.GetLatestAsync(latestPage, token).ConfigureAwait(false);
-                    if (list?.Mangas == null)
-                        break;
-
-                    bool addedAny = false;
-                    foreach (Manga m in list.Mangas)
-                    {
-                        string key = string.IsNullOrEmpty(m.Url) ? m.Title ?? string.Empty : m.Url;
-                        if (string.IsNullOrEmpty(key))
-                            continue;
-                        latestKeys.Add(key);
-                        if (!collected.ContainsKey(key))
-                        {
-                            collected[key] = m;
-                            addedAny = true;
-                        }
-                    }
-
-                    if (!list.HasNextPage || !addedAny)
-                        break;
-                    latestPage++;
-                }
-            }
-
-            // ── 4. write to contributor.db (SeenInPopular / SeenInLatest set per collection) ──
-            int written = await WriteAsync(package, source, collected, latestKeys, token).ConfigureAwait(false);
-
-            // ── 5. export ──
-            await ExportAsync(token).ConfigureAwait(false);
-
-            _logger.LogInformation("SeedService: [{Source}] Done — {Written} series recorded.", label, written);
-            return written;
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "SeedService: [{Source}] sweep failed; continuing.", label);
-            return 0;
-        }
-    }
-
-    private Task<ISourceInterop> ResolveSourceAsync(string package, long sourceId, CancellationToken token)
-        => _rpc.GetSourceInteropAsync(package, sourceId, token);
-
-    private async Task MatchAsync(IEnumerable<Manga> mangas, CancellationToken token)
-    {
-        List<string> titles = mangas
-            .Select(m => m.Title)
-            .Where(t => !string.IsNullOrWhiteSpace(t))
-            .Select(t => t!.Trim())
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-        if (titles.Count == 0)
-            return;
-
-        List<Guid> mappingIds = await _mapping.FindMappingIdsByTitlesAsync(titles, token).ConfigureAwait(false);
-        if (mappingIds.Count == 0)
-            return;
-
-        List<IExternalSeriesProvider> providers = _providerSupport.GetMetadataProvidersInOrder();
-        await _providerSupport.EnsureProvidersAuthenticatedAsync(providers, token).ConfigureAwait(false);
-        await _mapping.ScanMappingsAsync(mappingIds, providers, token).ConfigureAwait(false);
-    }
-
-    private async Task<int> WriteAsync(
-        string package, SourceDescriptor source, Dictionary<string, Manga> collected,
-        HashSet<string> latestKeys, CancellationToken token)
-    {
-        if (collected.Count == 0)
-            return 0;
-
-        // Resolve all titles up front (deterministic ids), then map each manga to a record.
-        Dictionary<string, Guid> titleIds = await _writer
-            .ResolveTitlesAsync(collected.Values.Select(m => m.Title ?? string.Empty), token)
-            .ConfigureAwait(false);
-
-        await _writer.EnsureSourceAsync(
-            package, source.SourceId,
-            string.IsNullOrWhiteSpace(source.Name) ? "Unknown" : source.Name,
-            source.Language ?? string.Empty,
-            DateTime.UtcNow, token).ConfigureAwait(false);
-
-        Guid sourceEntityId = ContributionSourceEntity.DeriveId(package, source.SourceId);
-
-        int written = 0;
-        foreach ((string url, Manga manga) in collected)
-        {
-            if (string.IsNullOrWhiteSpace(manga.Title))
-                continue;
-
-            // One mapping per series, resolved from its own title set.
-            var seriesTitles = new Dictionary<string, Guid>(StringComparer.Ordinal)
-            {
-                [TitleEntity.Normalize(manga.Title)] = titleIds[TitleEntity.Normalize(manga.Title)]
-            };
-            Guid mappingId = await _writer.ResolveMappingAsync(seriesTitles, manga.Title, token).ConfigureAwait(false);
-            await _writer.SyncMappingTitlesAsync(mappingId, seriesTitles.Values, token).ConfigureAwait(false);
-
-            var record = new ContributionRecordV1
-            {
-                SchemaVersion = ContributionRecordV1.CurrentSchemaVersion,
-                TitleId = titleIds[TitleEntity.Normalize(manga.Title)],
-                ThumbnailUrl = manga.ThumbnailUrl,
-                Status = (int)manga.Status,
-                SeenInPopular = true,
-                SeenInLatest = latestKeys.Contains(url),
-                LastUpdateUTC = DateTime.UtcNow
-            };
-
-            await _writer.UpsertSeriesRecordAsync(
-                mappingId, sourceEntityId, package, source.SourceId, url, record, token).ConfigureAwait(false);
-            written++;
-        }
-
-        await _writer.SaveAsync(token).ConfigureAwait(false);
-        return written;
+        // ── export once, at the very end ──
+        await ExportAsync(stoppingToken).ConfigureAwait(false);
     }
 
     private async Task ExportAsync(CancellationToken token)

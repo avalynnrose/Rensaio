@@ -4,13 +4,15 @@ ARG TARGETPLATFORM
 ARG TARGETARCH
 ARG TARGETOS
 
-# ---- System deps for Chromium/CEF (JCEF) + headless X ----
+# ---- System deps for Chromium (Playwright/Patchright) + headless X ----
+# NOTE: libjogl2-jni / libgluegen2-jni were removed with JCEF — they existed only for CEF's
+# JOGL/GLCanvas OSR path. The .NET-hosted browser needs no JOGL/JOGAMP natives.
 RUN apt-get update && \
  apt-get install -y --no-install-recommends software-properties-common ca-certificates && \
  add-apt-repository ppa:dotnet/backports -y && \
  apt-get update && \
  apt-get -y install --no-install-recommends -y aspnetcore-runtime-8.0 gettext-base unzip tini libicu78 gosu cron libxss1 libxext6 libxrender1 libxcomposite1 libxdamage1 libxkbcommon0 libxtst6 \
- libgtk-3-0 libjogl2-jni libgluegen2-jni libglib2.0-0t64 libnss3 libdbus-1-3 libpango-1.0-0 libcairo2 libasound2t64 \
+ libgtk-3-0 libglib2.0-0t64 libnss3 libdbus-1-3 libpango-1.0-0 libcairo2 libasound2t64 \
  libatk-bridge2.0-0t64 libcups2t64 libdrm2 libgbm1 xvfb libssl3t64 libgdiplus libjxl0.11 libavif-bin libheif1 libopenjp2-7 && \
  rm -rf /var/lib/apt/lists/*
 

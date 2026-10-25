@@ -53,7 +53,7 @@ function statusBadge(status: SeriesMappingStatus) {
     case SeriesMappingStatus.Unmatched: return <Badge variant="secondary">Not matched</Badge>;
     case SeriesMappingStatus.AutoMatched: return <Badge variant="default">Auto</Badge>;
     case SeriesMappingStatus.UserConfirmed: return <Badge variant="default">User</Badge>;
-    case SeriesMappingStatus.TemporaryIgnored: return <Badge variant="secondary">Temp. ignored</Badge>;
+    case SeriesMappingStatus.ManualIgnore: return <Badge variant="secondary">Manual ignore</Badge>;
     case SeriesMappingStatus.ForeverIgnored: return <Badge variant="secondary">Disabled</Badge>;
     case SeriesMappingStatus.Blocked: return <Badge variant="destructive">Blocked</Badge>;
     default: return <Badge variant="secondary">Unknown</Badge>;
@@ -435,7 +435,16 @@ function SeriesGroupRows({ group, providerMeta, scanSeries, block, unblock, igno
               );
             })()}
           </td>
-          <td className="py-2 pr-3">{statusBadge(m.mappingStatus)}</td>
+          <td className="py-2 pr-3">
+            <div className="flex flex-col gap-0.5">
+              {statusBadge(m.mappingStatus)}
+              {m.mappingStatus === SeriesMappingStatus.ManualIgnore && m.linkedDate && (
+                <span className="text-xs text-muted-foreground">
+                  Triggered {new Date(m.linkedDate).toLocaleDateString()}
+                </span>
+              )}
+            </div>
+          </td>
           <td className="py-2 pr-3">
             <div className="flex gap-1">
               <Button
@@ -479,17 +488,17 @@ function SeriesGroupRows({ group, providerMeta, scanSeries, block, unblock, igno
                   </Button>
                 )
               )}
-              {/* Temporary ignore (re-evaluated after 1 month) */}
-              {m.mappingStatus !== SeriesMappingStatus.TemporaryIgnored && (
+              {/* Manual ignore (no expiration) */}
+              {m.mappingStatus !== SeriesMappingStatus.ManualIgnore && (
                 <Button
                   variant="outline"
                   size="sm"
                   className="gap-1"
                   onClick={() => ignore.mutate({ seriesId: group.seriesId, provider: m.provider.toString(), forever: false })}
-                  title="Ignore this provider for 1 month (re-evaluated afterward)"
+                  title="Manually ignore this provider (no expiration)"
                 >
                   <EyeOff className="h-3.5 w-3.5" />
-                  Ignore 1m
+                  Manual Ignore
                 </Button>
               )}
 
@@ -507,8 +516,8 @@ function SeriesGroupRows({ group, providerMeta, scanSeries, block, unblock, igno
                 </Button>
               )}
 
-              {/* Un-ignore: only when the row is currently ignored (temp or forever). */}
-              {(m.mappingStatus === SeriesMappingStatus.TemporaryIgnored || m.mappingStatus === SeriesMappingStatus.ForeverIgnored) && (
+              {/* Un-ignore: only when the row is currently ignored (manual or forever). */}
+              {(m.mappingStatus === SeriesMappingStatus.ManualIgnore || m.mappingStatus === SeriesMappingStatus.ForeverIgnored) && (
                 <Button
                   variant="outline"
                   size="sm"

@@ -18,6 +18,25 @@ object TrustManagerBridge {
     private val installed = AtomicBoolean(false)
     private val lock = Any()
 
+    /**
+     * Stable platform-backed manager. Exposed so other trust compositions (notably
+     * [ProxyTrustInstaller], which OkHttp consumes) can DELEGATE to the real platform store instead
+     * of capturing a snapshot that a later `SSLContext.setDefault` would invalidate.
+     */
+    @Volatile
+    private var base: X509TrustManager? = null
+
+    /** The underlying platform trust manager (SKID tolerance is a separate, composing concern). */
+    fun baseTrustManager(): X509TrustManager? {
+        base?.let { return it }
+        synchronized(lock) {
+            base?.let { return it }
+            val created = loadPlatformTrustManager()
+            base = created
+            return created
+        }
+    }
+
     fun ensureSubjectKeyIdentifierTolerance() {
         if (installed.get()) {
             return
@@ -37,10 +56,14 @@ object TrustManagerBridge {
         }
     }
 
-    private fun installSubjectKeyIdentifierTolerantTrustManager() {
+    private fun loadPlatformTrustManager(): X509TrustManager? {
         val factory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
         factory.init(null as KeyStore?)
-        val defaultTm = factory.trustManagers.filterIsInstance<X509TrustManager>().firstOrNull() ?: return
+        return factory.trustManagers.filterIsInstance<X509TrustManager>().firstOrNull()
+    }
+
+    private fun installSubjectKeyIdentifierTolerantTrustManager() {
+        val defaultTm = baseTrustManager() ?: return
         val tolerantTm =
             object : X509TrustManager {
                 override fun getAcceptedIssuers(): Array<X509Certificate> = defaultTm.acceptedIssuers

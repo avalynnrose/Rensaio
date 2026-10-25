@@ -7,10 +7,12 @@ import {
 } from '@/lib/api/types';
 
 interface ListParams {
-  filter?: 'all' | 'unmatched' | 'blocked';
+  filter?: 'all' | 'unmatched' | 'blocked' | 'manualignored';
+  verified?: 'all' | 'verified' | 'unverified';
   page?: number;
   pageSize?: number;
   status?: SeriesMappingStatus | null;
+  name?: string;
 }
 
 export const contributionMappingsQueryKey = ['contribution-mappings'] as const;
@@ -20,9 +22,11 @@ export const useContributionMappings = (params: ListParams = {}, enabled = true)
     queryKey: [
       ...contributionMappingsQueryKey,
       params.filter ?? 'unmatched',
+      params.verified ?? 'all',
       params.page ?? 0,
       params.pageSize ?? 50,
       params.status,
+      params.name ?? '',
     ],
     queryFn: () => contributionMappingsService.list(params),
     enabled,
@@ -57,6 +61,17 @@ export const useContributionMappingsScanMapping = () => {
   });
 };
 
+/**
+ * Smart Search for one (mapping, provider) pair. Read-only: it returns ranked suggestions and
+ * does not modify anything, so no cache invalidation is needed.
+ */
+export const useContributionMappingsSmartSearch = () => {
+  return useMutation({
+    mutationFn: ({ mappingId, provider }: { mappingId: string; provider: ScrobblerProvider }) =>
+      contributionMappingsService.smartSearchMapping(mappingId, provider),
+  });
+};
+
 export const useContributionMappingsLink = () => {
   const queryClient = useQueryClient();
   return useMutation({
@@ -70,8 +85,8 @@ export const useContributionMappingsLink = () => {
 export const useContributionMappingsBlock = () => {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ mappingId, provider }: { mappingId: string; provider: string }) =>
-      contributionMappingsService.blockMapping(mappingId, provider),
+    mutationFn: ({ mappingId, provider, key }: { mappingId: string; provider: string; key: string }) =>
+      contributionMappingsService.blockMapping(mappingId, provider, key),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: contributionMappingsQueryKey });
     },
@@ -81,8 +96,8 @@ export const useContributionMappingsBlock = () => {
 export const useContributionMappingsUnblock = () => {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ mappingId, provider }: { mappingId: string; provider: string }) =>
-      contributionMappingsService.unblockMapping(mappingId, provider),
+    mutationFn: ({ mappingId, provider, key }: { mappingId: string; provider: string; key: string }) =>
+      contributionMappingsService.unblockMapping(mappingId, provider, key),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: contributionMappingsQueryKey });
     },
@@ -115,6 +130,46 @@ export const useContributionMappingsUnlink = () => {
   return useMutation({
     mutationFn: ({ mappingId, provider }: { mappingId: string; provider: string }) =>
       contributionMappingsService.unlinkMapping(mappingId, provider),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: contributionMappingsQueryKey });
+    },
+  });
+};
+
+export const useContributionMappingsJoin = () => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (mappingIds: string[]) => contributionMappingsService.joinMappings(mappingIds),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: contributionMappingsQueryKey });
+    },
+  });
+};
+
+export const useContributionMappingsSplit = () => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (mappingId: string) => contributionMappingsService.splitMapping(mappingId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: contributionMappingsQueryKey });
+    },
+  });
+};
+
+export const useContributionMappingsVerify = () => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (mappingId: string) => contributionMappingsService.verifyMapping(mappingId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: contributionMappingsQueryKey });
+    },
+  });
+};
+
+export const useContributionMappingsUnverify = () => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (mappingId: string) => contributionMappingsService.unverifyMapping(mappingId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: contributionMappingsQueryKey });
     },

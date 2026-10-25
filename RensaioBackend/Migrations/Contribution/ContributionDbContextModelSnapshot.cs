@@ -21,101 +21,210 @@ namespace RensaioBackend.Migrations.Contribution
                 {
                     b.Property<byte[]>("Id")
                         .ValueGeneratedOnAdd()
-                        .HasColumnType("BLOB");
+                        .HasColumnType("BLOB")
+                        .HasColumnName("Id")
+                        .HasAnnotation("Relational:JsonPropertyName", "i");
+
+                    b.Property<string>("CoverUrl")
+                        .HasColumnType("TEXT")
+                        .HasColumnName("cover_url");
 
                     b.Property<DateTime?>("LinkedDate")
-                        .HasColumnType("TEXT");
-
-                    b.Property<byte[]>("MappingId")
-                        .IsRequired()
-                        .HasColumnType("BLOB");
+                        .HasColumnType("TEXT")
+                        .HasAnnotation("Relational:JsonPropertyName", "u");
 
                     b.Property<int>("MappingStatus")
-                        .HasColumnType("INTEGER");
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("MappingStatus")
+                        .HasAnnotation("Relational:JsonPropertyName", "s");
 
                     b.Property<int>("ProviderId")
-                        .HasColumnType("INTEGER");
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("ProviderId")
+                        .HasAnnotation("Relational:JsonPropertyName", "p");
 
                     b.Property<string>("ProviderKey")
                         .IsRequired()
-                        .HasColumnType("TEXT");
+                        .HasColumnType("TEXT")
+                        .HasColumnName("ProviderKey")
+                        .HasAnnotation("Relational:JsonPropertyName", "k");
+
+                    b.Property<string>("ProviderTitleIds")
+                        .IsRequired()
+                        .HasColumnType("TEXT")
+                        .HasColumnName("provider_title_ids");
+
+                    b.Property<byte[]>("SeriesId")
+                        .IsRequired()
+                        .HasColumnType("BLOB")
+                        .HasColumnName("series_id")
+                        .HasAnnotation("Relational:JsonPropertyName", "m");
 
                     b.Property<int>("Version")
-                        .HasColumnType("INTEGER");
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("Version")
+                        .HasAnnotation("Relational:JsonPropertyName", "v");
 
                     b.HasKey("Id");
-
-                    b.HasIndex("MappingId")
-                        .HasDatabaseName("IX_Metadata_MappingId");
 
                     b.HasIndex("MappingStatus")
                         .HasDatabaseName("IX_Metadata_MappingType");
 
+                    b.HasIndex("SeriesId")
+                        .HasDatabaseName("IX_Metadata_series_id");
+
+                    b.HasIndex("MappingStatus", "Version")
+                        .HasDatabaseName("IX_Metadata_MappingStatus_Version");
+
                     b.HasIndex("ProviderId", "ProviderKey")
                         .HasDatabaseName("IX_Metadata_ProviderId_ProviderKey");
 
-                    b.ToTable("Metadata");
+                    b.HasIndex("SeriesId", "Version")
+                        .HasDatabaseName("IX_Metadata_series_id_Version");
+
+                    b.HasIndex("Version", "SeriesId")
+                        .HasDatabaseName("IX_Metadata_Version_series_id");
+
+                    b.HasIndex("SeriesId", "MappingStatus", "Version")
+                        .HasDatabaseName("IX_Metadata_series_id_MappingStatus_Version");
+
+                    b.ToTable("Metadata", (string)null);
                 });
 
             modelBuilder.Entity("RensaioBackend.Models.ContributionDatabase.ContributionSeriesEntity", b =>
                 {
                     b.Property<byte[]>("Id")
-                        .HasColumnType("BLOB");
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("BLOB")
+                        .HasColumnName("Id")
+                        .HasAnnotation("Relational:JsonPropertyName", "i");
 
                     b.Property<string>("Data")
-                        .HasColumnType("TEXT")
-                        .UseCollation("BINARY");
-
-                    b.Property<byte[]>("MappingId")
                         .IsRequired()
-                        .HasColumnType("BLOB");
+                        .HasColumnType("TEXT")
+                        .HasColumnName("Data")
+                        .UseCollation("BINARY")
+                        .HasAnnotation("Relational:JsonPropertyName", "d");
+
+                    b.Property<bool>("Metadata")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("Metadata")
+                        .HasAnnotation("Relational:JsonPropertyName", "q");
+
+                    b.Property<byte[]>("PackageId")
+                        .IsRequired()
+                        .HasColumnType("BLOB")
+                        .HasColumnName("PackageId")
+                        .HasAnnotation("Relational:JsonPropertyName", "pi");
+
+                    b.Property<byte[]>("SeriesId")
+                        .IsRequired()
+                        .HasColumnType("BLOB")
+                        .HasColumnName("series_id")
+                        .HasAnnotation("Relational:JsonPropertyName", "m");
 
                     b.Property<byte[]>("SourceId")
                         .IsRequired()
-                        .HasColumnType("BLOB");
+                        .HasColumnType("BLOB")
+                        .HasColumnName("SourceId")
+                        .HasAnnotation("Relational:JsonPropertyName", "s");
+
+                    b.Property<DateTime?>("VerifiedDateUTC")
+                        .HasColumnType("TEXT")
+                        .HasColumnName("VerifiedDateUTC")
+                        .HasAnnotation("Relational:JsonPropertyName", "z");
 
                     b.Property<int>("Version")
-                        .HasColumnType("INTEGER");
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("Version")
+                        .HasAnnotation("Relational:JsonPropertyName", "v");
 
                     b.HasKey("Id");
 
-                    b.HasIndex("MappingId")
-                        .HasDatabaseName("IX_Sources_MappingId");
+                    b.HasIndex("Metadata")
+                        .HasDatabaseName("IX_SeriesEntries_Metadata");
+
+                    b.HasIndex("PackageId")
+                        .HasDatabaseName("IX_SeriesEntries_PackageId");
+
+                    b.HasIndex("SeriesId")
+                        .HasDatabaseName("IX_SeriesEntries_series_id");
 
                     b.HasIndex("SourceId");
 
-                    b.ToTable("Series");
+                    b.HasIndex("VerifiedDateUTC")
+                        .HasDatabaseName("IX_SeriesEntries_VerifiedDateUTC");
+
+                    b.HasIndex("Version")
+                        .HasDatabaseName("IX_SeriesEntries_Version");
+
+                    b.HasIndex("Metadata", "Version")
+                        .HasDatabaseName("IX_SeriesEntries_Metadata_Version");
+
+                    b.HasIndex("SeriesId", "VerifiedDateUTC")
+                        .HasDatabaseName("IX_SeriesEntries_series_id_VerifiedDateUTC");
+
+                    b.HasIndex("SeriesId", "Version")
+                        .HasDatabaseName("IX_SeriesEntries_series_id_Version");
+
+                    b.ToTable("SeriesEntries", (string)null);
                 });
 
             modelBuilder.Entity("RensaioBackend.Models.ContributionDatabase.ContributionSourceEntity", b =>
                 {
                     b.Property<byte[]>("Id")
                         .ValueGeneratedOnAdd()
-                        .HasColumnType("BLOB");
+                        .HasColumnType("BLOB")
+                        .HasColumnName("Id")
+                        .HasAnnotation("Relational:JsonPropertyName", "i");
 
                     b.Property<DateTime?>("LastBatchExecutionUTC")
-                        .HasColumnType("TEXT");
+                        .HasColumnType("TEXT")
+                        .HasColumnName("LastBatchExecutionUTC")
+                        .HasAnnotation("Relational:JsonPropertyName", "b");
+
+                    b.Property<string>("LatestIds")
+                        .IsRequired()
+                        .HasColumnType("TEXT")
+                        .HasColumnName("LatestIds")
+                        .HasAnnotation("Relational:JsonPropertyName", "li");
 
                     b.Property<string>("Package")
                         .IsRequired()
                         .HasColumnType("TEXT")
-                        .UseCollation("BINARY");
+                        .HasColumnName("Package")
+                        .UseCollation("BINARY")
+                        .HasAnnotation("Relational:JsonPropertyName", "p");
+
+                    b.Property<byte[]>("PackageId")
+                        .IsRequired()
+                        .HasColumnType("BLOB")
+                        .HasColumnName("PackageId")
+                        .HasAnnotation("Relational:JsonPropertyName", "pi");
 
                     b.Property<long>("SourceId")
-                        .HasColumnType("INTEGER");
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("SourceId")
+                        .HasAnnotation("Relational:JsonPropertyName", "s");
 
                     b.Property<string>("SourceLanguage")
                         .IsRequired()
                         .HasColumnType("TEXT")
-                        .UseCollation("BINARY");
+                        .HasColumnName("SourceLanguage")
+                        .UseCollation("BINARY")
+                        .HasAnnotation("Relational:JsonPropertyName", "l");
 
                     b.Property<string>("SourceName")
                         .IsRequired()
                         .HasColumnType("TEXT")
-                        .UseCollation("BINARY");
+                        .HasColumnName("SourceName")
+                        .UseCollation("BINARY")
+                        .HasAnnotation("Relational:JsonPropertyName", "n");
 
                     b.Property<int>("Version")
-                        .HasColumnType("INTEGER");
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("Version")
+                        .HasAnnotation("Relational:JsonPropertyName", "v");
 
                     b.HasKey("Id");
 
@@ -123,36 +232,81 @@ namespace RensaioBackend.Migrations.Contribution
                         .IsUnique()
                         .HasDatabaseName("IX_Sources_Package_SourceId");
 
-                    b.ToTable("Sources");
+                    b.ToTable("Sources", (string)null);
                 });
 
-            modelBuilder.Entity("RensaioBackend.Models.ContributionDatabase.MappingEntity", b =>
+            modelBuilder.Entity("RensaioBackend.Models.ContributionDatabase.ContributionSourceSeriesEntity", b =>
+                {
+                    b.Property<byte[]>("SourceId")
+                        .HasColumnType("BLOB")
+                        .HasColumnName("source_id")
+                        .HasAnnotation("Relational:JsonPropertyName", "s");
+
+                    b.Property<byte[]>("SeriesEntityId")
+                        .HasColumnType("BLOB")
+                        .HasColumnName("series_entity_id")
+                        .HasAnnotation("Relational:JsonPropertyName", "e");
+
+                    b.Property<int>("Version")
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("version")
+                        .HasAnnotation("Relational:JsonPropertyName", "v");
+
+                    b.HasKey("SourceId", "SeriesEntityId");
+
+                    b.HasIndex("Version")
+                        .HasDatabaseName("IX_SourceSeries_Version");
+
+                    b.HasIndex("SeriesEntityId", "Version")
+                        .HasDatabaseName("IX_SourceSeries_series_entity_id_Version");
+
+                    b.HasIndex("SourceId", "Version")
+                        .HasDatabaseName("IX_SourceSeries_source_id_Version");
+
+                    b.ToTable("SourceSeries", (string)null);
+                });
+
+            modelBuilder.Entity("RensaioBackend.Models.ContributionDatabase.SeriesEntity", b =>
                 {
                     b.Property<byte[]>("Id")
                         .ValueGeneratedOnAdd()
-                        .HasColumnType("BLOB");
+                        .HasColumnType("BLOB")
+                        .HasColumnName("Id");
 
                     b.HasKey("Id");
 
-                    b.ToTable("Mappings");
+                    b.ToTable("Series", (string)null);
                 });
 
-            modelBuilder.Entity("RensaioBackend.Models.ContributionDatabase.MappingTitleEntity", b =>
+            modelBuilder.Entity("RensaioBackend.Models.ContributionDatabase.SeriesTitleEntity", b =>
                 {
-                    b.Property<byte[]>("MappingId")
-                        .HasColumnType("BLOB");
+                    b.Property<byte[]>("SeriesId")
+                        .HasColumnType("BLOB")
+                        .HasColumnName("series_id")
+                        .HasAnnotation("Relational:JsonPropertyName", "m");
 
                     b.Property<byte[]>("TitleId")
-                        .HasColumnType("BLOB");
+                        .HasColumnType("BLOB")
+                        .HasColumnName("title_id")
+                        .HasAnnotation("Relational:JsonPropertyName", "t");
 
                     b.Property<int>("Version")
-                        .HasColumnType("INTEGER");
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("version")
+                        .HasAnnotation("Relational:JsonPropertyName", "v");
 
-                    b.HasKey("MappingId", "TitleId");
+                    b.HasKey("SeriesId", "TitleId");
 
-                    b.HasIndex("TitleId");
+                    b.HasIndex("SeriesId", "Version")
+                        .HasDatabaseName("IX_SeriesTitles_series_id_version");
 
-                    b.ToTable("MappingTitles");
+                    b.HasIndex("Version", "SeriesId")
+                        .HasDatabaseName("IX_SeriesTitles_version_series_id");
+
+                    b.HasIndex("TitleId", "SeriesId", "Version")
+                        .HasDatabaseName("IX_SeriesTitles_title_id_series_id_version");
+
+                    b.ToTable("SeriesTitles", (string)null);
                 });
 
             modelBuilder.Entity("RensaioBackend.Models.ContributionDatabase.SyncStateEntity", b =>
@@ -166,44 +320,50 @@ namespace RensaioBackend.Migrations.Contribution
 
                     b.HasKey("Id");
 
-                    b.ToTable("SyncStates");
+                    b.ToTable("SyncStates", (string)null);
                 });
 
             modelBuilder.Entity("RensaioBackend.Models.ContributionDatabase.TitleEntity", b =>
                 {
                     b.Property<byte[]>("Id")
                         .ValueGeneratedOnAdd()
-                        .HasColumnType("BLOB");
+                        .HasColumnType("BLOB")
+                        .HasColumnName("Id")
+                        .HasAnnotation("Relational:JsonPropertyName", "i");
 
                     b.Property<string>("Title")
                         .IsRequired()
                         .HasColumnType("TEXT")
-                        .UseCollation("BINARY");
+                        .HasColumnName("Title")
+                        .UseCollation("BINARY")
+                        .HasAnnotation("Relational:JsonPropertyName", "t");
 
                     b.Property<int>("Version")
-                        .HasColumnType("INTEGER");
+                        .HasColumnType("INTEGER")
+                        .HasColumnName("Version")
+                        .HasAnnotation("Relational:JsonPropertyName", "v");
 
                     b.HasKey("Id");
 
-                    b.ToTable("Titles");
+                    b.ToTable("Titles", (string)null);
                 });
 
             modelBuilder.Entity("RensaioBackend.Models.ContributionDatabase.ContributionMetadataEntity", b =>
                 {
-                    b.HasOne("RensaioBackend.Models.ContributionDatabase.MappingEntity", "Mapping")
+                    b.HasOne("RensaioBackend.Models.ContributionDatabase.SeriesEntity", "Series")
                         .WithMany()
-                        .HasForeignKey("MappingId")
+                        .HasForeignKey("SeriesId")
                         .OnDelete(DeleteBehavior.Cascade)
                         .IsRequired();
 
-                    b.Navigation("Mapping");
+                    b.Navigation("Series");
                 });
 
             modelBuilder.Entity("RensaioBackend.Models.ContributionDatabase.ContributionSeriesEntity", b =>
                 {
-                    b.HasOne("RensaioBackend.Models.ContributionDatabase.MappingEntity", "Mapping")
+                    b.HasOne("RensaioBackend.Models.ContributionDatabase.SeriesEntity", "Series")
                         .WithMany()
-                        .HasForeignKey("MappingId")
+                        .HasForeignKey("SeriesId")
                         .OnDelete(DeleteBehavior.Cascade)
                         .IsRequired();
 
@@ -213,16 +373,35 @@ namespace RensaioBackend.Migrations.Contribution
                         .OnDelete(DeleteBehavior.Cascade)
                         .IsRequired();
 
-                    b.Navigation("Mapping");
+                    b.Navigation("Series");
 
                     b.Navigation("Source");
                 });
 
-            modelBuilder.Entity("RensaioBackend.Models.ContributionDatabase.MappingTitleEntity", b =>
+            modelBuilder.Entity("RensaioBackend.Models.ContributionDatabase.ContributionSourceSeriesEntity", b =>
                 {
-                    b.HasOne("RensaioBackend.Models.ContributionDatabase.MappingEntity", "Mapping")
+                    b.HasOne("RensaioBackend.Models.ContributionDatabase.ContributionSeriesEntity", "SeriesEntity")
+                        .WithMany("Sources")
+                        .HasForeignKey("SeriesEntityId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("RensaioBackend.Models.ContributionDatabase.ContributionSourceEntity", "Source")
                         .WithMany()
-                        .HasForeignKey("MappingId")
+                        .HasForeignKey("SourceId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("SeriesEntity");
+
+                    b.Navigation("Source");
+                });
+
+            modelBuilder.Entity("RensaioBackend.Models.ContributionDatabase.SeriesTitleEntity", b =>
+                {
+                    b.HasOne("RensaioBackend.Models.ContributionDatabase.SeriesEntity", "Series")
+                        .WithMany()
+                        .HasForeignKey("SeriesId")
                         .OnDelete(DeleteBehavior.Cascade)
                         .IsRequired();
 
@@ -232,9 +411,14 @@ namespace RensaioBackend.Migrations.Contribution
                         .OnDelete(DeleteBehavior.Cascade)
                         .IsRequired();
 
-                    b.Navigation("Mapping");
+                    b.Navigation("Series");
 
                     b.Navigation("Title");
+                });
+
+            modelBuilder.Entity("RensaioBackend.Models.ContributionDatabase.ContributionSeriesEntity", b =>
+                {
+                    b.Navigation("Sources");
                 });
 #pragma warning restore 612, 618
         }

@@ -153,6 +153,12 @@ export class ProtoWriter {
     this.append(bytes);
   }
 
+  /** repeated string field (one tag per element). */
+  repeatedString(field: number, values: string[] | null | undefined): void {
+    if (!values) return;
+    for (const v of values) this.string(field, v);
+  }
+
   /** Embedded message field (length-delimited). */
   message(field: number, messageBytes: Uint8Array): void {
     this.append(encodeVarint((field << 3) | 2));
