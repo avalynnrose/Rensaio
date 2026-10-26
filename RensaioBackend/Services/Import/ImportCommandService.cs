@@ -310,6 +310,7 @@ public class ImportCommandService
                     List<string> langs = import.Info.Series.Providers.Select(a => a.Language).Distinct().ToList();
                     if (langs.Count == 0)
                         langs = ["en"];
+                    langs = ImportLanguageHints.WithScriptLanguages(langs, import.Info.Title);
                     var filteredSources = await _providerCache.GetSourcesForLanguagesAsync(langs, token).ConfigureAwait(false);
                     RensaioBackend.Models.Database.SeriesEntity? s = null;
                     if (!string.IsNullOrEmpty(import.Info.Path) && paths.TryGetValue(import.Info.Path, out Guid id))
