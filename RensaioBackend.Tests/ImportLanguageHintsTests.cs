@@ -32,3 +32,36 @@ public class ImportLanguageHintsTests
         Assert.Equal(new[] { "JA", "en" }, ImportLanguageHints.WithScriptLanguages(new[] { "JA", "en" }, "隣のステラ"));
     }
 }
+
+public class LanguagesForSearchTests
+{
+    private static readonly (string, string)[] Unknown = { ("Unknown", "en") };
+
+    [Fact]
+    public void GuessedLanguageWithJapaneseTitleAddsJa() =>
+        Assert.Equal(new[] { "en", "ja" }, ImportLanguageHints.LanguagesForSearch(Unknown, "隣のステラ"));
+
+    [Fact]
+    public void GuessedLanguageWithEnglishTitleStaysEnglish() =>
+        Assert.Equal(new[] { "en" }, ImportLanguageHints.LanguagesForSearch(Unknown, "Medalist"));
+
+    [Fact]
+    public void NoProvidersWithJapaneseTitleAddsJa() =>
+        Assert.Equal(new[] { "en", "ja" }, ImportLanguageHints.LanguagesForSearch(Array.Empty<(string, string)>(), "隣のステラ"));
+
+    [Fact]
+    public void ExplicitEnglishProviderWithJapaneseTitleIsNotWidened() =>
+        Assert.Equal(new[] { "en" }, ImportLanguageHints.LanguagesForSearch(new[] { ("SoraRaw", "en") }, "隣のステラ"));
+
+    [Fact]
+    public void ExplicitJapaneseProviderIsUnchanged() =>
+        Assert.Equal(new[] { "ja" }, ImportLanguageHints.LanguagesForSearch(new[] { ("SoraRaw", "ja") }, "隣のステラ"));
+
+    [Fact]
+    public void MixedFolderIsNotWidened() =>
+        Assert.Equal(new[] { "en" }, ImportLanguageHints.LanguagesForSearch(new[] { ("SoraRaw", "en"), ("Unknown", "en") }, "隣のステラ"));
+
+    [Fact]
+    public void EmptyProviderNameCountsAsGuessed() =>
+        Assert.Equal(new[] { "en", "ja" }, ImportLanguageHints.LanguagesForSearch(new[] { ("", "en") }, "隣のステラ"));
+}
